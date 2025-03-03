@@ -33,6 +33,11 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
 {
+  // fsh: events flag
+  val wevent           = Bool()
+  val revent           = Bool()
+
+
   val uopc             = UInt(UOPC_SZ.W)       // micro-op code
   val inst             = UInt(32.W)
   val debug_inst       = UInt(32.W)
@@ -172,6 +177,3 @@ class CtrlSignals extends Bundle()
   val is_sta      = Bool()   // will invoke TLB address lookup
   val is_std      = Bool()
 }
-
-
-
