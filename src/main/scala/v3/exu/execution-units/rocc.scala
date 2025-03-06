@@ -254,6 +254,8 @@ class RoCCShim(implicit p: Parameters) extends BoomModule
     io.resp.valid              := true.B
     io.resp.bits.uop           := rcq.io.deq.bits
     io.resp.bits.data          := io.core.rocc.resp.bits.data
+    //fsh: added, resp counter setting
+    io.resp.bits.counter          := 0.U
 
     rcq.io.deq.ready           := true.B
   }
