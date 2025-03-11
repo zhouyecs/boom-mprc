@@ -431,7 +431,7 @@ class ALUExeUnit(
 
     //fsh: for each unit, only when valid, transfer its counter
     io.iresp.bits.counter := PriorityMux(iresp_fu_units.map(f =>
-      (f.io.resp.valid, f.io.resp.bits.counter)))
+      (f.io.resp.valid, f.io.resp.bits.counter)).toSeq)
 
     // pulled out for critical path reasons
     // TODO: Does this make sense as part of the iresp bundle?
