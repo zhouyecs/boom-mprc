@@ -127,6 +127,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                             Seq(true))) // The jmp unit is always bypassable
   pregfile.io := DontCare // Only use the IO if enableSFBOpt
 
+  //fsh: added, define the event counters here
+  val event_counters = Module(new EventCounter(issue_units.map(_.issueWidth).sum, exe_units.count(_.hasAlu)))
+
   // wb arbiter for the 0th ll writeback
   // TODO: should this be a multi-arb?
   val ll_wbarb         = Module(new Arbiter(new ExeUnitResp(xLen), 1 +
@@ -868,6 +871,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   pred_wakeup.bits.data := DontCare
   pred_wakeup.bits.predicated := DontCare
 
+  //fsh: added, as the exe unit response, define the signal for the interface
+  pred_wakeup.bits.counter := DontCare
+
   // Perform load-hit speculative wakeup through a special port (performs a poison wake-up).
   issue_units map { iu =>
      iu.io.spec_ld_wakeup := io.lsu.spec_ld_wakeup
@@ -989,6 +995,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   iregister_read.io.bypass := bypasses
   iregister_read.io.pred_bypass := pred_bypasses
 
+  //fsh: added, for each read event counter, get its valid and addr
+  for (w <- 0 until exe_units.numIrfReaders) {
+    event_counters.io.read_addr(w).valid := iss_valids(w) && iss_uops(w).revent
+    event_counters.io.read_addr(w).bits := iss_uops(w).lrs2
+
+    // when(iss_valids(w) && iss_uops(w).revent){
+    //   printf("core set read idx, cycle: %d, idx: %d, pc: 0x%x, lrs1: %d, lrs2: %d\n", debug_cycles.value, w.U, iss_uops(w).debug_pc, iss_uops(w).lrs1, iss_uops(w).lrs2)
+    // }
+
+  }
+
   //-------------------------------------------------------------
   // Privileged Co-processor 0 Register File
   // Note: Normally this would be bad in that I'm writing state before
@@ -1013,6 +1030,84 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // Extra I/O
   // Delay retire/exception 1 cycle
   csr.io.retire    := RegNext(PopCount(rob.io.commit.arch_valids.asUInt))
+
+  //fsh: added, set the select signals for the event sets，
+  // according to the select signal choosing which counter to record which issue in 16 types of the issues
+  val event_set_sel = RegInit(0.U(5.W))
+  for (w <- 0 until coreWidth) {
+    when (rob.io.commit.valids(w)) {
+      when (rob.io.commit.uops(w).uopc === uopOR && rob.io.commit.uops(w).ldst === 0.U) {
+        event_set_sel := rob.io.commit.uops(w).lrs1 // + rob.io.commit.uops(w).lrs2
+      }
+    }
+  }
+
+  val used_event_sigs = WireInit(VecInit(Seq.fill(16) { 0.U(4.W) }))
+  val used_event_sigs_high = WireInit(VecInit(Seq.fill(16) { 0.U(4.W) }))
+
+  switch (event_set_sel) {
+    is (0.U) {
+      used_event_sigs(0) := 1.U  //cycles
+      used_event_sigs(1) := RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+      used_event_sigs(2) := Mux(io.ifu.perf.acquire, 1.U, 0.U) //i-cache miss
+      used_event_sigs(3) := Mux(io.lsu.perf.acquire, 1.U, 0.U) //d-cache miss
+      used_event_sigs(4) := Mux(io.ifu.perf.tlbMiss, 1.U, 0.U) //i-tlb miss
+      used_event_sigs(5) := Mux(io.lsu.perf.tlbMiss, 1.U, 0.U) //d-tlb miss
+      used_event_sigs(6) := Mux(io.ptw.perf.l2miss, 1.U, 0.U) //L2 TLB miss
+      used_event_sigs(7) := Mux(b2.mispredict, 1.U, 0.U) //bp mis-prediction
+
+      used_event_sigs(8) := 1.U  //cycles
+      used_event_sigs(9) := RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+      used_event_sigs(10) := Mux(io.ifu.perf.acquire, 1.U, 0.U) //i-cache miss
+      used_event_sigs(11) := Mux(io.lsu.perf.acquire, 1.U, 0.U) //d-cache miss
+      used_event_sigs(12) := Mux(io.ifu.perf.tlbMiss, 1.U, 0.U) //i-tlb miss
+      used_event_sigs(13) := Mux(io.lsu.perf.tlbMiss, 1.U, 0.U) //d-tlb miss
+      used_event_sigs(14) := Mux(io.ptw.perf.l2miss, 1.U, 0.U) //L2 TLB miss
+      used_event_sigs(15) := Mux(b2.mispredict, 1.U, 0.U) //bp mis-prediction
+
+      used_event_sigs_high(0) := 1.U  //cycles
+      used_event_sigs_high(1) := RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+      used_event_sigs_high(2) := Mux(io.ifu.perf.acquire, 1.U, 0.U) //i-cache miss
+      used_event_sigs_high(3) := Mux(io.lsu.perf.acquire, 1.U, 0.U) //d-cache miss
+      used_event_sigs_high(4) := Mux(io.ifu.perf.tlbMiss, 1.U, 0.U) //i-tlb miss
+      used_event_sigs_high(5) := Mux(io.lsu.perf.tlbMiss, 1.U, 0.U) //d-tlb miss
+      used_event_sigs_high(6) := Mux(io.ptw.perf.l2miss, 1.U, 0.U) //L2 TLB miss
+      used_event_sigs_high(7) := Mux(b2.mispredict, 1.U, 0.U) //bp mis-prediction
+
+      used_event_sigs_high(8) := 1.U  //cycles
+      used_event_sigs_high(9) := RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+      used_event_sigs_high(10) := Mux(io.ifu.perf.acquire, 2.U, 0.U) //i-cache miss
+      used_event_sigs_high(11) := Mux(io.lsu.perf.acquire, 2.U, 0.U) //d-cache miss
+      used_event_sigs_high(12) := Mux(io.ifu.perf.tlbMiss, 2.U, 0.U) //i-tlb miss
+      used_event_sigs_high(13) := Mux(io.lsu.perf.tlbMiss, 2.U, 0.U) //d-tlb miss
+      used_event_sigs_high(14) := Mux(io.ptw.perf.l2miss, 2.U, 0.U) //L2 TLB miss
+      used_event_sigs_high(15) := Mux(b2.mispredict, 2.U, 0.U) //bp mis-prediction
+    }
+
+    is (1.U) {
+      used_event_sigs(0) := 1.U  //cycles
+      used_event_sigs(1) := RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+      used_event_sigs(2) := Mux(b2.mispredict, 1.U, 0.U)
+      used_event_sigs(3) := Mux(io.ifu.perf.acquire, 1.U, 0.U)
+    }
+
+    is (2.U) {
+      used_event_sigs(0) := 1.U  //cycles
+      used_event_sigs(1) := RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+      used_event_sigs(2) := Mux(dec_stalls.reduce(_||_), 1.U, 0.U)
+      used_event_sigs(3) := Mux(ren_stalls.reduce(_||_), 1.U, 0.U)
+      used_event_sigs(4) := Mux(dis_stalls.reduce(_||_), 1.U, 0.U)
+      used_event_sigs(5) := Mux(rob.io.flush_frontend, 1.U, 0.U) //flush the frontend due to exception
+    }
+  }
+
+  for (w <- 0 until 16) {
+    event_counters.io.event_signals(w) := used_event_sigs(w)
+    event_counters.io.event_signals_high(w) := used_event_sigs_high(w)
+  }
+  //fsh: end
+
+
   csr.io.exception := RegNext(rob.io.com_xcpt.valid)
   // csr.io.pc used for setting EPC during exception or CSR.io.trace.
 
@@ -1087,6 +1182,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val exe_unit = exe_units(w)
     if (exe_unit.readsIrf) {
       exe_unit.io.req <> iregister_read.io.exe_reqs(iss_idx)
+
+      //fsh: added, for event counter, add read counter to exe unit
+      exe_unit.io.req.bits.counter := event_counters.io.read_data(iss_idx)
 
       if (exe_unit.bypassable) {
         for (i <- 0 until exe_unit.numBypassStages) {
@@ -1190,6 +1288,21 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     pregfile.io.write_ports(0).bits.addr := jmp_unit.io.iresp.bits.uop.pdst
     pregfile.io.write_ports(0).bits.data := jmp_unit.io.iresp.bits.data
   }
+
+  //fsh: added, for write counter, define the interface of its valid, addr and data
+  var wc_cnt = 0
+  for (i <- 0 until exe_units.length) {
+    if (exe_units(i).hasAlu) {
+      val wbresp = exe_units(i).io.iresp
+      event_counters.io.write_addr(wc_cnt).valid := wbresp.valid && wbresp.bits.uop.wevent
+      event_counters.io.write_addr(wc_cnt).bits := wbresp.bits.uop.lrs2
+      event_counters.io.write_data(wc_cnt) := wbresp.bits.counter
+
+
+      wc_cnt += 1
+    }
+  }
+  //fsh: end
 
   if (usingFPU) {
     // Connect IFPU
