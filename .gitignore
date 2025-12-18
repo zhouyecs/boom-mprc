@@ -7,3 +7,5 @@ lib
 *~
 .nfs*
 .#*
+.metals
+settings.json
