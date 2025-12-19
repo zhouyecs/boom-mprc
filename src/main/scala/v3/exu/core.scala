@@ -369,6 +369,46 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         "Using FPU Unit?       : " + usingFPU.toString,
         "Using FDivSqrt?       : " + usingFDivSqrt.toString,
         "Using VM?             : " + usingVM.toString) + "\n")
+  
+  //-------------------------------------------------------------
+  //Enable_Sample_Support: some special registers
+  val procTag         = RegInit(0.U(32.W))
+  val pfc_maxPriv     = RegInit(0.U(2.W))
+  val pfc_enable      = RegInit(0.U(1.W))
+
+  val isTargetProc = procTag === 0x1234567.U
+  val startCounter = csr.io.status.prv <= pfc_maxPriv && isTargetProc && (pfc_enable === 1.U)
+  val isUserMode      = csr.io.status.prv === 0.U && RegNext(csr.io.status.prv === 0.U) && RegNext(RegNext(csr.io.status.prv === 0.U))
+  
+
+  //-------------------------------------------------------------
+  //Enable_PerfCounter_Support
+  val event_counters = Module(new EventCounter(exe_units.numIrfReaders))
+
+  //reset event counters
+  event_counters.io.reset_counter := false.B
+  for (w <- 0 until coreWidth) {
+    val uop = rob.io.commit.uops(w)
+    when (rob.io.commit.valids(w) && uop.ucsrInst && uop.inst(31, 20) === SpecialInst_RstPFC) { //tag == 1024, reset all counters
+      event_counters.io.reset_counter := true.B
+    }
+  }
+
+  //start read counter
+  for (w <- 0 until exe_units.numIrfReaders) {
+    event_counters.io.read_addr(w).valid := iss_valids(w) && iss_uops(w).readCounter && iss_uops(w).ldst =/= 0.U
+    event_counters.io.read_addr(w).bits := iss_uops(w).inst(26, 20)
+  }
+
+  //connect signal to counters
+  for (w <- 0 until subECounterNum*16) {
+    event_counters.io.event_signals(w) := 0.U
+  }
+
+  when (startCounter) {
+    event_counters.io.event_signals(0) :=   1.U  //cycles
+    event_counters.io.event_signals(1) :=  RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+  }
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -1088,12 +1128,32 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     if (exe_unit.readsIrf) {
       exe_unit.io.req <> iregister_read.io.exe_reqs(iss_idx)
 
+      //Enable_PerfCounter_Support: get counter value and send to execution.req.rs1_data
+      val uop = exe_unit.io.req.bits.uop
+      when (uop.readCounter && uop.ldst =/= 0.U) {
+        exe_unit.io.req.bits.rs1_data := event_counters.io.read_data(iss_idx)
+      }
+
       if (exe_unit.bypassable) {
         for (i <- 0 until exe_unit.numBypassStages) {
           bypasses(bypass_idx) := exe_unit.io.bypass(i)
           bypass_idx += 1
         }
       }
+
+      ////Enable_Sample_Support: read special registers data from regfile
+      val rrd_uop = iregister_read.io.exe_reqs(iss_idx).bits.uop
+      when (rrd_uop.ucsrInst && rrd_uop.ldst === 0.U ) {
+        val tag = rrd_uop.inst(31, 20)
+        val rs1_data = iregister_read.io.exe_reqs(iss_idx).bits.rs1_data
+        switch (tag){
+          is (SetUCSR_ProcTag)       { procTag       := rs1_data(31, 0) }
+          is (SetUCSR_MaxPriv)       { pfc_maxPriv   := rs1_data(1,0) }
+          is (SetUCSR_PfcEnable)     { pfc_enable      := rs1_data(0,0) }
+        }
+        printf("set event value, pc: 0x%x, inst: 0x%x, tag: %d, value: 0x%x\n", rrd_uop.debug_pc, rrd_uop.inst, tag, rs1_data)
+      }
+
       iss_idx += 1
     }
   }
@@ -1167,6 +1227,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         iregfile.io.write_ports(w_cnt).bits.data := Mux(wbReadsCSR, csr.io.rw.rdata, wbdata)
       } else {
         iregfile.io.write_ports(w_cnt).bits.data := wbdata
+      }
+
+      //Enable_Sample_Support: write special registers data to regfile
+      when (wbresp.bits.uop.ucsrInst && wbresp.bits.uop.ldst =/= 0.U ) {
+        val tag = wbresp.bits.uop.inst(31, 20)
+        switch (tag) {
+          is (GetUCSR_ProcTag)   { iregfile.io.write_ports(w_cnt).bits.data := Cat(0.U(32.W), procTag) }
+          is (GetUCSR_Maxpriv)   { iregfile.io.write_ports(w_cnt).bits.data := Cat(0.U(62.W), pfc_maxPriv) }
+        }
       }
 
       assert (!wbIsValid(RT_FLT), "[fppipeline] An FP writeback is being attempted to the Int Regfile.")

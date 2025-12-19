@@ -43,6 +43,18 @@ trait ScalarOpConstants
 
   //************************************
   // Extra Constants
+  // Enable_Sample_Support
+  val SetUCSR_ProcTag        = 1.U(12.W)
+  val SetUCSR_MaxPriv        = 6.U(12.W)
+  val SetUCSR_PfcEnable      = 7.U(12.W)
+
+  val GetUCSR_ProcTag       = 33.U(12.W)
+
+  //for testing
+  val GetUCSR_Maxpriv       = 45.U(12.W)
+
+  //special inst fuc
+  val SpecialInst_RstPFC      = 127.U(12.W)
 
   // Which branch predictor predicted us
   val BSRC_SZ = 2
