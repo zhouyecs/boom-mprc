@@ -1,13 +1,13 @@
-package boom.exu
+package boom.v3.exu
 
 import chisel3._
 import chisel3.util._
 
-import freechips.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket._
 
-import boom.common._
-import boom.util._
+import boom.v3.common._
+import boom.v3.util._
 
 //Enable_PerfCounter_Support
 class SubEventCounterIO(readWidth: Int)(implicit p: Parameters) extends BoomBundle
@@ -24,15 +24,13 @@ class SubEventCounter(readWidth: Int)(implicit p: Parameters) extends BoomModule
 	val reg_counters = io.event_signals.zipWithIndex.map { case (e, i) => freechips.rocketchip.util.WideCounter(64, e, reset = false) }
 
   for (i <- 0 until readWidth) {
+    io.read_data(i) := 0.U
     when (io.read_addr(i).valid) {
       for (w <- 0 until 16) {
         when (io.read_addr(i).bits === w.U) {
           io.read_data(i) := reg_counters(w)
         }
       }
-    }
-    .otherwise {
-      io.read_data(i) := 0.U
     }
   }
 
