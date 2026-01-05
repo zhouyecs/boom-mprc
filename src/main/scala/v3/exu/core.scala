@@ -374,12 +374,29 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
   //Enable_Sample_Support: some special registers
   val procTag         = RegInit(0.U(32.W))
+  val exitFuncAddr    = RegInit(0.U(vaddrBitsExtended.W))
+  val warmupInstNum   = RegInit(0.U(64.W))
+  val maxEventNum     = RegInit(0.U(64.W))
+  val sampleEventSel  = RegInit(0.U(3.W))
   val pfc_maxPriv     = RegInit(0.U(2.W))
   val pfc_enable      = RegInit(0.U(1.W))
+  val sampleHappen    = RegInit(0.U(32.W))
+  val userExitPC      = RegInit(0.U(64.W))
+
+  val nowWarmupInsts  = RegInit(0.U(64.W))
+  val nowEventNum     = RegInit(0.U(64.W))
+
+  val tempReg1  = RegInit(0.U(64.W))
+  val tempReg2  = RegInit(0.U(64.W))
+  val tempReg3  = RegInit(0.U(64.W))
+  val tempReg4  = RegInit(0.U(64.W))
 
   val isTargetProc = procTag === 0x1234567.U
   val startCounter = csr.io.status.prv <= pfc_maxPriv && isTargetProc && (pfc_enable === 1.U)
   val isUserMode      = csr.io.status.prv === 0.U && RegNext(csr.io.status.prv === 0.U) && RegNext(RegNext(csr.io.status.prv === 0.U))
+  val sampleValid     = isUserMode && isTargetProc && maxEventNum =/= 0.U && warmupInstNum === 0.U 
+  val warmupValid     = isUserMode && isTargetProc && warmupInstNum =/= 0.U 
+  val overflow_event  = sampleValid &&  (nowEventNum > maxEventNum)
   
 
   //-------------------------------------------------------------
@@ -395,10 +412,33 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     }
   }
 
+
+  //reset counter when running > start
+  when (warmupValid) {
+    nowWarmupInsts := nowWarmupInsts + RegNext(PopCount(rob.io.commit.arch_valids.asUInt))
+    when (nowWarmupInsts > warmupInstNum) {
+      warmupInstNum := 0.U
+      nowWarmupInsts := 0.U
+      event_counters.io.reset_counter := true.B
+      nowEventNum := 0.U
+    }
+  }
+
   //start read counter
   for (w <- 0 until exe_units.numIrfReaders) {
     event_counters.io.read_addr(w).valid := iss_valids(w) && iss_uops(w).readCounter && iss_uops(w).ldst =/= 0.U
     event_counters.io.read_addr(w).bits := iss_uops(w).inst(26, 20)
+  }
+
+  //update nowWarmupInsts
+  when (sampleValid) { //usemode
+    switch (sampleEventSel){
+      is (0.U)  { nowEventNum := nowEventNum + RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) }
+      is (1.U)  {  }
+      is (2.U)  {  }
+      is (3.U)  {  }
+    }
+    // printf("wordValid, instnum: %d, eventnum: %d, maxnum: %d\n", nowWarmupInsts, nowEventNum, maxEventNum)
   }
 
   //connect signal to counters
@@ -409,6 +449,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   when (startCounter) {
     event_counters.io.event_signals(0) :=   1.U  //cycles
     event_counters.io.event_signals(1) :=  RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+    event_counters.io.event_signals(2) :=  Mux(io.ifu.icache_valid_access, 1.U, 0.U) //i-cache valid access number
+    event_counters.io.event_signals(3) :=  Mux(io.ifu.icache_hit, 1.U, 0.U)  //icache hit number
+    event_counters.io.event_signals(4) :=  Mux(io.ifu.perf.acquire, 1.U, 0.U) //i-cache send req to next level cache
+    event_counters.io.event_signals(5) :=  Mux(io.ifu.itlb_valid_access, 1.U, 0.U) //itlb valid access number
+    event_counters.io.event_signals(6) :=  Mux(io.ifu.itlb_hit, 1.U, 0.U) //itlb hit number
+    event_counters.io.event_signals(7) :=  Mux(io.ifu.perf.tlbMiss, 1.U, 0.U) //i-tlb start ptw
+    // TODO
   }
 
   //-------------------------------------------------------------
@@ -449,17 +496,43 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     new_ghist.ras_idx := io.ifu.get_pc(0).entry.ras_idx
     io.ifu.redirect_ghist := new_ghist
     when (FlushTypes.useCsrEvec(flush_typ)) {
-      io.ifu.redirect_pc  := Mux(flush_typ === FlushTypes.eret,
-                                 RegNext(RegNext(csr.io.evec)),
-                                 csr.io.evec)
+      //Enable_Sample_Support
+      when (overflow_event && RegNext(rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause === Cause_OverFlow)) {
+        when (exitFuncAddr =/= 0.U ) {  //redirected to the setting target addr
+          io.ifu.redirect_pc  := exitFuncAddr
+          procTag := 0.U
+        }
+        .otherwise {        // trigger a ecall, which need to be captured by ptrace
+          io.ifu.redirect_pc  := csr.io.evec
+          sampleHappen := 1.U   // set the register for ptrace detect the sample ecall
+        }
+        maxEventNum := 0.U
+        nowEventNum := 0.U
+        pfc_enable  := 0.U     // disable the performance counter
+      }
+      .otherwise {
+        io.ifu.redirect_pc  := Mux(flush_typ === FlushTypes.eret,
+                                  RegNext(RegNext(csr.io.evec)),
+                                  csr.io.evec)
+      }
     } .otherwise {
       val flush_pc = (AlignPCToBoundary(io.ifu.get_pc(0).pc, icBlockBytes)
                       + RegNext(rob.io.flush.bits.pc_lob)
                       - Mux(RegNext(rob.io.flush.bits.edge_inst), 2.U, 0.U))
       val flush_pc_next = flush_pc + Mux(RegNext(rob.io.flush.bits.is_rvc), 2.U, 4.U)
-      io.ifu.redirect_pc := Mux(FlushTypes.useSamePC(flush_typ),
-                                flush_pc, flush_pc_next)
-
+      //Enable_Sample_Support
+      when (RegNext(rob.io.flush.bits.isURet)) {
+        switch (RegNext(rob.io.flush.bits.uret_target)) {
+          is (0.U)  { io.ifu.redirect_pc := tempReg1 }
+          is (1.U)  { io.ifu.redirect_pc := tempReg2 }
+          is (2.U)  { io.ifu.redirect_pc := tempReg3 }
+          is (3.U)  { io.ifu.redirect_pc := tempReg4 }
+        }
+      }
+      .otherwise {
+        io.ifu.redirect_pc := Mux(FlushTypes.useSamePC(flush_typ),
+                                  flush_pc, flush_pc_next)
+      }
     }
     io.ifu.redirect_ftq_idx := RegNext(rob.io.flush.bits.ftq_idx)
   } .elsewhen (brupdate.b2.mispredict && !RegNext(rob.io.flush.valid)) {
@@ -555,6 +628,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     decode_units(w).io.interrupt_cause := csr.io.interrupt_cause
 
     dec_uops(w) := decode_units(w).io.deq.uop
+
+    ////Enable_Sample_Support: when overflow maxinsts will make all decoded uop become illegal inst
+    when (overflow_event) {
+      dec_uops(w).exception := true.B
+      dec_uops(w).exc_cause := Cause_OverFlow
+    }
   }
 
   //-------------------------------------------------------------
@@ -1054,14 +1133,30 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // Extra I/O
   // Delay retire/exception 1 cycle
   csr.io.retire    := RegNext(PopCount(rob.io.commit.arch_valids.asUInt))
-  csr.io.exception := RegNext(rob.io.com_xcpt.valid)
+  ////Enable_Sample_Support: overflow maxevent will not cause exception to kernel
+  val isOverFlowExcpt = RegNext(rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause === Cause_OverFlow) && overflow_event
+  when (isOverFlowExcpt) {
+    when (exitFuncAddr =/= 0.U) { // when this is a Event Overflow exception, disable this exception
+      csr.io.exception := false.B
+      csr.io.cause     := Causes.illegal_instruction.U
+    }
+    .otherwise {    // when exitFuncAddr, we set the cause be a user_ecall reason, which kernel will execute the ecall processor
+      csr.io.exception := true.B
+      csr.io.cause     := Causes.user_ecall.U
+    }
+    userExitPC := csr.io.pc   //record the exception pc for using
+  } 
+  .otherwise {  // the old setting
+    csr.io.exception := RegNext(rob.io.com_xcpt.valid)
+    csr.io.cause     := RegNext(rob.io.com_xcpt.bits.cause)
+  }
   // csr.io.pc used for setting EPC during exception or CSR.io.trace.
 
   csr.io.pc        := (boom.v3.util.AlignPCToBoundary(io.ifu.get_pc(0).com_pc, icBlockBytes)
                      + RegNext(rob.io.com_xcpt.bits.pc_lob)
                      - Mux(RegNext(rob.io.com_xcpt.bits.edge_inst), 2.U, 0.U))
   // Cause not valid for for CALL or BREAKPOINTs (CSRFile will override it).
-  csr.io.cause     := RegNext(rob.io.com_xcpt.bits.cause)
+  // csr.io.cause     := RegNext(rob.io.com_xcpt.bits.cause)
   csr.io.ungated_clock := clock
 
   val tval_valid = csr.io.exception &&
@@ -1149,10 +1244,25 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         val rs1_data = iregister_read.io.exe_reqs(iss_idx).bits.rs1_data
         switch (tag){
           is (SetUCSR_ProcTag)       { procTag       := rs1_data(31, 0) }
+          is (SetUCSR_SampleFuncAddr)  { exitFuncAddr  := rs1_data }
           is (SetUCSR_MaxPriv)       { pfc_maxPriv   := rs1_data(1,0) }
+          is (SetUCSR_Temp1)         { tempReg1      := rs1_data }
+          is (SetUCSR_Temp2)         { tempReg2      := rs1_data }
+          is (SetUCSR_Temp3)         { tempReg3      := rs1_data }
+          is (SetUCSR_Temp4)         { tempReg4      := rs1_data }
+          is (SetUCSR_EventSel)      { sampleEventSel  := rs1_data(2,0) }
           is (SetUCSR_PfcEnable)     { pfc_enable      := rs1_data(0,0) }
+          is (SetUCSR_SampleHappen)  { sampleHappen    := rs1_data(31,0) }
+          is (SetUCSR_WarmupInst)    { 
+            warmupInstNum := rs1_data 
+            nowWarmupInsts := 0.U 
+          }
+          is (SetUCSR_MaxEventNum)  { 
+            maxEventNum := rs1_data
+            nowEventNum := 0.U
+          }
         }
-        printf("set event value, pc: 0x%x, inst: 0x%x, tag: %d, value: 0x%x\n", rrd_uop.debug_pc, rrd_uop.inst, tag, rs1_data)
+        // printf("set event value, pc: 0x%x, inst: 0x%x, tag: %d, value: 0x%x\n", rrd_uop.debug_pc, rrd_uop.inst, tag, rs1_data)
       }
 
       iss_idx += 1
@@ -1235,6 +1345,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         val tag = wbresp.bits.uop.inst(31, 20)
         switch (tag) {
           is (GetUCSR_ProcTag)   { iregfile.io.write_ports(w_cnt).bits.data := Cat(0.U(32.W), procTag) }
+          is (GetUCSR_ExitNPC)   { iregfile.io.write_ports(w_cnt).bits.data := userExitPC }
+          is (GetUCSR_Temp1)     { iregfile.io.write_ports(w_cnt).bits.data := tempReg1 }
+          is (GetUCSR_Temp2)     { iregfile.io.write_ports(w_cnt).bits.data := tempReg2 }
+          is (GetUCSR_Temp3)     { iregfile.io.write_ports(w_cnt).bits.data := tempReg3 }
+          is (GetUCSR_Temp4)     { iregfile.io.write_ports(w_cnt).bits.data := tempReg4 }
+          is (GetUCSR_SampleHappen) { iregfile.io.write_ports(w_cnt).bits.data := Cat(0.U(32.W), sampleHappen) }
+
+          is (GetUCSR_SampleFuncAddr) { iregfile.io.write_ports(w_cnt).bits.data := exitFuncAddr }
+          is (GetUCSR_MaxEvents)    { iregfile.io.write_ports(w_cnt).bits.data := maxEventNum }
+          is (GetUCSR_NowEvents)    { iregfile.io.write_ports(w_cnt).bits.data := nowEventNum }
+          is (GetUCSR_EventSel)     { iregfile.io.write_ports(w_cnt).bits.data := Cat(0.U(61.W), sampleEventSel) }
           is (GetUCSR_Maxpriv)   { iregfile.io.write_ports(w_cnt).bits.data := Cat(0.U(62.W), pfc_maxPriv) }
         }
       }
