@@ -446,16 +446,61 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(w) := 0.U
   }
 
+  // 统计 commit 指令中分支指令的占比
+  val com_is_br   = Wire(Vec(coreWidth, Bool()))
+  val com_is_jalr = Wire(Vec(coreWidth, Bool()))
+  val com_is_ret  = Wire(Vec(coreWidth, Bool()))
+  val com_is_jalrcall  = Wire(Vec(coreWidth, Bool()))
+  val com_is_jalcall = Wire(Vec(coreWidth, Bool()))
+
+  // 统计预测错误的指令数目 
+  val com_misp_br   = Wire(Vec(coreWidth, Bool()))
+  val com_misp_jalr = Wire(Vec(coreWidth, Bool()))
+  val com_misp_ret  = Wire(Vec(coreWidth, Bool()))
+  val com_misp_jalrcall  = Wire(Vec(coreWidth, Bool()))
+
+  for(w <- 0 until coreWidth) {
+    val uop = rob.io.commit.uops(w)
+    val valid = rob.io.commit.arch_valids(w)
+
+    com_is_br(w) := valid && uop.is_br
+    com_is_jalr(w)  := valid && uop.is_jalr
+    com_is_ret(w)   := valid && uop.is_jalr && (uop.ldst === 0.U) && ((uop.lrs1 === 1.U) || (uop.lrs1 === 5.U))
+    // RISC-V 手册里建议应该 rd=x1(ra) 或者 rd=x5(t0) 都视为 call 指令
+    // 但 BOOM 里检测 call 指令时只使用了 x1, 这里也遵循 BOOM 里的检测
+    com_is_jalrcall(w) := valid && uop.is_jalr && (uop.ldst === 1.U)
+    com_is_jalcall(w) := valid && uop.is_jal && (uop.ldst === 1.U)
+
+    // fsrc 表示 next pc 从哪来的，如果 next pc 来自后端，则说明分支预测错误
+    com_misp_br(w)    := com_is_br(w)   && uop.debug_fsrc === BSRC_C
+    com_misp_jalr(w)  := com_is_jalr(w) && uop.debug_fsrc === BSRC_C 
+    com_misp_ret(w)   := com_is_ret(w)  && uop.debug_fsrc === BSRC_C 
+    com_misp_jalrcall(w) := com_is_jalrcall(w) && uop.debug_fsrc === BSRC_C 
+    // jalcall 在至多在 f3 阶段就能确定跳转目标
+  }
+
   when (startCounter) {
     event_counters.io.event_signals(0) :=   1.U  //cycles
     event_counters.io.event_signals(1) :=  RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+    // TODO: 因为 BOOM 前端的 replay 机制，计数器 cache valid access 与 tlb valid access 的值
+    // 会比实际的多，但 hit number 是准的，实际的 access time = hit number + perf miss？
+    // 但这还是有点微妙，例如 icache miss 但 itlb hit 的情况，replay 会导致 itlb 反复 hit
     event_counters.io.event_signals(2) :=  Mux(io.ifu.icache_valid_access, 1.U, 0.U) //i-cache valid access number
     event_counters.io.event_signals(3) :=  Mux(io.ifu.icache_hit, 1.U, 0.U)  //icache hit number
     event_counters.io.event_signals(4) :=  Mux(io.ifu.perf.acquire, 1.U, 0.U) //i-cache send req to next level cache
     event_counters.io.event_signals(5) :=  Mux(io.ifu.itlb_valid_access, 1.U, 0.U) //itlb valid access number
     event_counters.io.event_signals(6) :=  Mux(io.ifu.itlb_hit, 1.U, 0.U) //itlb hit number
     event_counters.io.event_signals(7) :=  Mux(io.ifu.perf.tlbMiss, 1.U, 0.U) //i-tlb start ptw
-    // TODO
+
+    event_counters.io.event_signals(8) :=  PopCount(com_is_br.asUInt)       //committed br number
+    event_counters.io.event_signals(9) :=  PopCount(com_is_jalr.asUInt)   // committed jalr number
+    event_counters.io.event_signals(10) :=  PopCount(com_is_ret.asUInt)     //committed jalr-ret number
+    event_counters.io.event_signals(11) :=  PopCount(com_is_jalrcall.asUInt)  //committed jalr-call number
+    event_counters.io.event_signals(12) :=  PopCount(com_is_jalcall.asUInt)  //committed jal-call number
+    event_counters.io.event_signals(13) :=  PopCount(com_misp_br.asUInt)       //committed misp br number
+    event_counters.io.event_signals(14) :=  PopCount(com_misp_jalr.asUInt)   //committed misp jalr number
+    event_counters.io.event_signals(15) :=  PopCount(com_misp_ret.asUInt)     //committed misp jalr-ret number
+    event_counters.io.event_signals(16) :=  PopCount(com_misp_jalrcall.asUInt)  //committed misp jalr-call number
   }
 
   //-------------------------------------------------------------
