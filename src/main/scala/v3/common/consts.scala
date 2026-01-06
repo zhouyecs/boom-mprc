@@ -77,9 +77,6 @@ trait ScalarOpConstants
   //special inst fuc
   val SpecialInst_URet        = 64.U(12.W)
   val SpecialInst_RstPFC      = 127.U(12.W)
-  
-  //special exception cause for sample happen
-  val Cause_OverFlow          = 17.U 
 
   // Which branch predictor predicted us
   val BSRC_SZ = 2
@@ -399,6 +396,11 @@ trait ExcCauseConstants
   val MINI_EXCEPTION_MEM_ORDERING = 16.U
   val MINI_EXCEPTION_CSR_REPLAY = 17.U
 
+  // Enable_Sample_Support
+  //special exception cause for sample happen
+  val Cause_OverFlow          = 18.U 
+
   require (!freechips.rocketchip.rocket.Causes.all.contains(16))
   require (!freechips.rocketchip.rocket.Causes.all.contains(17))
+  require (!freechips.rocketchip.rocket.Causes.all.contains(18))
 }
