@@ -448,35 +448,44 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // 统计 commit 指令中分支指令的占比
   val com_is_br   = Wire(Vec(coreWidth, Bool()))
+  val com_is_jal  = Wire(Vec(coreWidth, Bool()))
   val com_is_jalr = Wire(Vec(coreWidth, Bool()))
   val com_is_ret  = Wire(Vec(coreWidth, Bool()))
-  val com_is_jalrcall  = Wire(Vec(coreWidth, Bool()))
-  val com_is_jalcall = Wire(Vec(coreWidth, Bool()))
+  val com_is_call  = Wire(Vec(coreWidth, Bool()))
 
   // 统计预测错误的指令数目 
   val com_misp_br   = Wire(Vec(coreWidth, Bool()))
   val com_misp_jalr = Wire(Vec(coreWidth, Bool()))
   val com_misp_ret  = Wire(Vec(coreWidth, Bool()))
-  val com_misp_jalrcall  = Wire(Vec(coreWidth, Bool()))
+
+  // 统计 commit 指令中前端各级分支预测的贡献
+  val com_is_bsrc1 = Wire(Vec(coreWidth, Bool())) // committed inst from f1 prediction
+  val com_is_bsrc2 = Wire(Vec(coreWidth, Bool())) // committed inst from f2 prediction
+  val com_is_bsrc3 = Wire(Vec(coreWidth, Bool())) // committed inst from f3 prediction
+  val com_is_bsrcc = Wire(Vec(coreWidth, Bool())) // committed inst from backend correction
 
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
 
     com_is_br(w) := valid && uop.is_br
+    com_is_jal(w) := valid && uop.is_jal
     com_is_jalr(w)  := valid && uop.is_jalr
     com_is_ret(w)   := valid && uop.is_jalr && (uop.ldst === 0.U) && ((uop.lrs1 === 1.U) || (uop.lrs1 === 5.U))
     // RISC-V 手册里建议应该 rd=x1(ra) 或者 rd=x5(t0) 都视为 call 指令
     // 但 BOOM 里检测 call 指令时只使用了 x1, 这里也遵循 BOOM 里的检测
-    com_is_jalrcall(w) := valid && uop.is_jalr && (uop.ldst === 1.U)
-    com_is_jalcall(w) := valid && uop.is_jal && (uop.ldst === 1.U)
+    com_is_call(w) := valid && (uop.is_jalr || uop.is_jal) && (uop.ldst === 1.U)
 
     // fsrc 表示 next pc 从哪来的，如果 next pc 来自后端，则说明分支预测错误
     com_misp_br(w)    := com_is_br(w)   && uop.debug_fsrc === BSRC_C
     com_misp_jalr(w)  := com_is_jalr(w) && uop.debug_fsrc === BSRC_C 
     com_misp_ret(w)   := com_is_ret(w)  && uop.debug_fsrc === BSRC_C 
-    com_misp_jalrcall(w) := com_is_jalrcall(w) && uop.debug_fsrc === BSRC_C 
-    // jalcall 在至多在 f3 阶段就能确定跳转目标
+    // jal 在至多在 f3 阶段就能确定跳转目标
+
+    com_is_bsrc1(w) := valid && (uop.debug_tsrc === BSRC_1)
+    com_is_bsrc2(w) := valid && (uop.debug_tsrc === BSRC_2)
+    com_is_bsrc3(w) := valid && (uop.debug_tsrc === BSRC_3)
+    com_is_bsrcc(w) := valid && (uop.debug_tsrc === BSRC_C)
   }
 
   when (startCounter) {
@@ -495,12 +504,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(8) :=  PopCount(com_is_br.asUInt)       //committed br number
     event_counters.io.event_signals(9) :=  PopCount(com_is_jalr.asUInt)   // committed jalr number
     event_counters.io.event_signals(10) :=  PopCount(com_is_ret.asUInt)     //committed jalr-ret number
-    event_counters.io.event_signals(11) :=  PopCount(com_is_jalrcall.asUInt)  //committed jalr-call number
-    event_counters.io.event_signals(12) :=  PopCount(com_is_jalcall.asUInt)  //committed jal-call number
+    event_counters.io.event_signals(11) :=  PopCount(com_is_jal.asUInt)  //committed jal number
+    event_counters.io.event_signals(12) :=  PopCount(com_is_call.asUInt)  //committed call number
     event_counters.io.event_signals(13) :=  PopCount(com_misp_br.asUInt)       //committed misp br number
     event_counters.io.event_signals(14) :=  PopCount(com_misp_jalr.asUInt)   //committed misp jalr number
     event_counters.io.event_signals(15) :=  PopCount(com_misp_ret.asUInt)     //committed misp jalr-ret number
-    event_counters.io.event_signals(16) :=  PopCount(com_misp_jalrcall.asUInt)  //committed misp jalr-call number
+
+    event_counters.io.event_signals(16) :=  PopCount(com_is_bsrc1.asUInt) // committed inst from f1 prediction
+    event_counters.io.event_signals(17) :=  PopCount(com_is_bsrc2.asUInt) // committed inst from f2 prediction
+    event_counters.io.event_signals(18) :=  PopCount(com_is_bsrc3.asUInt) // committed inst from f3 prediction
+    event_counters.io.event_signals(19) :=  PopCount(com_is_bsrcc.asUInt) // committed inst from backend correction
   }
 
   //-------------------------------------------------------------
