@@ -211,7 +211,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     oldest_mispredict = Mux(use_this_mispredict, b, oldest_mispredict)
   }
 
-  b2.mispredict  := mispredict_val
+  // 在 rob.io.flush.valid 拉高时我们禁止 b2.mispredict 生效
+  // 这样使得 FTQ 中 mispredict 和 flush 不会同时发生，避免 flush
+  // 时触发 flush 的指令对应的 FTQ 表项被错误更新
+  // 但这不一定对性能是好事，因为 mispredict 使得 rob 表项可以快速回滚
+  // 到发生 mispredict 的指令位置。因此这样禁止 b2.mispredict 生效后
+  // 可能会延迟回滚时间
+  // 另外，这样做使得 b1 info 的效果传播开了，但是 b2 的效果没有传播开，
+  // 但因为马上就要 flush 了，所以我想应该不会有什么影响
+  b2.mispredict  := mispredict_val && !rob.io.flush.valid
   b2.cfi_type    := oldest_mispredict.cfi_type
   b2.taken       := oldest_mispredict.taken
   b2.pc_sel      := oldest_mispredict.pc_sel

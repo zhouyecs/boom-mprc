@@ -172,22 +172,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.cfi_npc_plus4 := io.enq.bits.cfi_npc_plus4
     new_entry.ras_top       := io.enq.bits.ras_top
     new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
-    new_entry.br_mask       := io.enq.bits.br_mask & io.enq.bits.mask
+    new_entry.br_mask       := io.enq.bits.br_mask
     new_entry.start_bank    := bank(io.enq.bits.pc)
 
-    val new_ghist = Mux(io.enq.bits.ghist.current_saw_branch_not_taken,
-      io.enq.bits.ghist,
-      prev_ghist.update(
-        prev_entry.br_mask,
-        prev_entry.cfi_taken,
-        prev_entry.br_mask(prev_entry.cfi_idx.bits),
-        prev_entry.cfi_idx.bits,
-        prev_entry.cfi_idx.valid,
-        prev_pc,
-        prev_entry.cfi_is_call,
-        prev_entry.cfi_is_ret
-      )
-    )
+    val new_ghist = io.enq.bits.ghist
 
     lhist.map( l => l.write(enq_ptr, io.enq.bits.lhist))
     ghist.map( g => g.write(enq_ptr, new_ghist))
@@ -229,8 +217,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_end_idx = Reg(UInt(log2Ceil(ftqSz).W))
   val bpd_repair_pc = Reg(UInt(vaddrBitsExtended.W))
 
-  val bpd_idx = Mux(io.redirect.valid, io.redirect.bits,
-    Mux(bpd_update_repair || bpd_update_mispredict, bpd_repair_idx, bpd_ptr))
+  val bpd_idx = Mux(bpd_update_repair || bpd_update_mispredict, bpd_repair_idx, bpd_ptr)
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
   val bpd_lhist = if (useLHist) {
@@ -311,6 +298,11 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val redirect_entry = ram(redirect_idx)
   val redirect_new_entry = WireInit(redirect_entry)
 
+  // Debug usage
+  val bpd_idx_debug = io.redirect.bits
+  val bpd_ghist_debug = ghist(0).read(bpd_idx_debug, true.B)
+  val bpd_pc_debug = RegNext(pcs(bpd_idx_debug))
+
   when (io.redirect.valid) {
     enq_ptr    := WrapInc(io.redirect.bits, num_entries)
 
@@ -331,8 +323,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   } .elsewhen (RegNext(io.redirect.valid)) {
     prev_entry := RegNext(redirect_new_entry)
-    prev_ghist := bpd_ghist
-    prev_pc    := bpd_pc
+    prev_ghist := bpd_ghist_debug
+    prev_pc    := bpd_pc_debug
 
     ram(RegNext(io.redirect.bits)) := RegNext(redirect_new_entry)
   }
@@ -361,5 +353,29 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   for (w <- 0 until coreWidth) {
     io.debug_fetch_pc(w) := RegNext(pcs(io.debug_ftq_idx(w)))
+  }
+
+  // Assertion
+  when (do_enq) {
+    // 前端在计算 f3_br_mask 时已经考虑了 fetch bundle 内部的 mask 了
+    assert ((io.enq.bits.br_mask & io.enq.bits.mask) === io.enq.bits.br_mask,
+      "FTQ: br_mask has bits set outside of valid fetch bundle")
+    
+    when (!io.enq.bits.ghist.current_saw_branch_not_taken) {
+      val ghist_by_prev = prev_ghist.update(
+        prev_entry.br_mask,
+        prev_entry.cfi_taken,
+        prev_entry.br_mask(prev_entry.cfi_idx.bits),
+        prev_entry.cfi_idx.bits,
+        prev_entry.cfi_idx.valid,
+        prev_pc,
+        prev_entry.cfi_is_call,
+        prev_entry.cfi_is_ret
+      )
+      // 按我的理解这俩应该是相等的
+      assert (io.enq.bits.ghist === ghist_by_prev,
+        "FTQ: ghist mismatch on enqueue. ")
+    }
+
   }
 }
