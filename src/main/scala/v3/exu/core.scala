@@ -1619,21 +1619,26 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         }
       }
 
-      when (rob.io.commit.arch_valids(w)) {
+      when (rob.io.commit.valids(w)) {
         printf("%d 0x%x ",
           priv,
           Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
         printf_inst(rob.io.commit.uops(w))
+        when (!rob.io.commit.arch_valids(w)) {
+          printf(" (not arch) ")
+        }
         when (rob.io.commit.uops(w).dst_rtype === RT_FIX && rob.io.commit.uops(w).ldst =/= 0.U) {
-          printf(" x%d 0x%x\n",
+          printf(" x%d 0x%x, ftq_idx 0x%x\n",
             rob.io.commit.uops(w).ldst,
-            rob.io.commit.debug_wdata(w))
+            rob.io.commit.debug_wdata(w),
+            rob.io.commit.uops(w).ftq_idx)
         } .elsewhen (rob.io.commit.uops(w).dst_rtype === RT_FLT) {
-          printf(" f%d 0x%x\n",
+          printf(" f%d 0x%x, ftq_idx 0x%x\n",
             rob.io.commit.uops(w).ldst,
-            rob.io.commit.debug_wdata(w))
+            rob.io.commit.debug_wdata(w),
+            rob.io.commit.uops(w).ftq_idx)
         } .otherwise {
-          printf("\n")
+          printf(" ftq_idx 0x%x\n", rob.io.commit.uops(w).ftq_idx)
         }
       }
     }

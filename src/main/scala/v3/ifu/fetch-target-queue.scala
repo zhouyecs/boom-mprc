@@ -89,6 +89,24 @@ class GetPCFromFtqIO(implicit p: Parameters) extends BoomBundle
   val next_pc   = Output(UInt(vaddrBitsExtended.W))
 }
 
+class FTQPtr(entries: Int)(implicit p: Parameters) extends CircularQueuePtr[FTQPtr](entries)
+{
+  // 好像在执行构造函数的时候 trait 内部的代码还未执行，因此这里拿不到 ftqSz
+  def this()(implicit p: Parameters) = this(32)
+  require(ftqSz == entries)
+}
+
+object FTQPtr {
+  def apply(f: Bool, v: UInt)(implicit p: Parameters): FTQPtr = {
+    val ptr = Wire(new FTQPtr)
+    ptr.flag  := f
+    ptr.value := v
+    ptr
+  }
+  def inverse(ptr: FTQPtr)(implicit p: Parameters): FTQPtr =
+    apply(!ptr.flag, ptr.value)
+}
+
 /**
  * Queue to store the fetch PC and other relevant branch predictor signals that are inflight in the
  * processor.
@@ -98,6 +116,7 @@ class GetPCFromFtqIO(implicit p: Parameters) extends BoomBundle
 class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   with HasBoomCoreParameters
   with HasBoomFrontendParameters
+  with HasCircularQueuePtrHelper
 {
   val num_entries = ftqSz
   private val idx_sz = log2Ceil(num_entries)
@@ -132,12 +151,11 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val ras_update_pc  = Output(UInt(vaddrBitsExtended.W))
 
   })
-  val bpd_ptr    = RegInit(0.U(idx_sz.W))
-  val deq_ptr    = RegInit(0.U(idx_sz.W))
-  val enq_ptr    = RegInit(1.U(idx_sz.W))
+  val bpd_ptr    = RegInit(FTQPtr(false.B, 0.U))
+  val deq_ptr    = RegInit(FTQPtr(false.B, 0.U))
+  val enq_ptr    = RegInit(FTQPtr(false.B, 0.U))
 
-  val full = ((WrapInc(WrapInc(enq_ptr, num_entries), num_entries) === bpd_ptr) ||
-              (WrapInc(enq_ptr, num_entries) === bpd_ptr))
+  val full = isFull(enq_ptr, bpd_ptr)
 
 
   val pcs      = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
@@ -159,7 +177,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val prev_pc    = RegInit(0.U(vaddrBitsExtended.W))
   when (do_enq) {
 
-    pcs(enq_ptr)           := io.enq.bits.pc
+    pcs(enq_ptr.value)           := io.enq.bits.pc
 
     val new_entry = Wire(new FTQBundle)
 
@@ -179,29 +197,33 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     val new_ghist = io.enq.bits.ghist
 
-    lhist.map( l => l.write(enq_ptr, io.enq.bits.lhist))
-    ghist.map( g => g.write(enq_ptr, new_ghist))
-    meta.write(enq_ptr, io.enq.bits.bpd_meta)
-    ram(enq_ptr) := new_entry
+    lhist.map( l => l.write(enq_ptr.value, io.enq.bits.lhist))
+    ghist.map( g => g.write(enq_ptr.value, new_ghist))
+    meta.write(enq_ptr.value, io.enq.bits.bpd_meta)
+    ram(enq_ptr.value) := new_entry
 
     prev_pc    := io.enq.bits.pc
     prev_entry := new_entry
     prev_ghist := new_ghist
 
-    enq_ptr := WrapInc(enq_ptr, num_entries)
+    enq_ptr := enq_ptr + 1.U
   }
 
-  io.enq_idx := enq_ptr
+  io.enq_idx := enq_ptr.value
 
   io.bpdupdate.valid := false.B
   io.bpdupdate.bits  := DontCare
 
   when (io.deq.valid) {
-    deq_ptr := io.deq.bits
+    val new_deq_ptr1 = FTQPtr(deq_ptr.flag, io.deq.bits)
+    val new_deq_ptr2 = FTQPtr.inverse(new_deq_ptr1)
+    // 因为 uop 中只保留了 ftq.value，没有 ftq.flag，我们需要从
+    // rob 返回的 ftq.value 中推断 flag 的值。如果 io.deq.bits
+    // 的值与 deq_ptr.value 相同，说明新的 commit 位于同一个 fetch
+    // packet，我们保持 deq_ptr 不变。否则，由于 deq_ptr 应当递增，
+    // 我们选择使得 deq_ptr 不会减小的那个
+    deq_ptr := Mux(deq_ptr <= new_deq_ptr1, new_deq_ptr1, new_deq_ptr2)
   }
-
-  // This register avoids a spurious bpd update on the first fetch packet
-  val first_empty = RegInit(true.B)
 
   // We can update the branch predictors when we know the target of the
   // CFI in this fetch bundle
@@ -219,7 +241,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_end_idx = Reg(UInt(log2Ceil(ftqSz).W))
   val bpd_repair_pc = Reg(UInt(vaddrBitsExtended.W))
 
-  val bpd_idx = Mux(bpd_update_repair || bpd_update_mispredict, bpd_repair_idx, bpd_ptr)
+  val bpd_idx = Mux(bpd_update_repair || bpd_update_mispredict, bpd_repair_idx, bpd_ptr.value)
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
   val bpd_lhist = if (useLHist) {
@@ -237,7 +259,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   } .elsewhen (RegNext(io.brupdate.b2.mispredict)) {
     bpd_update_mispredict := true.B
     bpd_repair_idx        := RegNext(io.brupdate.b2.uop.ftq_idx)
-    bpd_end_idx           := RegNext(enq_ptr)
+    bpd_end_idx           := RegNext(enq_ptr.value)
   } .elsewhen (bpd_update_mispredict) {
     bpd_update_mispredict := false.B
     bpd_update_repair     := true.B
@@ -254,23 +276,26 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   }
 
-
+  // 这里的判断中将原来的
+  // bpd_ptr =/= deq_ptr && enq_ptr =/= WrapInc(bpd_ptr, num_entries)
+  // 简化为了 bpd_ptr =/= deq_ptr，因为 deq_ptr < enq_ptr 在第一次 commit
+  // update 后总是成立，而 bpd_ptr <= deq_ptr
   val do_commit_update     = (!bpd_update_mispredict &&
                               !bpd_update_repair &&
-                               bpd_ptr =/= deq_ptr &&
-                               enq_ptr =/= WrapInc(bpd_ptr, num_entries) &&
+                              bpd_ptr =/= deq_ptr &&
                               !io.brupdate.b2.mispredict &&
                               !io.redirect.valid && !RegNext(io.redirect.valid))
   val do_mispredict_update = bpd_update_mispredict
   val do_repair_update     = bpd_update_repair
 
+  val done_commit_update_debug = RegInit(false.B)
+
   when (RegNext(do_commit_update || do_repair_update || do_mispredict_update)) {
     val cfi_idx = bpd_entry.cfi_idx.bits
     val valid_repair = bpd_pc =/= bpd_repair_pc
 
-    io.bpdupdate.valid := (!first_empty &&
-                           (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
-                           !(RegNext(do_repair_update) && !valid_repair))
+    io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
+                           !(RegNext(do_repair_update) && !valid_repair)
     io.bpdupdate.bits.is_mispredict_update := RegNext(do_mispredict_update)
     io.bpdupdate.bits.is_repair_update     := RegNext(do_repair_update)
     io.bpdupdate.bits.pc      := bpd_pc
@@ -287,14 +312,17 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.lhist      := bpd_lhist
     io.bpdupdate.bits.meta       := bpd_meta
 
-    first_empty := false.B
+    done_commit_update_debug := RegNext(do_commit_update) || done_commit_update_debug
   }
 
   when (do_commit_update) {
-    bpd_ptr := WrapInc(bpd_ptr, num_entries)
+    bpd_ptr := bpd_ptr + 1.U
   }
 
-  io.enq.ready := RegNext(!full || do_commit_update)
+  // 因为 ghist 用的 sync read mem，文档里说不能在同一周期读和写相同地址
+  // 因此这里就保守一些，在 ftq 满的时候就拉低 ready 信号，即使这周期的
+  // do_commit_update 信号为 true
+  io.enq.ready := !full
 
   val redirect_idx = io.redirect.bits
   val redirect_entry = ram(redirect_idx)
@@ -306,7 +334,11 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_pc_debug = RegNext(pcs(bpd_idx_debug))
 
   when (io.redirect.valid) {
-    enq_ptr    := WrapInc(io.redirect.bits, num_entries)
+    // 类似于 deq_ptr 的处理。因为新的 enq_ptr 只可能减小或者不变
+    val new_enq_ptr1 = FTQPtr(enq_ptr.flag, io.redirect.bits)
+    val new_enq_ptr2 = FTQPtr.inverse(new_enq_ptr1)
+    val proper_enq_ptr = Mux(enq_ptr > new_enq_ptr1, new_enq_ptr1, new_enq_ptr2)
+    enq_ptr    := proper_enq_ptr + 1.U
 
     when (io.brupdate.b2.mispredict && !io.rob_flush) {
     val new_cfi_idx = (io.brupdate.b2.uop.pc_lob ^
@@ -338,7 +370,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   for (i <- 0 until 2) {
     val idx = io.get_ftq_pc(i).ftq_idx
     val next_idx = WrapInc(idx, num_entries)
-    val next_is_enq = (next_idx === enq_ptr) && io.enq.fire
+    val next_is_enq = (next_idx === enq_ptr.value) && io.enq.fire
     val next_pc = Mux(next_is_enq, io.enq.bits.pc, pcs(next_idx))
     val get_entry = ram(idx)
     val next_entry = ram(next_idx)
@@ -349,8 +381,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       io.get_ftq_pc(i).ghist   := DontCare
     io.get_ftq_pc(i).pc        := RegNext(pcs(idx))
     io.get_ftq_pc(i).next_pc   := RegNext(next_pc)
-    io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= enq_ptr || next_is_enq)
-    io.get_ftq_pc(i).com_pc    := RegNext(pcs(Mux(io.deq.valid, io.deq.bits, deq_ptr)))
+    io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= enq_ptr.value || next_is_enq)
+    io.get_ftq_pc(i).com_pc    := RegNext(pcs(Mux(io.deq.valid, io.deq.bits, deq_ptr.value)))
   }
 
   for (w <- 0 until coreWidth) {
@@ -378,6 +410,28 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       assert (io.enq.bits.ghist === ghist_by_prev,
         "FTQ: ghist mismatch on enqueue. ")
     }
+  }
+  
+  assert (deq_ptr < enq_ptr || !done_commit_update_debug,
+          """After commit update, deq_ptr should always point to 
+          |a valid fetch packet, and deq_ptr points to next enqueue position"""
+  )
 
+  assert (bpd_ptr <= deq_ptr, "bpd_ptr should always behind deq_ptr")
+  when (io.deq.valid) {
+    // 因为 rob 每周期至多提交 coreWidth 条指令，而一条指令最多占据两
+    // 个 fetch packet。因此每次 commit, deq_ptr 至多前进 2 * coreWidth
+    // 个位置
+    val possible_new_ptrs = Seq.tabulate(2 * coreWidth + 1) { i => (deq_ptr + i.U).value === io.deq.bits }
+    assert (possible_new_ptrs.reduce(_ || _),
+    "deq_ptr should be incremented by at most 2 * coreWidth?")
+  }
+
+  when (do_commit_update) {
+    // 这保证了在同一周期 ghist 的 commit 读和 enq 写不会是同一地址
+    // 没有检测 mispredict 和 repair update，因为我们暂时不用 loop predictor
+    // 没有检测 redirect ghist read，因为 BOOM 里没有一个 valid 信号
+    // 来指示 io.get_ftq_pc(i).ftq_idx 是否有效
+    assert (bpd_ptr < enq_ptr, "bpd_ptr should never commit a invalid ftq entry")
   }
 }
