@@ -394,8 +394,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val isTargetProc = procTag === 0x1234567.U
   val startCounter = csr.io.status.prv <= pfc_maxPriv && isTargetProc && (pfc_enable === 1.U)
   val isUserMode      = csr.io.status.prv === 0.U && RegNext(csr.io.status.prv === 0.U) && RegNext(RegNext(csr.io.status.prv === 0.U))
-  val sampleValid     = isUserMode && isTargetProc && maxEventNum =/= 0.U && warmupInstNum === 0.U 
-  val warmupValid     = isUserMode && isTargetProc && warmupInstNum =/= 0.U 
+  val sampleValid = Wire(Bool())
+  val warmupValid = Wire(Bool())
+  if (IN_SIMULATION) {
+    sampleValid := isTargetProc && maxEventNum =/= 0.U && warmupInstNum === 0.U
+    warmupValid := isTargetProc && warmupInstNum =/= 0.U
+  } else {
+    sampleValid := isUserMode && isTargetProc && maxEventNum =/= 0.U && warmupInstNum === 0.U 
+    warmupValid := isUserMode && isTargetProc && warmupInstNum =/= 0.U 
+  }
   val overflow_event  = sampleValid &&  (nowEventNum > maxEventNum)
   
 
