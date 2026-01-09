@@ -211,15 +211,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     oldest_mispredict = Mux(use_this_mispredict, b, oldest_mispredict)
   }
 
-  // 在 rob.io.flush.valid 拉高时我们禁止 b2.mispredict 生效
-  // 这样使得 FTQ 中 mispredict 和 flush 不会同时发生，避免 flush
-  // 时触发 flush 的指令对应的 FTQ 表项被错误更新
-  // 但这不一定对性能是好事，因为 mispredict 使得 rob 表项可以快速回滚
-  // 到发生 mispredict 的指令位置。因此这样禁止 b2.mispredict 生效后
-  // 可能会延迟回滚时间
-  // 另外，这样做使得 b1 info 的效果传播开了，但是 b2 的效果没有传播开，
-  // 但因为马上就要 flush 了，所以我想应该不会有什么影响
-  b2.mispredict  := mispredict_val && !rob.io.flush.valid
+  // Caution!! 不能在 flush 信号拉高时禁止 b2.mispredict 生效，这样
+  // 会导致 rob 那边 clear 了预测错误的分支指令后边的指令（被 clear 的
+  // 指令不再参与 rob rollback），但是 renaming table 以及 free list
+  // 没有恢复到分支指令对应的 snapshot 状态，导致 cpu 整个状态异常了
+  // 因此，为了使 FTQ 能够区分 mispredict 和 rob flush，还是在前端加一个
+  // 信号好了
+  b2.mispredict  := mispredict_val // && !rob.io.flush.valid
   b2.cfi_type    := oldest_mispredict.cfi_type
   b2.taken       := oldest_mispredict.taken
   b2.pc_sel      := oldest_mispredict.pc_sel
@@ -531,6 +529,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
   io.ifu.redirect_val         := false.B
   io.ifu.redirect_flush       := false.B
+  io.ifu.rob_flush            := false.B
 
   // Breakpoint info
   io.ifu.status  := csr.io.status
@@ -553,6 +552,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //       Exceptions are reported to the CSR on the cycle we send the flush
   // This discrepency should be resolved elsewhere.
   when (RegNext(rob.io.flush.valid)) {
+    io.ifu.rob_flush      := true.B
     io.ifu.redirect_val   := true.B
     io.ifu.redirect_flush := true.B
     val flush_typ = RegNext(rob.io.flush.bits.flush_typ)

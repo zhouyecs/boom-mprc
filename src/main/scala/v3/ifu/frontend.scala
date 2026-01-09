@@ -279,6 +279,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val redirect_pc      = Output(UInt()) // Where do we redirect to?
   val redirect_ftq_idx = Output(UInt()) // Which ftq entry should we reset to?
   val redirect_ghist   = Output(new GlobalHistory) // What are we setting as the global history?
+  
+  // 额外的 flush 信号，使得 FTQ 可以区分 rob flush 和 mispredict
+  val rob_flush = Output(Bool()) // Flush coming from the ROB
 
   val commit = Valid(UInt(ftqSz.W))
 
@@ -959,6 +962,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   ftq.io.redirect.valid   := io.cpu.redirect_val
   ftq.io.redirect.bits    := io.cpu.redirect_ftq_idx
+  ftq.io.rob_flush        := io.cpu.rob_flush
   fb.io.clear := false.B
 
   when (io.cpu.sfence.valid) {

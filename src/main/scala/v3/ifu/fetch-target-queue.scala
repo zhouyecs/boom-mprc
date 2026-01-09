@@ -120,6 +120,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val debug_fetch_pc = Output(Vec(coreWidth, UInt(vaddrBitsExtended.W)))
 
     val redirect = Input(Valid(UInt(idx_sz.W)))
+    // 区分 rob flush 和 mispredict
+    val rob_flush = Input(Bool())
 
     val brupdate = Input(new BrUpdateInfo)
 
@@ -306,7 +308,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   when (io.redirect.valid) {
     enq_ptr    := WrapInc(io.redirect.bits, num_entries)
 
-    when (io.brupdate.b2.mispredict) {
+    when (io.brupdate.b2.mispredict && !io.rob_flush) {
     val new_cfi_idx = (io.brupdate.b2.uop.pc_lob ^
       Mux(redirect_entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(log2Ceil(fetchWidth), 1)
       redirect_new_entry.cfi_idx.valid    := true.B

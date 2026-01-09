@@ -246,7 +246,8 @@ class ALUExeUnit(
     (if (hasDiv)  BoomCoreStringPrefix(" - Div") else "") +
     (if (hasIfpu) BoomCoreStringPrefix(" - IFPU") else "") +
     (if (hasMem)  BoomCoreStringPrefix(" - Mem") else "") +
-    (if (hasRocc) BoomCoreStringPrefix(" - RoCC") else "")
+    (if (hasRocc) BoomCoreStringPrefix(" - RoCC") else "") +
+    (if (hasJmpUnit) BoomCoreStringPrefix(" - Jmp") else "")
 
   override def toString: String = out_str.toString
 
