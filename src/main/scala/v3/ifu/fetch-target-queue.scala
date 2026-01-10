@@ -141,6 +141,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val redirect = Input(Valid(UInt(idx_sz.W)))
     // 区分 rob flush 和 mispredict
     val rob_flush = Input(Bool())
+    val rob_flush_pc_lob = Input(UInt(log2Ceil(icBlockBytes).W))
 
     val brupdate = Input(new BrUpdateInfo)
 
@@ -305,8 +306,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.is_repair_update     := false.B
     io.bpdupdate.bits.pc      := bpd_pc
     io.bpdupdate.bits.btb_mispredicts := 0.U
-    io.bpdupdate.bits.br_mask := Mux(bpd_entry.cfi_idx.valid,
-      MaskLower(UIntToOH(cfi_idx)) & bpd_entry.br_mask, bpd_entry.br_mask)
+    io.bpdupdate.bits.br_mask :=  bpd_entry.br_mask
     io.bpdupdate.bits.cfi_idx := bpd_entry.cfi_idx
     io.bpdupdate.bits.cfi_mispredicted := bpd_entry.cfi_mispredicted
     io.bpdupdate.bits.cfi_taken  := bpd_entry.cfi_taken
@@ -345,7 +345,15 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val proper_enq_ptr = Mux(enq_ptr > new_enq_ptr1, new_enq_ptr1, new_enq_ptr2)
     enq_ptr    := proper_enq_ptr + 1.U
 
-    when (io.brupdate.b2.mispredict && !io.rob_flush) {
+    when (io.rob_flush) {
+      val new_cfi_idx = (io.rob_flush_pc_lob ^
+      Mux(redirect_entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(log2Ceil(fetchWidth), 1)
+      // 例如 fetch packet 的四条指令是 br, nop, load, br
+      // 我们预测第四条 br 为 taken，但 load 指令发送了异常
+      // 因此需要在 rob flush 时，修正 cfi_idx 和 br_mask
+      redirect_new_entry.br_mask := MaskLower(UIntToOH(new_cfi_idx)) & redirect_entry.br_mask
+      redirect_new_entry.cfi_idx.valid    := false.B
+    } .elsewhen (io.brupdate.b2.mispredict) {
     val new_cfi_idx = (io.brupdate.b2.uop.pc_lob ^
       Mux(redirect_entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(log2Ceil(fetchWidth), 1)
       redirect_new_entry.cfi_idx.valid    := true.B
@@ -354,6 +362,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       redirect_new_entry.cfi_taken        := io.brupdate.b2.taken
       redirect_new_entry.cfi_is_call      := redirect_entry.cfi_is_call && redirect_entry.cfi_idx.bits === new_cfi_idx
       redirect_new_entry.cfi_is_ret       := redirect_entry.cfi_is_ret  && redirect_entry.cfi_idx.bits === new_cfi_idx
+      // BOOM 原本的逻辑没有修改 cfi_type 和 br_mask
+      // 但我觉得是应该加上的
+      redirect_new_entry.cfi_type         := io.brupdate.b2.cfi_type
+      redirect_new_entry.br_mask          := MaskLower(UIntToOH(new_cfi_idx)) & redirect_entry.br_mask
     }
 
     ras_update     := true.B
@@ -445,5 +457,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   when (io.bpdupdate.valid) {
     assert (io.bpdupdate.bits.target =/= 0.U,
       "FTQ: branch target cannot be 0")
+    
+    when (bpd_entry.cfi_idx.valid) {
+      assert ((MaskLower(UIntToOH(bpd_entry.cfi_idx.bits)) & bpd_entry.br_mask) === bpd_entry.br_mask,
+        "FTQ: bpd_update br_mask has bits set outside of valid fetch bundle")
+    }
   }
 }

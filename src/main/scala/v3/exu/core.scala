@@ -537,6 +537,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.ifu.redirect_val         := false.B
   io.ifu.redirect_flush       := false.B
   io.ifu.rob_flush            := false.B
+  io.ifu.rob_flush_pc_lob     := 0.U
 
   // Breakpoint info
   io.ifu.status  := csr.io.status
@@ -560,6 +561,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // This discrepency should be resolved elsewhere.
   when (RegNext(rob.io.flush.valid)) {
     io.ifu.rob_flush      := true.B
+    io.ifu.rob_flush_pc_lob := RegNext(rob.io.flush.bits.pc_lob)
     io.ifu.redirect_val   := true.B
     io.ifu.redirect_flush := true.B
     val flush_typ = RegNext(rob.io.flush.bits.flush_typ)
