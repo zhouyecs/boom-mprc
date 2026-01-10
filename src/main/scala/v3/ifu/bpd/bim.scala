@@ -82,19 +82,15 @@ class BIMBranchPredictorBank(params: BoomBIMParams = BoomBIMParams())(implicit p
 
   for (w <- 0 until bankWidth) {
     s1_update_wmask(w)         := false.B
-    s1_update_wdata(w)         := DontCare
+    // 如果 bypass 命中，则使用 bypass 的数据
+    s1_update_wdata(w)         := Mux(wrbypass_hit, wrbypass(wrbypass_hit_idx)(w), s1_update_meta.bims(w))
 
     val update_pc = s1_update.bits.pc + (w << 1).U
 
-    when (s1_update.bits.br_mask(w) ||
-      (s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_idx.bits === w.U)) {
+    when (s1_update.bits.br_mask(w)) {
       val was_taken = (
         s1_update.bits.cfi_idx.valid &&
-        (s1_update.bits.cfi_idx.bits === w.U) &&
-        (
-          (s1_update.bits.cfi_is_br && s1_update.bits.br_mask(w) && s1_update.bits.cfi_taken) ||
-          s1_update.bits.cfi_is_jal
-        )
+        (s1_update.bits.cfi_idx.bits === w.U) && (s1_update.bits.cfi_taken)
       )
       val old_bim_value = Mux(wrbypass_hit, wrbypass(wrbypass_hit_idx)(w), s1_update_meta.bims(w))
 
