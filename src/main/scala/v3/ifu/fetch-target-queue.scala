@@ -241,7 +241,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_end_idx = Reg(UInt(log2Ceil(ftqSz).W))
   val bpd_repair_pc = Reg(UInt(vaddrBitsExtended.W))
 
-  val bpd_idx = Mux(bpd_update_repair || bpd_update_mispredict, bpd_repair_idx, bpd_ptr.value)
+  val bpd_idx = bpd_ptr.value
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
   val bpd_lhist = if (useLHist) {
@@ -251,7 +251,18 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
   val bpd_meta  = meta.read(bpd_idx, true.B) // TODO fix these SRAMs
   val bpd_pc    = RegNext(pcs(bpd_idx))
-  val bpd_target = RegNext(pcs(WrapInc(bpd_idx, num_entries)))
+  // TODO: 不怎么写不知道为啥 verilator 那边模拟的时候显示
+  // 当 bpd_ptr == 31 时做 commit update 会有问题，波形图
+  // 显示输出的 bpd_target 为 0，不知道是不是 verilator 的 bug？
+  val next_bpd_idx = Wire(UInt(log2Ceil(ftqSz).W))
+  next_bpd_idx := WrapInc(bpd_idx, num_entries)
+  dontTouch(next_bpd_idx)
+
+  val readout_target = Wire(UInt(vaddrBitsExtended.W))
+  readout_target := pcs(next_bpd_idx)
+  dontTouch(readout_target)
+
+  val bpd_target = RegNext(readout_target)
 
   when (io.redirect.valid) {
     bpd_update_mispredict := false.B
@@ -280,24 +291,18 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // bpd_ptr =/= deq_ptr && enq_ptr =/= WrapInc(bpd_ptr, num_entries)
   // 简化为了 bpd_ptr =/= deq_ptr，因为 deq_ptr < enq_ptr 在第一次 commit
   // update 后总是成立，而 bpd_ptr <= deq_ptr
-  val do_commit_update     = (!bpd_update_mispredict &&
-                              !bpd_update_repair &&
-                              bpd_ptr =/= deq_ptr &&
+  val do_commit_update     = (bpd_ptr =/= deq_ptr &&
                               !io.brupdate.b2.mispredict &&
                               !io.redirect.valid && !RegNext(io.redirect.valid))
-  val do_mispredict_update = bpd_update_mispredict
-  val do_repair_update     = bpd_update_repair
 
   val done_commit_update_debug = RegInit(false.B)
 
-  when (RegNext(do_commit_update || do_repair_update || do_mispredict_update)) {
+  when (RegNext(do_commit_update)) {
     val cfi_idx = bpd_entry.cfi_idx.bits
-    val valid_repair = bpd_pc =/= bpd_repair_pc
 
-    io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
-                           !(RegNext(do_repair_update) && !valid_repair)
-    io.bpdupdate.bits.is_mispredict_update := RegNext(do_mispredict_update)
-    io.bpdupdate.bits.is_repair_update     := RegNext(do_repair_update)
+    io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U)
+    io.bpdupdate.bits.is_mispredict_update := false.B
+    io.bpdupdate.bits.is_repair_update     := false.B
     io.bpdupdate.bits.pc      := bpd_pc
     io.bpdupdate.bits.btb_mispredicts := 0.U
     io.bpdupdate.bits.br_mask := Mux(bpd_entry.cfi_idx.valid,
@@ -382,7 +387,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.get_ftq_pc(i).pc        := RegNext(pcs(idx))
     io.get_ftq_pc(i).next_pc   := RegNext(next_pc)
     io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= enq_ptr.value || next_is_enq)
-    io.get_ftq_pc(i).com_pc    := RegNext(pcs(Mux(io.deq.valid, io.deq.bits, deq_ptr.value)))
+    
+    val com_pc_ptr = Wire(UInt(log2Ceil(ftqSz).W))
+    com_pc_ptr := Mux(io.deq.valid, io.deq.bits, deq_ptr.value)
+    io.get_ftq_pc(i).com_pc    := RegNext(pcs(com_pc_ptr))
   }
 
   for (w <- 0 until coreWidth) {
