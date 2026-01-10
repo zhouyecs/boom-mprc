@@ -442,4 +442,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // 来指示 io.get_ftq_pc(i).ftq_idx 是否有效
     assert (bpd_ptr < enq_ptr, "bpd_ptr should never commit a invalid ftq entry")
   }
+  when (io.bpdupdate.valid) {
+    assert (io.bpdupdate.bits.target =/= 0.U,
+      "FTQ: branch target cannot be 0")
+  }
 }
