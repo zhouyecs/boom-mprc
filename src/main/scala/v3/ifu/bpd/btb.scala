@@ -6,6 +6,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
+import freechips.rocketchip.util.PlusArg
 
 import boom.v3.common._
 import boom.v3.util.{BoomCoreStringPrefix}
@@ -163,6 +164,53 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     s1_update_wmeta_data(w).is_br   := s1_update.bits.br_mask(w)
   }
 
+  val btb_reset_value = WireDefault(0.U(btbEntrySz.W))
+  val meta_reset_value = WireDefault(0.U(btbMetaSz.W))
+  if (IN_SIMULATION) {
+    val cmd_btb_reset_v = PlusArg("btb-reset-value", 0x0, "Value to initialize BTB entries to on reset", offsetSz)
+    btb_reset_value := Cat(cmd_btb_reset_v, 0.U(1.W))
+    val cmd_meta_reset_v = PlusArg("btb-meta-reset-value", 0x0, "Value to initialize BTB meta entries to on reset", btbMetaSz)
+    meta_reset_value := cmd_meta_reset_v
+  }
+
+  if (IN_SIMULATION && F2BTB_PRINTF) {
+    // Add a free-running cycle counter for simulation
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+
+    when (s1_valid) {
+      printf("[%d BTB Read] S1 PC: 0x%x, idx: 0x%x, tag: 0x%x, hits: %b, hit_ways: %d\n",
+        cycleCount,
+        s1_pc,
+        s1_idx(log2Ceil(nSets)-1,0),
+        s1_req_tag,
+        VecInit(s1_hits).asUInt,
+        VecInit(s1_hit_ways).asUInt
+      )
+      // print out meta tag
+      for (w <- 0 until bankWidth) {
+        printf("tag slot %d way 0: 0x%x, tag slot %d way 1: 0x%x\n",
+          w.U, s1_req_rmeta(0)(w).tag,
+          w.U, s1_req_rmeta(1)(w).tag)
+      }
+    }
+    when (s1_update.valid && s1_update.bits.is_commit_update && !doing_reset) {
+      printf("[%d BTB Update] PC: 0x%x, idx: 0x%x, tag: 0x%x, cfi_idx: %d, target: 0x%x, taken: %b, br_mask: %b, btb_mispredicts: %b, write_way: %d, new_offset: 0x%x (extended: %b)\n",
+        cycleCount,
+        s1_update.bits.pc,
+        s1_update_idx(log2Ceil(nSets)-1,0),
+        s1_update_idx >> log2Ceil(nSets),
+        s1_update_cfi_idx,
+        s1_update.bits.target,
+        s1_update.bits.cfi_taken,
+        s1_update.bits.br_mask.asUInt,
+        s1_update.bits.btb_mispredicts.asUInt,
+        s1_update_meta.write_way,
+        new_offset_value,
+        offset_is_extended
+      )
+    }
+  }
+
   for (w <- 0 until nWays) {
     when (doing_reset || s1_update_meta.write_way === w.U || (w == 0 && nWays == 1).B) {
       btb(w).write(
@@ -170,7 +218,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
           reset_idx,
           s1_update_idx),
         Mux(doing_reset,
-          VecInit(Seq.fill(bankWidth) { 0.U(btbEntrySz.W) }),
+          VecInit(Seq.fill(bankWidth) { btb_reset_value }),
           VecInit(Seq.fill(bankWidth) { s1_update_wbtb_data.asUInt })),
         Mux(doing_reset,
           (~(0.U(bankWidth.W))),
@@ -181,7 +229,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
           reset_idx,
           s1_update_idx),
         Mux(doing_reset,
-          VecInit(Seq.fill(bankWidth) { 0.U(btbMetaSz.W) }),
+          VecInit(Seq.fill(bankWidth) { meta_reset_value }),
           VecInit(s1_update_wmeta_data.map(_.asUInt))),
         Mux(doing_reset,
           (~(0.U(bankWidth.W))),
