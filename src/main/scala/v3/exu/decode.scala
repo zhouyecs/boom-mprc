@@ -715,8 +715,12 @@ class BranchDecode(implicit p: Parameters) extends BoomModule
   val cs_is_shadowable = bpd_csignals(3)(0)
   val cs_has_rs2 = bpd_csignals(4)(0)
 
-  io.out.is_call := (cs_is_jal || cs_is_jalr) && GetRd(io.inst) === RA
-  io.out.is_ret  := cs_is_jalr && GetRs1(io.inst) === BitPat("b00?01") && GetRd(io.inst) === X0
+  // 这里遵从了香山的 PreDecode.scala 中检测 call 和 ret 的逻辑, 它和
+  // RISC-V 基本指令集手册的 2.5.1. Unconditional Jumps 一节定义的
+  // call/ret 稍微有些出入。RISC-V 手册中允许 rs1 和 rd 都是 x1 或
+  // x5 来表达又是 call 又是 ret 的情况，但这种 case 处理起来会有些麻烦
+  io.out.is_call := (cs_is_jal || cs_is_jalr) && GetRd(io.inst) === BitPat("b00?01")
+  io.out.is_ret  := cs_is_jalr && GetRs1(io.inst) === BitPat("b00?01") && !io.out.is_call
 
   io.out.target := Mux(cs_is_br, ComputeBranchTarget(io.pc, io.inst, xLen),
                                  ComputeJALTarget(io.pc, io.inst, xLen))

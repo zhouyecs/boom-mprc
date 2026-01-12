@@ -484,10 +484,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_is_br(w) := valid && uop.is_br
     com_is_jal(w) := valid && uop.is_jal
     com_is_jalr(w)  := valid && uop.is_jalr
-    com_is_ret(w)   := valid && uop.is_jalr && (uop.ldst === 0.U) && ((uop.lrs1 === 1.U) || (uop.lrs1 === 5.U))
-    // RISC-V 手册里建议应该 rd=x1(ra) 或者 rd=x5(t0) 都视为 call 指令
-    // 但 BOOM 里检测 call 指令时只使用了 x1, 这里也遵循 BOOM 里的检测
-    com_is_call(w) := valid && (uop.is_jalr || uop.is_jal) && (uop.ldst === 1.U)
+    // 这里遵从了香山的 PreDecode.scala 中检测 call 和 ret 的逻辑, 它和
+    // RISC-V 基本指令集手册的 2.5.1. Unconditional Jumps 一节定义的
+    // call/ret 稍微有些出入。RISC-V 手册中允许 rs1 和 rd 都是 x1 或
+    // x5 来表达又是 call 又是 ret 的情况，但这种 case 处理起来会有些麻烦
+    com_is_call(w) := valid && (uop.is_jalr || uop.is_jal) && ((uop.ldst === 1.U) || (uop.ldst === 5.U)) // c.jal 在 RV64 中会被译码为 c.addiw
+    com_is_ret(w)   := valid && uop.is_jalr && ((uop.lrs1 === 1.U) || (uop.lrs1 === 5.U)) && !com_is_call(w)
 
     // fsrc 表示 next pc 从哪来的，如果 next pc 来自后端，则说明分支预测错误
     com_misp_br(w)    := com_is_br(w)   && uop.debug_fsrc === BSRC_C
