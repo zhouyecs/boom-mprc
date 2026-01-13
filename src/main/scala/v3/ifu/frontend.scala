@@ -1007,6 +1007,30 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     (BoomCoreStringPrefix("====Overall Frontend Params====") + "\n"
     + icache.toString + bpd.toString)
 
+  // Printf
+  if (IN_SIMULATION) {
+    // Add a free-running cycle counter for simulation
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+
+    val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
+    when (cmd_ras_printf(0)) {
+      when (ftq.io.ras_update) {
+        printf(p"[${cycleCount} RAS Update] idx=${Hexadecimal(ftq.io.ras_update_idx)} " +
+          p"addr=${Hexadecimal(ftq.io.ras_update_pc)}\n")
+      } .elsewhen(bpd.io.f3_write_valid) {
+        val call_pc = bpd.io.f3_write_addr - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+        printf(p"[${cycleCount} RAS Push] idx=${Hexadecimal(bpd.io.f3_write_idx)} " +
+          p"addr=${Hexadecimal(bpd.io.f3_write_addr)} pc=${Hexadecimal(call_pc)}\n")
+      }
+      when (f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid && f3.io.deq.fire) {
+        val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+          f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+        printf(p"[${cycleCount} RAS Pop] idx=${Hexadecimal(f3_fetch_bundle.ghist.ras_idx)} " +
+          p"top=${Hexadecimal(f3_fetch_bundle.ras_top)}, pc=${Hexadecimal(ret_pc)}\n")
+      }
+    }
+  }
+
   // Assertions
   when (f3.io.deq.fire) {
     // Check all preds(i).ras_top are identical for i in [0, fetchWidth)

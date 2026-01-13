@@ -20,7 +20,7 @@ import chisel3._
 import chisel3.util._
 
 import org.chipsalliance.cde.config.{Parameters}
-import freechips.rocketchip.util.{Str}
+import freechips.rocketchip.util.{Str, PlusArg}
 
 import boom.v3.common._
 import boom.v3.exu._
@@ -407,6 +407,37 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   for (w <- 0 until coreWidth) {
     io.debug_fetch_pc(w) := RegNext(pcs(io.debug_ftq_idx(w)))
+  }
+
+  // Printf
+  if (IN_SIMULATION) {
+    // Add a free-running cycle counter for simulation
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+    val prev_update_printf = PlusArg("prev-ras-update", 0, "Print FTQ prev entry update", 1)
+    when (do_enq && prev_update_printf(0)) {
+       val ghist_by_prev = prev_ghist.update(
+        prev_entry.br_mask,
+        prev_entry.cfi_taken,
+        prev_entry.br_mask(prev_entry.cfi_idx.bits),
+        prev_entry.cfi_idx.bits,
+        prev_entry.cfi_idx.valid,
+        prev_pc,
+        prev_entry.cfi_is_call,
+        prev_entry.cfi_is_ret
+      )
+      when (io.enq.bits.ghist.current_saw_branch_not_taken) {
+        ghist_by_prev := io.enq.bits.ghist
+      }
+      when (ghist_by_prev.ras_idx =/= prev_ghist.ras_idx || 
+            io.enq.bits.ghist.ras_idx =/= prev_ghist.ras_idx) {
+        printf(p"[${cycleCount} FTQ] prev_ras_idx=${Hexadecimal(prev_ghist.ras_idx)}, " +
+          p"prev_cfi_call=${prev_entry.cfi_is_call && prev_entry.cfi_idx.valid}, " +
+          p"prev_cfi_ret=${prev_entry.cfi_is_ret && prev_entry.cfi_idx.valid}, " +
+          p"prev_pc=${Hexadecimal(prev_pc)}, " +
+          p"now_ras_idx=${Hexadecimal(ghist_by_prev.ras_idx)}, " +
+          p"real_ras_idx=${Hexadecimal(io.enq.bits.ghist.ras_idx)}\n")
+      }
+    }
   }
 
   // Assertion
