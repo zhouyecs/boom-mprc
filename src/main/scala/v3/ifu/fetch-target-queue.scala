@@ -429,6 +429,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       // 按我的理解这俩应该是相等的
       assert (io.enq.bits.ghist === ghist_by_prev,
         "FTQ: ghist mismatch on enqueue. ")
+      assert (io.enq.bits.ghist.ras_idx === ghist_by_prev.ras_idx,
+        p"FTQ: ras_idx mismatch on enqueue. enq: ${io.enq.bits.ghist.ras_idx}, prev: ${ghist_by_prev.ras_idx}")
     }
   }
   

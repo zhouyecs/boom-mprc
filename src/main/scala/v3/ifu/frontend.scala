@@ -835,6 +835,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     }
     when (s2_valid && s2_vpc === f3_predicted_target && !f3_correct_f2_ghist) {
       f3.io.enq.bits.ghist := f3_predicted_ghist
+      // 说明发生了 f2 replay, 我们需要把预测的 ghist 更新回去
+      // replay 的原因有 f2_clear 为 true 或 icache resp valid
+      // 为 false，这里如果发生了 f2_clear，仅可能是来自后端的重定向, 
+      // 它设置 s0_ghist 的优先级会更高
+      when (!f3.io.enq.fire) {
+        s0_ghist := f3_predicted_ghist 
+      }
     } .elsewhen (!s2_valid && s1_valid && s1_vpc === f3_predicted_target && !f3_correct_f1_ghist) {
       s2_ghist := f3_predicted_ghist
     } .elsewhen (( s2_valid &&  (s2_vpc =/= f3_predicted_target || f3_correct_f2_ghist)) ||
