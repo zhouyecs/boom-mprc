@@ -567,15 +567,17 @@ class WithTAGEBPD extends Config((site, here, up) => {
         val btb = Module(new BTBBranchPredictorBank()(p))
         val bim = Module(new BIMBranchPredictorBank()(p))
         val ubtb = Module(new FAMicroBTBBranchPredictorBank()(p))
-        val preds = Seq(tage, btb, ubtb, bim)
+        val ras = Module(new RASBranchPredictorBank()(p))
+        val preds = Seq(tage, btb, ubtb, bim, ras)
         preds.map(_.io := DontCare)
 
         ubtb.io.resp_in(0)  := resp_in
         bim.io.resp_in(0)   := ubtb.io.resp
         btb.io.resp_in(0)   := bim.io.resp
         tage.io.resp_in(0)  := btb.io.resp
+        ras.io.resp_in(0)   := tage.io.resp
 
-        (preds, tage.io.resp)
+        (preds, ras.io.resp)
       })
     )))
     case other => other

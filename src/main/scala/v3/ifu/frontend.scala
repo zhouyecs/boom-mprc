@@ -340,7 +340,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val bpd = Module(new BranchPredictor)
   bpd.io.f3_fire := false.B
-  val ras = Module(new BoomRAS)
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache
@@ -552,12 +551,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.tsrc := s2_tsrc
 
   // RAS takes a cycle to read
-  val ras_read_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
-  ras.io.read_idx := ras_read_idx
-  when (f3.io.enq.fire) {
-    ras_read_idx := f3.io.enq.bits.ghist.ras_idx
-    ras.io.read_idx := f3.io.enq.bits.ghist.ras_idx
-  }
+  bpd.io.f2_read_idx := f3.io.enq.bits.ghist.ras_idx
 
 
   // The BPD resp comes in f3
@@ -792,13 +786,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_idx.valid := f3_redirects.reduce(_||_)
   f3_fetch_bundle.cfi_idx.bits  := PriorityEncoder(f3_redirects)
 
-  f3_fetch_bundle.ras_top := ras.io.read_addr
+  f3_fetch_bundle.ras_top := f3_bpd_resp.io.deq.bits.preds(0).ras_top
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
   val f3_predicted_target = Mux(f3_redirects.reduce(_||_),
     Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B,
-      ras.io.read_addr,
+      f3_bpd_resp.io.deq.bits.preds(0).ras_top,
       f3_targs(PriorityEncoder(f3_redirects))
     ),
     nextFetch(f3_fetch_bundle.pc)
@@ -816,11 +810,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_fetch_bundle.cfi_is_ret
   )
 
-
-  ras.io.write_valid := false.B
-  ras.io.write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+  bpd.io.f3_write_valid := false.B
+  bpd.io.f3_write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
-  ras.io.write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
+  bpd.io.f3_write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
 
 
   val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
@@ -828,7 +821,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
-      ras.io.write_valid := true.B
+      bpd.io.f3_write_valid := true.B
     }
     when (f3_redirects.reduce(_||_)) {
       f3_prev_is_half := false.B
@@ -952,10 +945,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.update := bpd_update_arbiter.io.out
   bpd_update_arbiter.io.out.ready := true.B
 
+  // 从 FTQ 来的 RAS 更新具有更高优先级 
   when (ftq.io.ras_update && enableRasTopRepair.B) {
-    ras.io.write_valid := true.B
-    ras.io.write_idx   := ftq.io.ras_update_idx
-    ras.io.write_addr  := ftq.io.ras_update_pc
+    bpd.io.f3_write_valid := true.B
+    bpd.io.f3_write_idx   := ftq.io.ras_update_idx
+    bpd.io.f3_write_addr  := ftq.io.ras_update_pc
   }
 
 
@@ -1012,4 +1006,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   override def toString: String =
     (BoomCoreStringPrefix("====Overall Frontend Params====") + "\n"
     + icache.toString + bpd.toString)
+
+  // Assertions
+  when (f3.io.deq.fire) {
+    // Check all preds(i).ras_top are identical for i in [0, fetchWidth)
+    val f3_ras_top_eq = (0 until fetchWidth-1).map { i =>
+      f3_bpd_resp.io.deq.bits.preds(i).ras_top === f3_bpd_resp.io.deq.bits.preds(i+1).ras_top
+    }.reduce(_ && _)
+    assert(f3_ras_top_eq, "RAS tops should be the same in BPD response across instructions")
+  }
 }

@@ -25,8 +25,8 @@ class BranchPrediction(implicit p: Parameters) extends BoomBundle()(p)
   val is_jal          = Bool()
   // What is the target of his branch/jump? Do we know the target?
   val predicted_pc    = Valid(UInt(vaddrBitsExtended.W))
-
-
+  // ras 的栈顶值，没有 valid 信号
+  val ras_top         = UInt(vaddrBitsExtended.W)
 }
 
 // A branch prediction for a entire fetch-width worth of instructions
@@ -154,6 +154,13 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val f3_fire = Input(Bool())
 
     val update = Input(Valid(new BranchPredictionBankUpdate))
+
+    // For RAS
+    val f2_read_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+
+    val f3_write_valid = Input(Bool())
+    val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+    val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
   })
   io.resp := io.resp_in(0)
 
@@ -209,6 +216,12 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     // Update
     val update = Input(Valid(new BranchPredictionUpdate))
+    // For RAS
+    val f2_read_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+
+    val f3_write_valid = Input(Bool())
+    val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+    val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
   })
 
   var total_memsize = 0
@@ -240,6 +253,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(0).io.f1_lhist := banked_lhist_providers(0).io.f1_lhist
 
     banked_predictors(0).io.resp_in(0)           := (0.U).asTypeOf(new BranchPredictionBankResponse)
+    // For RAS
+    banked_predictors(0).io.f2_read_idx := io.f2_read_idx
+    banked_predictors(0).io.f3_write_valid := io.f3_write_valid
+    banked_predictors(0).io.f3_write_idx := io.f3_write_idx
+    banked_predictors(0).io.f3_write_addr := io.f3_write_addr
   } else {
     require(nBanks == 2)
 

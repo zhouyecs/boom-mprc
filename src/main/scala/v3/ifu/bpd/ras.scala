@@ -44,3 +44,20 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
 
 
 }
+
+class RASBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p: Parameters) extends BranchPredictorBank()(p)
+{
+  require(nBanks == 1, "RAS predictor bank only supports single bank.")
+  val mems = Seq(("RASBranchPredictorBank", nRasEntries, vaddrBitsExtended))
+
+  val ras = Module(new BoomRAS())
+
+  ras.io.read_idx := io.f2_read_idx
+  ras.io.write_valid := io.f3_write_valid
+  ras.io.write_idx := io.f3_write_idx
+  ras.io.write_addr := io.f3_write_addr
+
+  for (i <- 0 until bankWidth) {
+    io.resp.f3(i).ras_top := ras.io.read_addr
+  }
+}
