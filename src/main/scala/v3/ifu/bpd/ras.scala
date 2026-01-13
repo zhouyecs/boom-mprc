@@ -32,7 +32,7 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     val write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
     val write_addr  = Input(UInt(vaddrBitsExtended.W))
   })
-  val ras = Reg(Vec(nRasEntries, UInt(vaddrBitsExtended.W)))
+  val ras = RegInit(VecInit(Seq.fill(nRasEntries)(0.U(vaddrBitsExtended.W))))
 
   io.read_addr := Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
     RegNext(io.write_addr),

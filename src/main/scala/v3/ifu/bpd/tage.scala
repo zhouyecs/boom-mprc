@@ -138,9 +138,9 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
     Mux(doing_reset || doing_clear_u_lo, ~(0.U(bankWidth.W)), io.update_u_mask.asUInt).asBools
   )
 
-  val wrbypass_tags    = Reg(Vec(nWrBypassEntries, UInt(tagSz.W)))
-  val wrbypass_idxs    = Reg(Vec(nWrBypassEntries, UInt(log2Ceil(nRows).W)))
-  val wrbypass         = Reg(Vec(nWrBypassEntries, Vec(bankWidth, UInt(3.W))))
+  val wrbypass_tags    = RegInit(VecInit(Seq.fill(nWrBypassEntries)(0.U(tagSz.W))))
+  val wrbypass_idxs    = RegInit(VecInit(Seq.fill(nWrBypassEntries)(0.U(log2Ceil(nRows).W))))
+  val wrbypass         = RegInit(VecInit(Seq.fill(nWrBypassEntries)(VecInit(Seq.fill(bankWidth)(3.U(3.W))))))
   val wrbypass_enq_idx = RegInit(0.U(log2Ceil(nWrBypassEntries).W))
 
   val wrbypass_hits    = VecInit((0 until nWrBypassEntries) map { i =>

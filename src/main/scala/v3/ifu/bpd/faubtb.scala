@@ -55,7 +55,7 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
 
 
   val meta     = RegInit((0.U).asTypeOf(Vec(nWays, Vec(bankWidth, new MicroBTBMeta))))
-  val btb      = Reg(Vec(nWays, Vec(bankWidth, new MicroBTBEntry)))
+  val btb      = RegInit(VecInit(Seq.fill(nWays)(VecInit(Seq.fill(bankWidth)(0.U.asTypeOf(new MicroBTBEntry))))))
 
   val mems = Nil
 

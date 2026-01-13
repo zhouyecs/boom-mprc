@@ -67,8 +67,8 @@ class BIMBranchPredictorBank(params: BoomBIMParams = BoomBIMParams())(implicit p
   val s1_update_meta    = s1_update.bits.meta.asTypeOf(new BIMMeta)
   val s1_update_index   = s1_update_idx
 
-  val wrbypass_idxs = Reg(Vec(nWrBypassEntries, UInt(log2Ceil(nSets).W)))
-  val wrbypass      = Reg(Vec(nWrBypassEntries, Vec(bankWidth, UInt(2.W))))
+  val wrbypass_idxs = RegInit(VecInit(Seq.fill(nWrBypassEntries)(0.U(log2Ceil(nSets).W))))
+  val wrbypass      = RegInit(VecInit(Seq.fill(nWrBypassEntries)(VecInit(Seq.fill(bankWidth)(2.U(2.W))))))
   val wrbypass_enq_idx = RegInit(0.U(log2Ceil(nWrBypassEntries).W))
 
   val wrbypass_hits = VecInit((0 until nWrBypassEntries) map { i =>
