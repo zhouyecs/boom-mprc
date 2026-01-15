@@ -597,9 +597,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Tracks if last fetchpacket contained a half-inst
   val f3_prev_is_half = RegInit(false.B)
 
+  // 现在的译码逻辑的输入不包含 f3 预测
+  // 它的输出包括 5 个 predecode_xxx 信号，f3_is_rvc, f3_npc_plus4_mask 信号 
+  // f3_fetch_bundle 的 insts, exp_insts, edge_inst 信号
+  // 以及 bank_prev_is_half, bank_prev_half 信号
+  // 预译码输出的 bank_prev_is_half 尚未考虑分支跳转的影响 
+
+  // 表示该指令是否有效（考虑了 fetch pc 和压缩指令的影响，没考虑分支指令跳转）
+  val predecode_valid = Wire(Vec(fetchWidth, Bool()))
+  val predecode_is_call = Wire(Vec(fetchWidth, Bool()))
+  val predecode_is_ret  = Wire(Vec(fetchWidth, Bool()))
+  val predecode_cfi_type = Wire(Vec(fetchWidth, UInt(CFI_SZ.W)))
+  val predecode_targets = Wire(Vec(fetchWidth, UInt(vaddrBitsExtended.W)))
+
   require(fetchWidth >= 4) // Logic gets kind of annoying with fetchWidth = 2
   def isRVC(inst: UInt) = (inst(1,0) =/= 3.U)
-  var redirect_found = false.B
   var bank_prev_is_half = f3_prev_is_half
   var bank_prev_half    = f3_prev_half
   var last_inst = 0.U(16.W)
@@ -693,20 +705,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       }
 
       f3_is_rvc(i) := isRVC(bank_insts(w))
-
-
-      bank_mask(w) := f3.io.deq.valid && f3_imemresp.mask(i) && valid && !redirect_found
-      f3_mask  (i) := f3.io.deq.valid && f3_imemresp.mask(i) && valid && !redirect_found
-      f3_targs (i) := Mux(brsigs.cfi_type === CFI_JALR,
-        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits,
-        brsigs.target)
-
-      // Flush BTB entries for JALs if we mispredict the target
-      f3_btb_mispredicts(i) := (brsigs.cfi_type === CFI_JAL && valid &&
-        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.valid &&
-        (f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits =/= brsigs.target)
-      )
-
+      bank_mask(w) := f3.io.deq.valid && f3_imemresp.mask(i) && valid
+      predecode_valid(i) := bank_mask(w)
+      predecode_is_call(i) := brsigs.is_call
+      predecode_is_ret (i) := brsigs.is_ret
+      predecode_cfi_type(i) := brsigs.cfi_type
+      predecode_targets(i) := brsigs.target
 
       f3_npc_plus4_mask(i) := (if (w == 0) {
         !f3_is_rvc(i) && !bank_prev_is_half
@@ -734,23 +738,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
                                              (brsigs.shadowable || !f3_mask(i)))
       f3_fetch_bundle.sfb_dests(i)       := offset_from_aligned_pc
 
-      // Redirect if
-      //  1) its a JAL/JALR (unconditional)
-      //  2) the BPD believes this is a branch and says we should take it
-      f3_redirects(i)    := f3_mask(i) && (
-        brsigs.cfi_type === CFI_JAL || brsigs.cfi_type === CFI_JALR ||
-        (brsigs.cfi_type === CFI_BR && f3_bpd_resp.io.deq.bits.preds(i).taken && useBPD.B)
-      )
-
-      f3_br_mask(i)   := f3_mask(i) && brsigs.cfi_type === CFI_BR
-      f3_cfi_types(i) := brsigs.cfi_type
-      f3_call_mask(i) := brsigs.is_call
-      f3_ret_mask(i)  := brsigs.is_ret
-
       f3_fetch_bundle.bp_debug_if_oh(i) := bpu.io.debug_if
       f3_fetch_bundle.bp_xcpt_if_oh (i) := bpu.io.xcpt_if
 
-      redirect_found = redirect_found || f3_redirects(i)
     }
     last_inst = bank_insts(bankWidth-1)(15,0)
     bank_prev_is_half = Mux(f3_bank_mask(b),
@@ -760,6 +750,35 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       last_inst(15,0),
       bank_prev_half)
   }
+
+  var redirect_found = false.B
+  for (i <- 0 until fetchWidth) {
+      // Redirect if
+      //  1) its a JAL/JALR (unconditional)
+      //  2) the BPD believes this is a branch and says we should take it
+      f3_redirects(i)    := predecode_valid(i) && (
+        predecode_cfi_type(i) === CFI_JAL || predecode_cfi_type(i) === CFI_JALR ||
+        (predecode_cfi_type(i) === CFI_BR && f3_bpd_resp.io.deq.bits.preds(i).taken && useBPD.B)
+      )
+      f3_mask  (i) := predecode_valid(i) && !redirect_found
+      f3_targs (i) := Mux(predecode_cfi_type(i) === CFI_JALR,
+        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits,
+        predecode_targets(i))
+
+      // Flush BTB entries for JALs if we mispredict the target
+      f3_btb_mispredicts(i) := (predecode_cfi_type(i) === CFI_JAL && predecode_valid(i) &&
+        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.valid &&
+        (f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits =/= predecode_targets(i))
+      )
+
+      f3_br_mask(i)   := f3_mask(i) && predecode_cfi_type(i) === CFI_BR
+      f3_cfi_types(i) := predecode_cfi_type(i)
+      f3_call_mask(i) := predecode_is_call(i)
+      f3_ret_mask(i)  := predecode_is_ret(i)
+
+      redirect_found = redirect_found || f3_redirects(i)
+  }
+
 
   f3_fetch_bundle.cfi_type      := f3_cfi_types(f3_fetch_bundle.cfi_idx.bits)
   f3_fetch_bundle.cfi_is_call   := f3_call_mask(f3_fetch_bundle.cfi_idx.bits)
