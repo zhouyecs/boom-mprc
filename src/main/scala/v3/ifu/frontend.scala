@@ -557,8 +557,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
 
+  // 会不会改为 f3_ras_top_idx 更合适一些？
+  val f2_ras_top_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
+  val f2_ras_top_idx_write = WireDefault(f2_ras_top_idx)
+  f2_ras_top_idx := f2_ras_top_idx_write
   // RAS takes a cycle to read
-  bpd.io.f2_read_idx := f3.io.enq.bits.ghist.ras_idx
+  bpd.io.f2_read_idx := f2_ras_top_idx_write
 
 
   // The BPD resp comes in f3
@@ -793,6 +797,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_npc_plus4 := f3_npc_plus4_mask(f3_fetch_bundle.cfi_idx.bits)
 
   f3_fetch_bundle.ghist    := f3.io.deq.bits.ghist
+  // 忽略 f1, f2, f3 ghist 的 ras_idx 字段
+  f3_fetch_bundle.ghist.ras_idx := f2_ras_top_idx
   f3_fetch_bundle.lhist    := f3_bpd_resp.io.deq.bits.lhist
   f3_fetch_bundle.bpd_meta := f3_bpd_resp.io.deq.bits.meta
 
@@ -836,6 +842,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_fetch_bundle.cfi_is_ret
   )
 
+  // 如果后端重定向引发 ras top idx 的修正和 f3_fire 引发 call/ret 指令修改 ras 内容
+  // 可以同时发生，互不干扰，因此这里没有检查 f3_clear 信号。下一周期 ftq 传来 ras 内容的
+  // 修正请求时，f3_fire 必为 false
   bpd.io.f3_write_valid := false.B
   bpd.io.f3_write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
@@ -847,21 +856,24 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
       bpd.io.f3_write_valid := true.B
+      f2_ras_top_idx_write := WrapInc(f2_ras_top_idx, nRasEntries)
+    } .elsewhen(f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid) {
+      f2_ras_top_idx_write := WrapDec(f2_ras_top_idx, nRasEntries)
     }
     when (f3_redirects.reduce(_||_)) {
       f3_prev_is_half := false.B
     }
     when (s2_valid && s2_vpc === f3_predicted_target && !f3_correct_ghist) {
-      f3.io.enq.bits.ghist.ras_idx := f3_predicted_ghist.ras_idx
+      // f3.io.enq.bits.ghist.ras_idx := f3_predicted_ghist.ras_idx
       // 说明发生了 f2 replay, 我们需要把预测的 ghist 更新回去
       // replay 的原因有 f2_clear 为 true 或 icache resp valid
       // 为 false，这里如果发生了 f2_clear，仅可能是来自后端的重定向, 
       // 它设置 s0_ghist 的优先级会更高
-      when (!f3.io.enq.fire) {
-        s0_ghist.ras_idx := f3_predicted_ghist.ras_idx
-      }
+      // when (!f3.io.enq.fire) {
+      //   s0_ghist.ras_idx := f3_predicted_ghist.ras_idx
+      // }
     } .elsewhen (!s2_valid && s1_valid && s1_vpc === f3_predicted_target && !f3_correct_ghist) {
-      s2_ghist.ras_idx := f3_predicted_ghist.ras_idx
+      // s2_ghist.ras_idx := f3_predicted_ghist.ras_idx
     } .elsewhen (( s2_valid &&  (s2_vpc =/= f3_predicted_target || f3_correct_ghist)) ||
           (!s2_valid &&  s1_valid && (s1_vpc =/= f3_predicted_target || f3_correct_ghist)) ||
           (!s2_valid && !s1_valid)) {
@@ -975,6 +987,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     bpd.io.f3_write_valid := true.B
     bpd.io.f3_write_idx   := ftq.io.ras_update_idx
     bpd.io.f3_write_addr  := ftq.io.ras_update_pc
+
+    assert (RegNext(io.cpu.redirect_val), "RAS updates should only occur on next cycle of redirects" )
+    assert (!f3.io.deq.valid, "f3 should be cleared by redirects when RAS updates occur")
   }
 
 
@@ -1022,6 +1037,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
     ftq.io.redirect.valid := io.cpu.redirect_val
     ftq.io.redirect.bits  := io.cpu.redirect_ftq_idx
+
+    // 如果预测错误的 cfi 指令是 call 或者 ret 指令, 则
+    // 新的 ras top 和 ftq update ras idx 不相同
+    f2_ras_top_idx_write := io.cpu.redirect_ghist.ras_idx
   }
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
