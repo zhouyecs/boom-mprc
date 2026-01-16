@@ -81,6 +81,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val s1_resp   = Wire(Vec(bankWidth, Valid(UInt(vaddrBitsExtended.W))))
   val s1_is_br  = Wire(Vec(bankWidth, Bool()))
   val s1_is_jal = Wire(Vec(bankWidth, Bool()))
+  val s1_is_call = Wire(Vec(bankWidth, Bool()))
+  val s1_is_ret  = Wire(Vec(bankWidth, Bool()))
 
   val s1_hit_ohs = VecInit((0 until bankWidth) map { i =>
     VecInit((0 until nWays) map { w =>
@@ -100,6 +102,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       (s1_pc.asSInt + (w << 1).S + entry_btb.offset).asUInt)
     s1_is_br(w)  := !doing_reset && s1_resp(w).valid &&  entry_meta.is_br
     s1_is_jal(w) := !doing_reset && s1_resp(w).valid && !entry_meta.is_br
+    s1_is_call(w) := !doing_reset && s1_resp(w).valid && entry_meta.is_call
+    s1_is_ret(w)  := !doing_reset && s1_resp(w).valid && entry_meta.is_ret
 
 
     io.resp.f2(w) := io.resp_in(0).f2(w)
@@ -108,6 +112,10 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       io.resp.f2(w).predicted_pc := RegNext(s1_resp(w))
       io.resp.f2(w).is_br        := RegNext(s1_is_br(w))
       io.resp.f2(w).is_jal       := RegNext(s1_is_jal(w))
+      io.resp.f2(w).is_call      := RegNext(s1_is_call(w))
+      io.resp.f2(w).is_ret       := RegNext(s1_is_ret(w))
+      // s1_is_jal 是 !s1_is_br，所以它表示该指令是否是无条件跳转指令
+      // 包括了 jal 指令和 jalr 指令
       when (RegNext(s1_is_jal(w))) {
         io.resp.f2(w).taken      := true.B
       }
@@ -116,6 +124,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       io.resp.f3(w).predicted_pc := RegNext(io.resp.f2(w).predicted_pc)
       io.resp.f3(w).is_br        := RegNext(io.resp.f2(w).is_br)
       io.resp.f3(w).is_jal       := RegNext(io.resp.f2(w).is_jal)
+      io.resp.f3(w).is_call      := RegNext(io.resp.f2(w).is_call)
+      io.resp.f3(w).is_ret       := RegNext(io.resp.f2(w).is_ret)
       when (RegNext(RegNext(s1_is_jal(w)))) {
         io.resp.f3(w).taken      := true.B
       }
@@ -164,8 +174,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   for (w <- 0 until bankWidth) {
     s1_update_wmeta_data(w).tag     := Mux(s1_update.bits.btb_mispredicts(w), 0.U, s1_update_idx >> log2Ceil(nSets))
     s1_update_wmeta_data(w).is_br   := s1_update.bits.br_mask(w)
-    s1_update_wmeta_data(w).is_call := s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_call
-    s1_update_wmeta_data(w).is_ret  := s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_ret
+    s1_update_wmeta_data(w).is_call := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_call
+    s1_update_wmeta_data(w).is_ret  := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_ret
   }
 
   val btb_reset_value = WireDefault(0.U(btbEntrySz.W))
@@ -254,5 +264,40 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     ebtb.write(s1_update_idx, s1_update.bits.target)
   }
 
+  // Assertions
+  for (w <- 0 until bankWidth) {
+    when (io.resp.f2(w).predicted_pc.valid) {
+      assert(!(io.resp.f2(w).is_jal && io.resp.f2(w).is_br),
+        p"BTB predicted PC cannot be both JAL and BR\n")
+      assert(!(io.resp.f2(w).is_call && !io.resp.f2(w).is_jal),
+        p"BTB predicted PC cannot be CALL without JAL\n")
+      assert(!(io.resp.f2(w).is_ret && !io.resp.f2(w).is_jal),
+        p"BTB predicted PC cannot be RET without JAL\n")
+      assert(!(io.resp.f2(w).is_call && io.resp.f2(w).is_ret),
+        p"BTB predicted PC cannot be both CALL and RET\n")
+    }
+    when (io.resp.f3(w).predicted_pc.valid) {
+      assert(!(io.resp.f3(w).is_jal && io.resp.f3(w).is_br),
+        p"BTB predicted PC cannot be both JAL and BR\n")
+      assert(!(io.resp.f3(w).is_call && !io.resp.f3(w).is_jal),
+        p"BTB predicted PC cannot be CALL without JAL\n")
+      assert(!(io.resp.f3(w).is_ret && !io.resp.f3(w).is_jal),
+        p"BTB predicted PC cannot be RET without JAL\n")
+      assert(!(io.resp.f3(w).is_call && io.resp.f3(w).is_ret),
+        p"BTB predicted PC cannot be both CALL and RET\n")
+    }
+    when (s1_update.valid && s1_update.bits.is_commit_update && !doing_reset) {
+      assert(!(s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_br && s1_update.bits.cfi_is_jal),
+        p"cfi cannot be both JAL and BR\n")
+      assert(!(s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_jal && !s1_update.bits.cfi_taken),
+        p"cfi should be taken if it is a JAL\n")
+      assert(!(s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_call && !s1_update.bits.cfi_is_jal),
+        p"cfi cannot be CALL without being JAL\n")
+      assert(!(s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_ret && !s1_update.bits.cfi_is_jal),
+        p"cfi cannot be RET without being JAL\n")
+      assert(!(s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_call && s1_update.bits.cfi_is_ret),
+        p"cfi cannot be both CALL and RET\n")
+    }
+  }
 }
 
