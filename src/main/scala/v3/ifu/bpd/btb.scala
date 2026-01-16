@@ -177,11 +177,11 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     meta_reset_value := cmd_meta_reset_v
   }
 
-  if (IN_SIMULATION && F2BTB_PRINTF) {
+  if (IN_SIMULATION) {
     // Add a free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
-
-    when (s1_valid) {
+    val btb_access_printf = PlusArg("btb-access-printf", 0, "Enable BTB access printf debugging", 1)
+    when (s1_valid && btb_access_printf(0) && !doing_reset) {
       printf("[%d BTB Read] S1 PC: 0x%x, idx: 0x%x, tag: 0x%x, hits: %b, hit_ways: %d\n",
         cycleCount,
         s1_pc,
@@ -197,16 +197,23 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
           w.U, s1_req_rmeta(1)(w).tag)
       }
     }
-    when (s1_update.valid && s1_update.bits.is_commit_update && !doing_reset) {
-      printf("[%d BTB Update] PC: 0x%x, idx: 0x%x, tag: 0x%x, cfi_idx: %d, target: 0x%x, taken: %b, br_mask: %b, btb_mispredicts: %b, write_way: %d, new_offset: 0x%x (extended: %b)\n",
+    val btb_update_printf = PlusArg("btb-update-printf", 0, "Enable BTB update printf debugging", 1)
+    when (s1_update.valid && s1_update.bits.is_commit_update && !doing_reset && btb_update_printf(0)) {
+      printf("[%d BTB Update] PC: 0x%x, idx: 0x%x, tag: 0x%x, cfi_valid: %b, cfi_idx: %d, target: 0x%x," +
+      " taken: %b, br_mask: %b, cfi_is_call: %b, cfi_is_ret: %b, cfi_is_jal: %b, btb_mispredicts: %b," +
+      " write_way: %d, new_offset: 0x%x (extended: %b)\n",
         cycleCount,
         s1_update.bits.pc,
         s1_update_idx(log2Ceil(nSets)-1,0),
         s1_update_idx >> log2Ceil(nSets),
+        s1_update.bits.cfi_idx.valid,
         s1_update_cfi_idx,
         s1_update.bits.target,
         s1_update.bits.cfi_taken,
         s1_update.bits.br_mask.asUInt,
+        s1_update.bits.cfi_is_call,
+        s1_update.bits.cfi_is_ret,
+        s1_update.bits.cfi_is_jal,
         s1_update.bits.btb_mispredicts.asUInt,
         s1_update_meta.write_way,
         new_offset_value,
