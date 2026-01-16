@@ -440,6 +440,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
           p"real_ras_idx=${Hexadecimal(io.enq.bits.ghist.ras_idx)}\n")
       }
     }
+    val enq_ghist_printf = PlusArg("enq-ghist-update", 0, "Print FTQ enq ghist update", 1)
+    when (do_enq && enq_ghist_printf(0)) {
+      printf(p"[${cycleCount} FTQ] enq_ptr=${enq_ptr.value}, enq_pc=${Hexadecimal(io.enq.bits.pc)}, " +
+        p"enq_cfi_idx=${io.enq.bits.cfi_idx}, " +
+        p"enq_br_mask=${Binary(io.enq.bits.br_mask)}, " +
+        p"enq_ghist=${Binary(io.enq.bits.ghist.histories(0))}\n")
+    }
   }
 
   // Assertion
