@@ -632,7 +632,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val cfi_idx = (brupdate.b2.uop.pc_lob ^
       Mux(ftq_entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(log2Ceil(fetchWidth), 1)
     val ftq_ghist = io.ifu.get_pc(1).ghist
-    val next_ghist = ftq_ghist.update(
+    val (next_ghist, _) = ftq_ghist.update(
       ftq_entry.br_mask.asUInt,
       brupdate.b2.taken,
       brupdate.b2.cfi_type === CFI_BR,

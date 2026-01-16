@@ -417,7 +417,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
     val prev_update_printf = PlusArg("prev-ras-update", 0, "Print FTQ prev entry update", 1)
     when (do_enq && prev_update_printf(0)) {
-       val ghist_by_prev = prev_ghist.update(
+       val (ghist_by_prev, _) = prev_ghist.update(
         prev_entry.br_mask,
         prev_entry.cfi_taken,
         prev_entry.br_mask(prev_entry.cfi_idx.bits),
@@ -449,7 +449,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       "FTQ: br_mask has bits set outside of valid fetch bundle")
     
     when (!io.enq.bits.ghist.current_saw_branch_not_taken) {
-      val ghist_by_prev = prev_ghist.update(
+      val (ghist_by_prev, _) = prev_ghist.update(
         prev_entry.br_mask,
         prev_entry.cfi_taken,
         prev_entry.br_mask(prev_entry.cfi_idx.bits),

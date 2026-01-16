@@ -34,6 +34,7 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val mask = UInt(fetchWidth.W)
   val xcpt = new FrontendExceptions
   val ghist = new GlobalHistory
+  val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
 
   // fsrc provides the prediction FROM a branch in this packet
   // tsrc provides the prediction TO this packet
@@ -81,7 +82,7 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
   def update(branches: UInt, cfi_taken: Bool, cfi_is_br: Bool, cfi_idx: UInt,
     cfi_valid: Bool, addr: UInt,
-    cfi_is_call: Bool, cfi_is_ret: Bool): GlobalHistory = {
+    cfi_is_call: Bool, cfi_is_ret: Bool): (GlobalHistory, UInt) = {
     val cfi_idx_fixed = cfi_idx(log2Ceil(fetchWidth)-1,0)
     val cfi_idx_oh = UIntToOH(cfi_idx_fixed)
     val new_history = Wire(new GlobalHistory)
@@ -89,6 +90,7 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
     val not_taken_branches = branches & Mux(cfi_valid,
                                             MaskLower(cfi_idx_oh) & ~Mux(cfi_is_br && cfi_taken, cfi_idx_oh, 0.U(fetchWidth.W)),
                                             ~(0.U(fetchWidth.W)))
+    val ghr_update_type = WireDefault(NO_SHIFT)
 
     if (nBanks == 1) {
       // In the single bank case every bank sees the history including the previous bank
@@ -98,6 +100,8 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
       new_history.old_history := Mux(cfi_is_br && cfi_taken && cfi_valid   , histories(0) << 1 | 1.U,
                                  Mux(saw_not_taken_branch                  , histories(0) << 1,
                                                                              histories(0)))
+      ghr_update_type := Mux(cfi_is_br && cfi_taken && cfi_valid, SHIFT_ONE,
+                           Mux(saw_not_taken_branch, SHIFT_ZERO, NO_SHIFT))
     } else {
       // In the two bank case every bank ignore the history added by the previous bank
       val base = histories(1)
@@ -122,7 +126,8 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
     }
     new_history.ras_idx := Mux(cfi_valid && cfi_is_call, WrapInc(ras_idx, nRasEntries),
                            Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, nRasEntries), ras_idx))
-    new_history
+
+    (new_history, ghr_update_type)
   }
 
 }
@@ -425,7 +430,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
                                 f1_targs(f1_redirect_idx),
                                 nextFetch(s1_vpc))
 
-  val f1_predicted_ghist = s1_ghist.update(
+  val (f1_predicted_ghist, f1_pred_ghist_update_type) = s1_ghist.update(
     s1_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f1_mask,
     s1_bpd_resp.preds(f1_redirect_idx).taken && f1_do_redirect,
     s1_bpd_resp.preds(f1_redirect_idx).is_br,
@@ -454,6 +459,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s2_valid = RegNext(s1_valid && !f1_clear, false.B)
   val s2_vpc   = RegNext(s1_vpc)
   val s2_ghist = Reg(new GlobalHistory)
+  val f2_ghist_update_type = RegNext(f1_pred_ghist_update_type)
   s2_ghist := s1_ghist
   val s2_ppc  = RegNext(s1_ppc)
   val s2_tsrc = RegNext(s1_tsrc) // tsrc provides the predictor component which provided the prediction TO this instruction
@@ -480,7 +486,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f2_predicted_target = Mux(f2_do_redirect,
                                 f2_targs(f2_redirect_idx),
                                 nextFetch(s2_vpc))
-  val f2_predicted_ghist = s2_ghist.update(
+  val (f2_predicted_ghist, f2_pred_ghist_update_type) = s2_ghist.update(
     f2_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f2_mask,
     f2_bpd_resp.preds(f2_redirect_idx).taken && f2_do_redirect,
     f2_bpd_resp.preds(f2_redirect_idx).is_br,
@@ -490,7 +496,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     false.B,
     false.B)
 
-  val f2_correct_f1_ghist = s1_ghist =/= f2_predicted_ghist && enableGHistStallRepair.B
+  val f2_correct_f1_ghist = f2_pred_ghist_update_type =/= f2_ghist_update_type && enableGHistStallRepair.B
 
   when ((s2_valid && !icache.io.resp.valid) ||
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
@@ -504,8 +510,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f1_clear := true.B
   } .elsewhen (s2_valid && f3_ready) {
     when (s1_valid && s1_vpc === f2_predicted_target && !f2_correct_f1_ghist) {
-      // We trust our prediction of what the global history for the next branch should be
-      s2_ghist := f2_predicted_ghist
+      // 单 bank 情况下就不需要回传了
+      // s2_ghist := f2_predicted_ghist
     }
     when ((s1_valid && (s1_vpc =/= f2_predicted_target || f2_correct_f1_ghist)) || !s1_valid) {
       f1_clear := true.B
@@ -545,6 +551,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.pc := s2_vpc
   f3.io.enq.bits.data  := Mux(s2_xcpt, 0.U, icache.io.resp.bits.data)
   f3.io.enq.bits.ghist := s2_ghist
+  f3.io.enq.bits.ghist_update_type := f2_pred_ghist_update_type
   f3.io.enq.bits.mask := fetchMask(s2_vpc)
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
@@ -818,7 +825,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   )
 
   f3_fetch_bundle.next_pc       := f3_predicted_target
-  val f3_predicted_ghist = f3_fetch_bundle.ghist.update(
+  val (f3_predicted_ghist, f3_pred_ghist_update_type) = f3_fetch_bundle.ghist.update(
     f3_fetch_bundle.br_mask,
     f3_fetch_bundle.cfi_idx.valid,
     f3_fetch_bundle.br_mask(f3_fetch_bundle.cfi_idx.bits),
@@ -835,8 +842,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f3_write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
 
 
-  val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
-  val f3_correct_f2_ghist = s2_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
+  val f3_correct_ghist = f3_pred_ghist_update_type =/= f3.io.deq.bits.ghist_update_type && enableGHistStallRepair.B
 
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
@@ -845,19 +851,19 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     when (f3_redirects.reduce(_||_)) {
       f3_prev_is_half := false.B
     }
-    when (s2_valid && s2_vpc === f3_predicted_target && !f3_correct_f2_ghist) {
-      f3.io.enq.bits.ghist := f3_predicted_ghist
+    when (s2_valid && s2_vpc === f3_predicted_target && !f3_correct_ghist) {
+      f3.io.enq.bits.ghist.ras_idx := f3_predicted_ghist.ras_idx
       // 说明发生了 f2 replay, 我们需要把预测的 ghist 更新回去
       // replay 的原因有 f2_clear 为 true 或 icache resp valid
       // 为 false，这里如果发生了 f2_clear，仅可能是来自后端的重定向, 
       // 它设置 s0_ghist 的优先级会更高
       when (!f3.io.enq.fire) {
-        s0_ghist := f3_predicted_ghist 
+        s0_ghist.ras_idx := f3_predicted_ghist.ras_idx
       }
-    } .elsewhen (!s2_valid && s1_valid && s1_vpc === f3_predicted_target && !f3_correct_f1_ghist) {
-      s2_ghist := f3_predicted_ghist
-    } .elsewhen (( s2_valid &&  (s2_vpc =/= f3_predicted_target || f3_correct_f2_ghist)) ||
-          (!s2_valid &&  s1_valid && (s1_vpc =/= f3_predicted_target || f3_correct_f1_ghist)) ||
+    } .elsewhen (!s2_valid && s1_valid && s1_vpc === f3_predicted_target && !f3_correct_ghist) {
+      s2_ghist.ras_idx := f3_predicted_ghist.ras_idx
+    } .elsewhen (( s2_valid &&  (s2_vpc =/= f3_predicted_target || f3_correct_ghist)) ||
+          (!s2_valid &&  s1_valid && (s1_vpc =/= f3_predicted_target || f3_correct_ghist)) ||
           (!s2_valid && !s1_valid)) {
       f2_clear := true.B
       f1_clear := true.B
