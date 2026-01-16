@@ -6,6 +6,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
+import freechips.rocketchip.util._
 
 import boom.v3.common._
 import boom.v3.util.{BoomCoreStringPrefix}
@@ -43,6 +44,17 @@ class BranchPredictionBundle(implicit p: Parameters) extends BoomBundle()(p)
   val preds = Vec(fetchWidth, new BranchPrediction)
   val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   val lhist = Output(Vec(nBanks, UInt(localHistoryLength.W)))
+}
+
+class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
+  with HasBoomFrontendParameters
+{
+  val pc = UInt(vaddrBitsExtended.W)
+  val preds = Vec(fetchWidth, new BranchPrediction)
+  val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
+  val lhist = Output(Vec(nBanks, UInt(localHistoryLength.W)))
+  val ghist = new GlobalHistory
+  val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
 }
 
 
@@ -217,8 +229,41 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val resp = Output(new Bundle {
       val f1 = new BranchPredictionBundle
       val f2 = new BranchPredictionBundle
+      // 外部应该只关心 f3 的 prediction bundle
+      // 因为只有 f3 的 meta, preds, ghist 会被写入到 FTQ 中
       val f3 = new BranchPredictionBundle
+      val f3_ghist = new GlobalHistory
+      val f3_ghist_update_type = UInt(GHR_UPDATE_SZ.W)
+      // 用于 replay
+      val f2_ghist = new GlobalHistory
+
+      // prediction valid
+      // TODO：是否要考虑 clear 信号呢？目前是没考虑的
+      val f1_pred_valid = Bool()
+      val f2_pred_valid = Bool()
+      val f3_pred_valid = Bool()
+
+      // predicted next ghist
+      val f1_next_ghist = new GlobalHistory
+      val f2_next_ghist = new GlobalHistory
+      val f3_next_ghist = new GlobalHistory
+
+      // predicted next pc
+      val f1_next_pc = UInt(vaddrBitsExtended.W)
+      val f2_next_pc = UInt(vaddrBitsExtended.W)
+      val f3_next_pc = UInt(vaddrBitsExtended.W)
+
+      // 表示 f2 或 f3 是否重定向之前的预测
+      val f2_redirect = Bool()
+      val f3_redirect = Bool()
+
     })
+
+    // 用于 clear f1 和 f2 流水线，后续引入
+    // FDIP 之后应该只需要一个单独的 flush 信号
+    // TODO:是不是不需要 clear？
+    val f1_clear = Input(Bool())
+    val f2_clear = Input(Bool())
 
     val f3_fire = Input(Bool())
 
@@ -321,14 +366,217 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   }
 
   if (nBanks == 1) {
-    io.resp.f1.preds    := banked_predictors(0).io.resp.f1
-    io.resp.f2.preds    := banked_predictors(0).io.resp.f2
-    io.resp.f3.preds    := banked_predictors(0).io.resp.f3
+    val f1_preds = banked_predictors(0).io.resp.f1
+    val f2_preds = banked_predictors(0).io.resp.f2
+    val f3_preds = banked_predictors(0).io.resp.f3
+    io.resp.f1.preds    := f1_preds
+    io.resp.f2.preds    := f2_preds
+    io.resp.f3.preds    := f3_preds
     io.resp.f3.meta(0)  := banked_predictors(0).io.f3_meta
     io.resp.f3.lhist(0) := banked_lhist_providers(0).io.f3_lhist
 
     banked_predictors(0).io.f3_fire := io.f3_fire
     banked_lhist_providers(0).io.f3_fire := io.f3_fire
+
+    // 重定向相关逻辑
+    val s1_valid = RegNext(io.f0_req.valid, false.B)
+    val s2_valid = RegNext(s1_valid && !io.f1_clear, false.B)
+    val s3_valid = RegNext(s2_valid && !io.f2_clear, false.B)
+
+    val s1_vpc = RegNext(io.f0_req.bits.pc)
+    val s2_vpc = RegNext(s1_vpc)
+    val s3_vpc = RegNext(s2_vpc)
+
+    val s1_ghist = RegNext(io.f0_req.bits.ghist)
+    val s2_ghist = RegNext(s1_ghist)
+    // 用于 RAS 的访问
+    val s3_ghist_write = WireDefault(s2_ghist)
+    val s3_ghist = RegNext(s3_ghist_write) 
+
+    // 根据 f1 预测计算新的 ghist 和 next pc 
+    val f1_mask = fetchMask(s1_vpc)
+    val f1_redirects = (0 until fetchWidth) map { i =>
+      f1_mask(i) && f1_preds(i).predicted_pc.valid &&
+      (f1_preds(i).is_jal || (f1_preds(i).is_br && f1_preds(i).taken))
+    }
+
+    val f1_redirect_idx = PriorityEncoder(f1_redirects)
+    val f1_do_redirect = f1_redirects.reduce(_||_) && useBPD.B
+    val f1_targs = f1_preds.map(_.predicted_pc.bits)
+    val f1_predicted_target = Mux(f1_do_redirect,
+                                  f1_targs(f1_redirect_idx),
+                                  nextFetch(s1_vpc))
+
+    val (f1_predicted_ghist, f1_pred_ghist_update_type) = s1_ghist.update(
+      f1_preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f1_mask,
+      f1_preds(f1_redirect_idx).taken && f1_do_redirect,
+      f1_preds(f1_redirect_idx).is_br,
+      f1_redirect_idx,
+      f1_do_redirect,
+      s1_vpc,
+      false.B,
+      false.B)
+    
+    // 输出 f1 的预测
+    io.resp.f1_pred_valid := s1_valid
+    io.resp.f1_next_ghist := f1_predicted_ghist
+    io.resp.f1_next_pc := f1_predicted_target
+
+    // 根据 f2 预测计算新的 ghist 和 next pc
+    val f2_ghist_update_type = RegNext(f1_pred_ghist_update_type)
+    val f2_mask = fetchMask(s2_vpc)
+    val f2_redirects = (0 until fetchWidth) map { i =>
+      f2_mask(i) && f2_preds(i).predicted_pc.valid &&
+      (f2_preds(i).is_jal || (f2_preds(i).is_br && f2_preds(i).taken))
+    }
+    val f2_redirect_idx = PriorityEncoder(f2_redirects)
+    val f2_targs = f2_preds.map(_.predicted_pc.bits)
+    val f2_do_redirect = f2_redirects.reduce(_||_) && useBPD.B
+    val f2_predicted_target = Mux(f2_do_redirect,
+                                  f2_targs(f2_redirect_idx),
+                                  nextFetch(s2_vpc))
+    val (f2_predicted_ghist, f2_pred_ghist_update_type) = s2_ghist.update(
+      f2_preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f2_mask,
+      f2_preds(f2_redirect_idx).taken && f2_do_redirect,
+      f2_preds(f2_redirect_idx).is_br,
+      f2_redirect_idx,
+      f2_do_redirect,
+      s2_vpc,
+      false.B,
+      false.B)
+
+    // 输出 f2 的预测
+    io.resp.f2_pred_valid := s2_valid
+    io.resp.f2_next_ghist := f2_predicted_ghist
+    io.resp.f2_next_pc := f2_predicted_target
+    io.resp.f2_ghist := s2_ghist
+
+    // f2 重定向 f1
+    require(NO_SHIFT_CONST == 0)
+    require(SHIFT_ZERO_CONST == 1)
+    val s2_ghist_all_zero = s2_ghist === (0.U).asTypeOf(new GlobalHistory)
+    val shift_zero_or_no_shift = f2_pred_ghist_update_type(1) === 0.U && f2_ghist_update_type(1) === 0.U
+    val f2_correct_f1_ghist = !(s2_ghist_all_zero && shift_zero_or_no_shift) &&
+                              f2_pred_ghist_update_type =/= f2_ghist_update_type && enableGHistStallRepair.B
+    val f2_redirect_f1 = f2_correct_f1_ghist || s1_vpc =/= f2_predicted_target
+
+    io.resp.f2_redirect := false.B
+    when (s2_valid) {
+      when (!s1_valid || f2_redirect_f1) {
+        io.resp.f2_redirect := true.B
+      }
+    }
+
+    // 根据 f3 预测, 结合预译码信息计算新的 ghist 和 next pc
+    val f3_ghist_update_type = RegNext(f2_pred_ghist_update_type)
+    val f3_mask = fetchMask(s3_vpc)
+    val f3_is_call = f3_preds.map(p => p.is_call && p.predicted_pc.valid)
+    val f3_is_ret = f3_preds.map(p => p.is_ret && p.predicted_pc.valid)
+    val f3_redirects = (0 until fetchWidth) map { i =>
+      f3_mask(i) && f3_preds(i).predicted_pc.valid &&
+      (f3_preds(i).is_jal || (f3_preds(i).is_br && f3_preds(i).taken))
+    }
+    val f3_redirect_idx = PriorityEncoder(f3_redirects)
+    val f3_targs = f3_preds zip f3_is_ret map { case (p, is_ret) =>
+                    Mux(is_ret, p.ras_top, p.predicted_pc.bits) }
+    val f3_do_redirect = f3_redirects.reduce(_||_) && useBPD.B
+    val f3_predicted_target = Mux(f3_do_redirect,
+                                  f3_targs(f3_redirect_idx),
+                                  nextFetch(s3_vpc))
+    val (f3_predicted_ghist, f3_pred_ghist_update_type) = s3_ghist.update(
+      f3_preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f3_mask,
+      f3_preds(f3_redirect_idx).taken && f3_do_redirect,
+      f3_preds(f3_redirect_idx).is_br,
+      f3_redirect_idx,
+      f3_do_redirect,
+      s3_vpc,
+      f3_is_call(f3_redirect_idx),
+      f3_is_ret(f3_redirect_idx))   
+    
+    // 输出 f3 的基本信息
+    io.resp.f3_ghist := s3_ghist
+    io.resp.f3_ghist_update_type := f3_ghist_update_type
+
+    // 输出 f3 的预测
+    io.resp.f3_pred_valid := s3_valid
+    io.resp.f3_next_ghist := f3_predicted_ghist
+    io.resp.f3_next_pc := f3_predicted_target
+    
+    // f3 重定向 f1/f2
+    val f3_ghist_all_zero = s3_ghist === (0.U).asTypeOf(new GlobalHistory)
+    val shift_zero_or_no_shift_f3 = f3_pred_ghist_update_type(1) === 0.U && f3_ghist_update_type(1) === 0.U
+    val f3_correct_ghist = !(f3_ghist_all_zero && shift_zero_or_no_shift_f3) &&
+                            f3_pred_ghist_update_type =/= f3_ghist_update_type &&
+                            enableGHistStallRepair.B
+
+    val f3_redirect_f2 = f3_correct_ghist || s2_vpc =/= f3_predicted_target
+    val f3_redirect_f1 = f3_correct_ghist || s1_vpc =/= f3_predicted_target
+
+    io.resp.f3_redirect := false.B
+    when (s3_valid) {
+      when (s2_valid && f3_redirect_f2) {
+        io.resp.f3_redirect := true.B
+      } .elsewhen (!s2_valid && s1_valid && f3_redirect_f1) {
+        io.resp.f3_redirect := true.B
+      } .elsewhen (!s2_valid && !s1_valid) {
+        io.resp.f3_redirect := true.B
+      }
+    }
+
+    // Assertion
+    assert (!(s2_valid && RegNext(io.resp.f2_redirect, false.B)), 
+    "s2_valid should be false if last cycle redirected")
+    // TODO: 目前前端会忽略 bpd 的 f3 重定向
+    // assert (!(s2_valid && RegNext(io.resp.f2_redirect || io.resp.f3_redirect, false.B)), 
+    // "s2_valid should be false if last cycle redirected")
+    // assert (!(s3_valid && RegNext(io.resp.f3_redirect, false.B)),
+    // "s3_valid should be false if last cycle redirected")
+    // assert (!(s3_valid && RegNext(RegNext(io.resp.f3_redirect, false.B), false.B)),
+    // "s3_valid should be false if redirected two cycles ago")
+    when (s3_valid) {
+      // 检测 jal/jalr 指令是否正确处理了跳转以及跳转目标
+      val f3_is_jal = (0 until fetchWidth) map { i =>
+        f3_preds(i).predicted_pc.valid && f3_mask(i) && (f3_preds(i).is_jal) && (!f3_preds(i).is_ret)
+      }
+      val f3_has_jal = f3_is_jal.reduce(_||_)
+      val f3_jal_idx = PriorityEncoder(f3_is_jal)
+      assert (f3_do_redirect || !f3_is_jal.reduce(_||_), 
+        "If there is a jal in f3, f3_do_redirect should be true")
+      assert ( !f3_has_jal || (f3_redirect_idx <= f3_jal_idx), 
+        "If there is a jal in f3, f3_redirect_idx should point to the jal or an earlier instruction")
+      assert ( !f3_has_jal || f3_redirect_idx =/= f3_jal_idx ||
+        f3_predicted_target === f3_preds(f3_jal_idx).predicted_pc.bits,
+        "If f3_redirect_idx points to a jal, the predicted target should equal the predecode target")
+      
+      // 检测 ret 指令是否正确处理了跳转以及跳转目标
+      when (useBPD.B && useRAS.B) {
+        val f3_ret_masks = (f3_is_ret zip f3_mask.asBools) map {case (is_ret, m) => is_ret && m}
+        val f3_has_ret = f3_ret_masks.reduce(_||_)
+        val f3_ret_idx = PriorityEncoder(f3_ret_masks)
+        assert (f3_do_redirect || !f3_ret_masks.reduce(_||_), 
+          "If there is a ret in f3, f3_do_redirect should be true")
+        assert ( !f3_has_ret || (f3_redirect_idx <= f3_ret_idx), 
+          "If there is a ret in f3, f3_redirect_idx should point to the ret or an earlier instruction")
+        assert ( !f3_has_ret || f3_redirect_idx =/= f3_ret_idx ||
+          f3_predicted_target === f3_preds(f3_ret_idx).ras_top,
+          "If f3_redirect_idx points to a ret, the predicted target should equal the RAS top")
+      }
+      when (useBPD.B) {
+        // 检测 br 指令是否正确处理了跳转以及跳转目标
+        val f3_taken_br_masks = (f3_mask.asBools zip f3_preds) map 
+                                {case (m, p) => p.predicted_pc.valid && p.is_br && p.taken && m}
+        val f3_has_taken_br = f3_taken_br_masks.reduce(_||_)
+        val f3_taken_br_idx = PriorityEncoder(f3_taken_br_masks)
+        assert (f3_do_redirect || !f3_taken_br_masks.reduce(_||_), 
+          "If there is a taken br in f3, f3_do_redirect should be true")
+        assert ( !f3_has_taken_br || (f3_redirect_idx <= f3_taken_br_idx), 
+          "If there is a taken br in f3, f3_redirect_idx should point to the taken br or an earlier instruction")
+        assert ( !f3_has_taken_br || f3_redirect_idx =/= f3_taken_br_idx ||
+          f3_predicted_target === f3_preds(f3_taken_br_idx).predicted_pc.bits,
+          "If f3_redirect_idx points to a taken br, the predicted target should equal the predicted target")
+      }
+    }
+
   } else {
     require(nBanks == 2)
     val b0_fire = io.f3_fire && RegNext(RegNext(RegNext(banked_predictors(0).io.f0_valid)))

@@ -33,8 +33,6 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val data = UInt((fetchWidth * coreInstBits).W)
   val mask = UInt(fetchWidth.W)
   val xcpt = new FrontendExceptions
-  val ghist = new GlobalHistory
-  val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
 
   // fsrc provides the prediction FROM a branch in this packet
   // tsrc provides the prediction TO this packet
@@ -365,9 +363,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_is_replay = WireInit(false.B)
   val s0_is_sfence = WireInit(false.B)
   val s0_replay_resp = Wire(new TLBResp(log2Ceil(fetchBytes)))
-  val s0_replay_bpd_resp = Wire(new BranchPredictionBundle)
   val s0_replay_ppc  = Wire(UInt())
-  val s0_s1_use_f3_bpd_resp = WireInit(false.B)
 
   //Enable_PerfCounter_Support
   io.cpu.icache_valid_access := icache.io.icache_valid_access
@@ -398,6 +394,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_is_replay = RegNext(s0_is_replay)
   val s1_is_sfence = RegNext(s0_is_sfence)
   val f1_clear     = WireInit(false.B)
+  val bpd_f1_clear = WireInit(false.B)
   val s1_tsrc      = RegNext(s0_tsrc)
   tlb.io.req.valid      := (s1_valid && !s1_is_replay && !f1_clear) || s1_is_sfence
   tlb.io.req.bits.cmd   := DontCare
@@ -417,35 +414,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   icache.io.s1_paddr := s1_ppc
   icache.io.s1_kill  := tlb.io.resp.miss || f1_clear
 
-  val f1_mask = fetchMask(s1_vpc)
-  val f1_redirects = (0 until fetchWidth) map { i =>
-    s1_valid && f1_mask(i) && s1_bpd_resp.preds(i).predicted_pc.valid &&
-    (s1_bpd_resp.preds(i).is_jal ||
-      (s1_bpd_resp.preds(i).is_br && s1_bpd_resp.preds(i).taken))
-  }
-  val f1_redirect_idx = PriorityEncoder(f1_redirects)
-  val f1_do_redirect = f1_redirects.reduce(_||_) && useBPD.B
-  val f1_targs = s1_bpd_resp.preds.map(_.predicted_pc.bits)
-  val f1_predicted_target = Mux(f1_do_redirect,
-                                f1_targs(f1_redirect_idx),
-                                nextFetch(s1_vpc))
-
-  val (f1_predicted_ghist, f1_pred_ghist_update_type) = s1_ghist.update(
-    s1_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f1_mask,
-    s1_bpd_resp.preds(f1_redirect_idx).taken && f1_do_redirect,
-    s1_bpd_resp.preds(f1_redirect_idx).is_br,
-    f1_redirect_idx,
-    f1_do_redirect,
-    s1_vpc,
-    false.B,
-    false.B)
-
+  // s0_vpc 来源 1: f1 预测
   when (s1_valid && !s1_tlb_miss) {
     // Stop fetching on fault
     s0_valid     := !(s1_tlb_resp.ae.inst || s1_tlb_resp.pf.inst)
     s0_tsrc      := BSRC_1
-    s0_vpc       := f1_predicted_target
-    s0_ghist     := f1_predicted_ghist
+    s0_vpc       := bpd.io.resp.f1_next_pc
+    s0_ghist     := bpd.io.resp.f1_next_ghist
     s0_is_replay := false.B
   }
 
@@ -458,13 +433,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val s2_valid = RegNext(s1_valid && !f1_clear, false.B)
   val s2_vpc   = RegNext(s1_vpc)
-  val s2_ghist = Reg(new GlobalHistory)
-  val f2_ghist_update_type = RegNext(f1_pred_ghist_update_type)
-  s2_ghist := s1_ghist
   val s2_ppc  = RegNext(s1_ppc)
   val s2_tsrc = RegNext(s1_tsrc) // tsrc provides the predictor component which provided the prediction TO this instruction
   val s2_fsrc = WireInit(BSRC_1) // fsrc provides the predictor component which provided the prediction FROM this instruction
   val f2_clear = WireInit(false.B)
+  val bpd_f2_clear = WireInit(false.B)
   val s2_tlb_resp = RegNext(s1_tlb_resp)
   val s2_tlb_miss = RegNext(s1_tlb_miss)
   val s2_is_replay = RegNext(s1_is_replay) && s2_valid
@@ -473,65 +446,35 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   icache.io.s2_kill := s2_xcpt
 
-  val f2_bpd_resp = bpd.io.resp.f2
-  val f2_mask = fetchMask(s2_vpc)
-  val f2_redirects = (0 until fetchWidth) map { i =>
-    s2_valid && f2_mask(i) && f2_bpd_resp.preds(i).predicted_pc.valid &&
-    (f2_bpd_resp.preds(i).is_jal ||
-      (f2_bpd_resp.preds(i).is_br && f2_bpd_resp.preds(i).taken))
-  }
-  val f2_redirect_idx = PriorityEncoder(f2_redirects)
-  val f2_targs = f2_bpd_resp.preds.map(_.predicted_pc.bits)
-  val f2_do_redirect = f2_redirects.reduce(_||_) && useBPD.B
-  val f2_predicted_target = Mux(f2_do_redirect,
-                                f2_targs(f2_redirect_idx),
-                                nextFetch(s2_vpc))
-  val (f2_predicted_ghist, f2_pred_ghist_update_type) = s2_ghist.update(
-    f2_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f2_mask,
-    f2_bpd_resp.preds(f2_redirect_idx).taken && f2_do_redirect,
-    f2_bpd_resp.preds(f2_redirect_idx).is_br,
-    f2_redirect_idx,
-    f2_do_redirect,
-    s2_vpc,
-    false.B,
-    false.B)
-
-  require(NO_SHIFT_CONST == 0)
-  require(SHIFT_ZERO_CONST == 1)
-  val s2_ghist_all_zero = s2_ghist === (0.U).asTypeOf(new GlobalHistory)
-  val shift_zero_or_no_shift = f2_pred_ghist_update_type(1) === 0.U &&f2_ghist_update_type(1) === 0.U
-  val f2_correct_f1_ghist = !(s2_ghist_all_zero && shift_zero_or_no_shift) &&
-                            f2_pred_ghist_update_type =/= f2_ghist_update_type && enableGHistStallRepair.B
-
+  // s0_vpc 来源 3: icache/tlb miss 或者 f3 没有 ready 发生 replay
   when ((s2_valid && !icache.io.resp.valid) ||
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
     s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
     s0_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
-    // When this is not a replay (it queried the BPDs, we should use f3 resp in the replaying s1)
-    s0_s1_use_f3_bpd_resp := !s2_is_replay
-    s0_ghist := s2_ghist
+    s0_ghist := bpd.io.resp.f2_ghist
+    // replay 就不需要设置 s2_fsrc
     s0_tsrc  := s2_tsrc
     f1_clear := true.B
-  } .elsewhen (s2_valid && f3_ready) {
-    when (s1_valid && s1_vpc === f2_predicted_target && !f2_correct_f1_ghist) {
-      // 单 bank 情况下就不需要回传了
-      // s2_ghist := f2_predicted_ghist
-    }
-    when ((s1_valid && (s1_vpc =/= f2_predicted_target || f2_correct_f1_ghist)) || !s1_valid) {
-      f1_clear := true.B
-
-      s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
-      s0_vpc       := f2_predicted_target
-      s0_is_replay := false.B
-      s0_ghist     := f2_predicted_ghist
-      s2_fsrc      := BSRC_2
-      s0_tsrc      := BSRC_2
-    }
+    bpd_f1_clear := true.B
+    // flush bpd 的 f2 流水线，避免给出 f3 预测进入到 f3_bpd_resp queue 中
+    bpd_f2_clear := true.B
+  // s0_vpc 来源 2: bpd f2 预测重定向
+  } .elsewhen (bpd.io.resp.f2_redirect) {
+    s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
+    s0_vpc       := bpd.io.resp.f2_next_pc
+    s0_is_replay := false.B
+    s0_ghist     := bpd.io.resp.f2_next_ghist
+    s2_fsrc      := BSRC_2
+    s0_tsrc      := BSRC_2
+    f1_clear := true.B
+    bpd_f1_clear := true.B
   }
-  s0_replay_bpd_resp := f2_bpd_resp
   s0_replay_resp := s2_tlb_resp
   s0_replay_ppc  := s2_ppc
+
+  bpd.io.f1_clear := bpd_f1_clear
+  bpd.io.f2_clear := bpd_f2_clear
 
   // --------------------------------------------------------
   // **** F3 ****
@@ -543,7 +486,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Queue up the bpd resp as well, incase f4 backpressures f3
   // This is "flow" because the response (enq) arrives in f3, not f2
   val f3_bpd_resp = withReset(reset.asBool || f3_clear) {
-    Module(new Queue(new BranchPredictionBundle, 1, pipe=true, flow=true)) }
+    Module(new Queue(new BranchPredBundleWithGHist, 1, pipe=true, flow=true)) }
 
 
 
@@ -555,8 +498,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   )
   f3.io.enq.bits.pc := s2_vpc
   f3.io.enq.bits.data  := Mux(s2_xcpt, 0.U, icache.io.resp.bits.data)
-  f3.io.enq.bits.ghist := s2_ghist
-  f3.io.enq.bits.ghist_update_type := f2_pred_ghist_update_type
   f3.io.enq.bits.mask := fetchMask(s2_vpc)
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
@@ -572,7 +513,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   // The BPD resp comes in f3
   f3_bpd_resp.io.enq.valid := f3.io.deq.valid && RegNext(f3.io.enq.ready)
-  f3_bpd_resp.io.enq.bits  := bpd.io.resp.f3
+  f3_bpd_resp.io.enq.bits.pc  := bpd.io.resp.f3.pc
+  f3_bpd_resp.io.enq.bits.preds := bpd.io.resp.f3.preds
+  f3_bpd_resp.io.enq.bits.meta  := bpd.io.resp.f3.meta
+  f3_bpd_resp.io.enq.bits.lhist := bpd.io.resp.f3.lhist
+  f3_bpd_resp.io.enq.bits.ghist := bpd.io.resp.f3_ghist
+  f3_bpd_resp.io.enq.bits.ghist_update_type := bpd.io.resp.f3_ghist_update_type
+
   when (f3_bpd_resp.io.enq.fire) {
     bpd.io.f3_fire := true.B
   }
@@ -801,7 +748,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_is_ret    := f3_ret_mask (f3_fetch_bundle.cfi_idx.bits)
   f3_fetch_bundle.cfi_npc_plus4 := f3_npc_plus4_mask(f3_fetch_bundle.cfi_idx.bits)
 
-  f3_fetch_bundle.ghist    := f3.io.deq.bits.ghist
+  f3_fetch_bundle.ghist    := f3_bpd_resp.io.deq.bits.ghist
   // 忽略 f1, f2, f3 ghist 的 ras_idx 字段
   f3_fetch_bundle.ghist.ras_idx := f2_ras_top_idx
   f3_fetch_bundle.lhist    := f3_bpd_resp.io.deq.bits.lhist
@@ -858,9 +805,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val f3_ghist_all_zero = f3_fetch_bundle.ghist === (0.U).asTypeOf(new GlobalHistory)
   val shift_zero_or_no_shift_f3 = f3_pred_ghist_update_type(1) === 0.U &&
-                                  f3.io.deq.bits.ghist_update_type(1) === 0.U
+                                  f3_bpd_resp.io.deq.bits.ghist_update_type(1) === 0.U
   val f3_correct_ghist = !(f3_ghist_all_zero && shift_zero_or_no_shift_f3) &&
-                          f3_pred_ghist_update_type =/= f3.io.deq.bits.ghist_update_type &&
+                          f3_pred_ghist_update_type =/= f3_bpd_resp.io.deq.bits.ghist_update_type &&
                           enableGHistStallRepair.B
 
   when (f3.io.deq.valid && f4_ready) {
@@ -888,7 +835,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           (!s2_valid &&  s1_valid && (s1_vpc =/= f3_predicted_target || f3_correct_ghist)) ||
           (!s2_valid && !s1_valid)) {
       f2_clear := true.B
+      bpd_f2_clear := true.B
       f1_clear := true.B
+      bpd_f1_clear := true.B
 
       s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
       s0_vpc       := f3_predicted_target
@@ -1023,7 +972,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f4_clear    := true.B
     f3_clear    := true.B
     f2_clear    := true.B
+    bpd_f2_clear := true.B
     f1_clear    := true.B
+    bpd_f1_clear := true.B
 
     s0_valid     := false.B
     s0_vpc       := io.cpu.sfence.bits.addr
@@ -1035,7 +986,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f4_clear    := true.B
     f3_clear    := true.B
     f2_clear    := true.B
+    bpd_f2_clear := true.B
     f1_clear    := true.B
+    bpd_f1_clear := true.B
 
     f3_prev_is_half := false.B
 
@@ -1092,5 +1045,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       f3_bpd_resp.io.deq.bits.preds(i).ras_top === f3_bpd_resp.io.deq.bits.preds(i+1).ras_top
     }.reduce(_ && _)
     assert(f3_ras_top_eq, "RAS tops should be the same in BPD response across instructions")
+
+    assert (f3_bpd_resp.io.deq.fire, "BPD F3 response should fire when F3 fires" )
+  }
+
+  assert (s1_valid === bpd.io.resp.f1_pred_valid, "S1 valid should match BPD F1 prediction valid" )
+  assert (s2_valid === bpd.io.resp.f2_pred_valid, "S2 valid should match BPD F2 prediction valid" )
+  when (bpd.io.resp.f3_pred_valid) {
+    assert (f3.io.deq.valid, "F3 valid should be high when BPD F3 prediction valid is high" )
   }
 }
