@@ -86,9 +86,12 @@ trait ScalarOpConstants
   val BSRC_C = 3.U(BSRC_SZ.W) // core branch resolution
 
   val GHR_UPDATE_SZ = 2
-  val NO_SHIFT    = 0.U(GHR_UPDATE_SZ.W)
-  val SHIFT_ZERO  = 1.U(GHR_UPDATE_SZ.W)
-  val SHIFT_ONE   = 2.U(GHR_UPDATE_SZ.W)
+  val NO_SHIFT_CONST = 0
+  val SHIFT_ZERO_CONST = 1
+  val SHIFT_ONE_CONST = 2
+  val NO_SHIFT    = NO_SHIFT_CONST.U(GHR_UPDATE_SZ.W)
+  val SHIFT_ZERO  = SHIFT_ZERO_CONST.U(GHR_UPDATE_SZ.W)
+  val SHIFT_ONE   = SHIFT_ONE_CONST.U(GHR_UPDATE_SZ.W)
 
   //************************************
   // Control Signals

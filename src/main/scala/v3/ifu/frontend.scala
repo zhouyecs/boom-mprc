@@ -496,7 +496,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     false.B,
     false.B)
 
-  val f2_correct_f1_ghist = f2_pred_ghist_update_type =/= f2_ghist_update_type && enableGHistStallRepair.B
+  require(NO_SHIFT_CONST == 0)
+  require(SHIFT_ZERO_CONST == 1)
+  val s2_ghist_all_zero = s2_ghist === (0.U).asTypeOf(new GlobalHistory)
+  val shift_zero_or_no_shift = f2_pred_ghist_update_type(1) === 0.U &&f2_ghist_update_type(1) === 0.U
+  val f2_correct_f1_ghist = !(s2_ghist_all_zero && shift_zero_or_no_shift) &&
+                            f2_pred_ghist_update_type =/= f2_ghist_update_type && enableGHistStallRepair.B
 
   when ((s2_valid && !icache.io.resp.valid) ||
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
@@ -851,7 +856,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f3_write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
 
 
-  val f3_correct_ghist = f3_pred_ghist_update_type =/= f3.io.deq.bits.ghist_update_type && enableGHistStallRepair.B
+  val f3_ghist_all_zero = f3_fetch_bundle.ghist === (0.U).asTypeOf(new GlobalHistory)
+  val shift_zero_or_no_shift_f3 = f3_pred_ghist_update_type(1) === 0.U &&
+                                  f3.io.deq.bits.ghist_update_type(1) === 0.U
+  val f3_correct_ghist = !(f3_ghist_all_zero && shift_zero_or_no_shift_f3) &&
+                          f3_pred_ghist_update_type =/= f3.io.deq.bits.ghist_update_type &&
+                          enableGHistStallRepair.B
 
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
