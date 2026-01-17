@@ -718,7 +718,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       )
       f3_mask  (i) := predecode_valid(i) && !redirect_found
       f3_targs (i) := Mux(predecode_cfi_type(i) === CFI_JALR,
-        f3_bpd_resp.io.deq.bits.preds.jal_targets_debug(i),
+        f3_bpd_resp.io.deq.bits.preds.jal_target,
         predecode_targets(i))
 
       // Flush BTB entries for JALs if we mispredict the target
