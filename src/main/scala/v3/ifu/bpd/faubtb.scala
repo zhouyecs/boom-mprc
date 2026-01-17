@@ -6,6 +6,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
+import freechips.rocketchip.util._
 
 import boom.v3.common._
 import boom.v3.util.{BoomCoreStringPrefix, WrapInc}
@@ -148,5 +149,27 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
     }
   }
 
+  if (IN_SIMULATION) {
+    // Add a free-running cycle counter for simulation
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+
+    val faubtb_printf = PlusArg("faubtb-pred-printf", 0, "print FAUBTB predictions", 1)
+    when (s1_valid && faubtb_printf =/= 0.U) {
+      // 打印当前周期和取指 PC
+      printf("[%d FAUBTB] s1_pc=0x%x\n", cycleCount, s1_pc)
+
+      // 打印每个指令位的预测结果
+      for (w <- 0 until bankWidth) {
+        printf("  slot=%d valid=%d taken=%d is_br=%d is_jal=%d pred_pc=0x%x\n",
+          w.U,
+          s1_resp(w).valid,
+          s1_taken(w),
+          s1_is_br(w),
+          s1_is_jal(w),
+          s1_resp(w).bits
+        )
+      }
+    }
+  }
 }
 

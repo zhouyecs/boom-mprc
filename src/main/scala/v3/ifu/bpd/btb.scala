@@ -7,6 +7,7 @@ import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util.PlusArg
+import freechips.rocketchip.util._
 
 import boom.v3.common._
 import boom.v3.util.{BoomCoreStringPrefix}
@@ -190,26 +191,39 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   if (IN_SIMULATION) {
     // Add a free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
-    val btb_access_printf = PlusArg("btb-access-printf", 0, "Enable BTB access printf debugging", 1)
-    when (s1_valid && btb_access_printf(0) && !doing_reset) {
-      printf("[%d BTB Read] S1 PC: 0x%x, idx: 0x%x, tag: 0x%x, hits: %b, hit_ways: %d\n",
+    val btb_access_printf = PlusArg("f2btb-access-printf", 0, "Enable F2 BTB access printf debugging", 1)
+    val s2_vpc  = RegNext(s1_pc)
+    val s2_idx  = RegNext(s1_idx)
+    val s2_tag  = RegNext(s1_req_tag)    
+    val s2_hit = RegNext(s1_hits.reduce(_||_))
+    when (s2_hit && btb_access_printf(0) && !doing_reset) {
+      // F2 阶段 BTB 命中，打印本次取指的 BTB 命中信息
+      printf("[%d F2 BTB] S1 PC: 0x%x, idx: 0x%x, tag: 0x%x\n",
         cycleCount,
-        s1_pc,
-        s1_idx(log2Ceil(nSets)-1,0),
-        s1_req_tag,
-        VecInit(s1_hits).asUInt,
-        VecInit(s1_hit_ways).asUInt
+        s2_vpc,
+        s2_idx(log2Ceil(nSets)-1,0),
+        s2_tag(tagSz-1,0)
       )
-      // print out meta tag
+      // 打印每个 slot 的 F2 预测结果
       for (w <- 0 until bankWidth) {
-        printf("tag slot %d way 0: 0x%x, tag slot %d way 1: 0x%x\n",
-          w.U, s1_req_rmeta(0)(w).tag,
-          w.U, s1_req_rmeta(1)(w).tag)
+        when (RegNext(s1_hits(w))) {
+          printf("  slot=%d valid=%d pred_pc=0x%x is_br=%d is_jal=%d is_call=%d is_ret=%d taken=%d\n",
+            w.U,
+            io.resp.f2(w).predicted_pc.valid,
+            io.resp.f2(w).predicted_pc.bits,
+            io.resp.f2(w).is_br,
+            io.resp.f2(w).is_jal,
+            io.resp.f2(w).is_call,
+            io.resp.f2(w).is_ret,
+            io.resp.f2(w).taken
+          )
+        }
       }
     }
-    val btb_update_printf = PlusArg("btb-update-printf", 0, "Enable BTB update printf debugging", 1)
+
+    val btb_update_printf = PlusArg("f2btb-update-printf", 0, "Enable F2 BTB update printf debugging", 1)
     when (s1_update.valid && s1_update.bits.is_commit_update && !doing_reset && btb_update_printf(0)) {
-      printf("[%d BTB Update] PC: 0x%x, idx: 0x%x, tag: 0x%x, cfi_valid: %b, cfi_idx: %d, target: 0x%x," +
+      printf("[%d F2 BTB Update] PC: 0x%x, idx: 0x%x, tag: 0x%x, cfi_valid: %b, cfi_idx: %d, target: 0x%x," +
       " taken: %b, br_mask: %b, cfi_is_call: %b, cfi_is_ret: %b, cfi_is_jal: %b, btb_mispredicts: %b," +
       " write_way: %d, new_offset: 0x%x (extended: %b)\n",
         cycleCount,
