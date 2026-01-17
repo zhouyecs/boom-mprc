@@ -409,7 +409,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_tlb_miss = !s1_is_replay && tlb.io.resp.miss
   val s1_tlb_resp = Mux(s1_is_replay, RegNext(s0_replay_resp), tlb.io.resp)
   val s1_ppc  = Mux(s1_is_replay, RegNext(s0_replay_ppc), tlb.io.resp.paddr)
-  val s1_bpd_resp = bpd.io.resp.f1
 
   icache.io.s1_paddr := s1_ppc
   icache.io.s1_kill  := tlb.io.resp.miss || f1_clear
@@ -503,22 +502,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
 
-  // 会不会改为 f3_ras_top_idx 更合适一些？
-  val f2_ras_top_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
-  val f2_ras_top_idx_write = WireDefault(f2_ras_top_idx)
-  f2_ras_top_idx := f2_ras_top_idx_write
-  // RAS takes a cycle to read
-  bpd.io.f2_read_idx := f2_ras_top_idx_write
-
-
   // The BPD resp comes in f3
   f3_bpd_resp.io.enq.valid := f3.io.deq.valid && RegNext(f3.io.enq.ready)
-  f3_bpd_resp.io.enq.bits.pc  := bpd.io.resp.f3.pc
-  f3_bpd_resp.io.enq.bits.preds := bpd.io.resp.f3.preds
-  f3_bpd_resp.io.enq.bits.meta  := bpd.io.resp.f3.meta
-  f3_bpd_resp.io.enq.bits.lhist := bpd.io.resp.f3.lhist
-  f3_bpd_resp.io.enq.bits.ghist := bpd.io.resp.f3_ghist
+  f3_bpd_resp.io.enq.bits.pc  := bpd.io.resp.f3_meta.pc
+  f3_bpd_resp.io.enq.bits.preds := bpd.io.resp.f3_preds_info
+  f3_bpd_resp.io.enq.bits.meta  := bpd.io.resp.f3_meta.meta
+  f3_bpd_resp.io.enq.bits.ghist := bpd.io.resp.f3_meta.ghist
   f3_bpd_resp.io.enq.bits.ghist_update_type := bpd.io.resp.f3_ghist_update_type
+  // 同步运行时预译码阶段不需要做校验
+  f3_bpd_resp.io.enq.bits.target := DontCare
 
   when (f3_bpd_resp.io.enq.fire) {
     bpd.io.f3_fire := true.B
@@ -545,6 +537,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_ret_mask     = Wire(Vec(fetchWidth, Bool()))
   val f3_npc_plus4_mask = Wire(Vec(fetchWidth, Bool()))
   val f3_btb_mispredicts = Wire(Vec(fetchWidth, Bool()))
+  f3_btb_mispredicts := DontCare
   f3_fetch_bundle.mask := f3_mask.asUInt
   f3_fetch_bundle.br_mask := f3_br_mask.asUInt
   f3_fetch_bundle.pc := f3_imemresp.pc
@@ -721,18 +714,18 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       //  2) the BPD believes this is a branch and says we should take it
       f3_redirects(i)    := predecode_valid(i) && (
         predecode_cfi_type(i) === CFI_JAL || predecode_cfi_type(i) === CFI_JALR ||
-        (predecode_cfi_type(i) === CFI_BR && f3_bpd_resp.io.deq.bits.preds(i).taken && useBPD.B)
+        (predecode_cfi_type(i) === CFI_BR && f3_bpd_resp.io.deq.bits.preds.br_taken(i) && useBPD.B)
       )
       f3_mask  (i) := predecode_valid(i) && !redirect_found
       f3_targs (i) := Mux(predecode_cfi_type(i) === CFI_JALR,
-        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits,
+        f3_bpd_resp.io.deq.bits.preds.jal_targets_debug(i),
         predecode_targets(i))
 
       // Flush BTB entries for JALs if we mispredict the target
-      f3_btb_mispredicts(i) := (predecode_cfi_type(i) === CFI_JAL && predecode_valid(i) &&
-        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.valid &&
-        (f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits =/= predecode_targets(i))
-      )
+      // f3_btb_mispredicts(i) := (predecode_cfi_type(i) === CFI_JAL && predecode_valid(i) &&
+      //   f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.valid &&
+      //   (f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits =/= predecode_targets(i))
+      // )
 
       f3_br_mask(i)   := f3_mask(i) && predecode_cfi_type(i) === CFI_BR
       f3_cfi_types(i) := predecode_cfi_type(i)
@@ -750,8 +743,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   f3_fetch_bundle.ghist    := f3_bpd_resp.io.deq.bits.ghist
   // 忽略 f1, f2, f3 ghist 的 ras_idx 字段
-  f3_fetch_bundle.ghist.ras_idx := f2_ras_top_idx
-  f3_fetch_bundle.lhist    := f3_bpd_resp.io.deq.bits.lhist
+  f3_fetch_bundle.ghist.ras_idx := f3_bpd_resp.io.deq.bits.preds.ras_idx
+  f3_fetch_bundle.lhist    := DontCare
   f3_fetch_bundle.bpd_meta := f3_bpd_resp.io.deq.bits.meta
 
   f3_fetch_bundle.end_half.valid := bank_prev_is_half
@@ -770,13 +763,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_idx.valid := f3_redirects.reduce(_||_)
   f3_fetch_bundle.cfi_idx.bits  := PriorityEncoder(f3_redirects)
 
-  f3_fetch_bundle.ras_top := f3_bpd_resp.io.deq.bits.preds(0).ras_top
+  f3_fetch_bundle.ras_top := f3_bpd_resp.io.deq.bits.preds.ras_top
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
   val f3_predicted_target = Mux(f3_redirects.reduce(_||_),
     Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B,
-      f3_bpd_resp.io.deq.bits.preds(0).ras_top,
+      f3_bpd_resp.io.deq.bits.preds.ras_top,
       f3_targs(PriorityEncoder(f3_redirects))
     ),
     nextFetch(f3_fetch_bundle.pc)
@@ -797,11 +790,18 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // 如果后端重定向引发 ras top idx 的修正和 f3_fire 引发 call/ret 指令修改 ras 内容
   // 可以同时发生，互不干扰，因此这里没有检查 f3_clear 信号。下一周期 ftq 传来 ras 内容的
   // 修正请求时，f3_fire 必为 false
-  bpd.io.f3_write_valid := false.B
-  bpd.io.f3_write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+  bpd.io.predecode_ras_update_valid := false.B
+  bpd.io.predecode_ras_update_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
-  bpd.io.f3_write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
+  bpd.io.predecode_ras_update_idx   := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
+  bpd.io.predecode_ras_top_update_valid := false.B
+  bpd.io.predecode_ras_top_update_idx   := DontCare
 
+  bpd.io.backend_ras_update_valid := false.B
+  bpd.io.backend_ras_update_addr  := DontCare
+  bpd.io.backend_ras_update_idx   := DontCare
+  bpd.io.backend_ras_top_update_valid := false.B
+  bpd.io.backend_ras_top_update_idx := DontCare
 
   val f3_ghist_all_zero = f3_fetch_bundle.ghist === (0.U).asTypeOf(new GlobalHistory)
   val shift_zero_or_no_shift_f3 = f3_pred_ghist_update_type(1) === 0.U &&
@@ -812,10 +812,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
-      bpd.io.f3_write_valid := true.B
-      f2_ras_top_idx_write := WrapInc(f2_ras_top_idx, nRasEntries)
+      // 预译码检测到 call 指令时，ras top idx 更新和 ras top 内容更新同时发生 
+      bpd.io.predecode_ras_update_valid := true.B
+      bpd.io.predecode_ras_top_update_valid := true.B
+      bpd.io.predecode_ras_top_update_idx := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
     } .elsewhen(f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid) {
-      f2_ras_top_idx_write := WrapDec(f2_ras_top_idx, nRasEntries)
+      // 预译码检测到 ret 指令时，更新 ras top idx
+      bpd.io.predecode_ras_top_update_valid := true.B 
+      bpd.io.predecode_ras_top_update_idx := WrapDec(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
     }
     when (f3_redirects.reduce(_||_)) {
       f3_prev_is_half := false.B
@@ -943,9 +947,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   // 从 FTQ 来的 RAS 更新具有更高优先级 
   when (ftq.io.ras_update && enableRasTopRepair.B) {
-    bpd.io.f3_write_valid := true.B
-    bpd.io.f3_write_idx   := ftq.io.ras_update_idx
-    bpd.io.f3_write_addr  := ftq.io.ras_update_pc
+    // FTQ 负责更新 ras top 的内容
+    bpd.io.backend_ras_update_valid := true.B
+    bpd.io.backend_ras_update_idx  := ftq.io.ras_update_idx
+    bpd.io.backend_ras_update_addr  := ftq.io.ras_update_pc
 
     assert (RegNext(io.cpu.redirect_val), "RAS updates should only occur on next cycle of redirects" )
     assert (!f3.io.deq.valid, "f3 should be cleared by redirects when RAS updates occur")
@@ -1003,7 +1008,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
     // 如果预测错误的 cfi 指令是 call 或者 ret 指令, 则
     // 新的 ras top 和 ftq update ras idx 不相同
-    f2_ras_top_idx_write := io.cpu.redirect_ghist.ras_idx
+    // 后端重定向更新 ras top 指针的内容
+    bpd.io.backend_ras_top_update_valid := true.B
+    bpd.io.backend_ras_top_update_idx  := io.cpu.redirect_ghist.ras_idx
   }
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
@@ -1019,33 +1026,27 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // Add a free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
 
-    val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
-    when (cmd_ras_printf(0)) {
-      when (ftq.io.ras_update) {
-        printf(p"[${cycleCount} RAS Update] idx=${Hexadecimal(ftq.io.ras_update_idx)} " +
-          p"addr=${Hexadecimal(ftq.io.ras_update_pc)}\n")
-      } .elsewhen(bpd.io.f3_write_valid) {
-        val call_pc = bpd.io.f3_write_addr - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
-        printf(p"[${cycleCount} RAS Push] idx=${Hexadecimal(bpd.io.f3_write_idx)} " +
-          p"addr=${Hexadecimal(bpd.io.f3_write_addr)} pc=${Hexadecimal(call_pc)}\n")
-      }
-      when (f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid && f3.io.deq.fire) {
-        val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
-          f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
-        printf(p"[${cycleCount} RAS Pop] idx=${Hexadecimal(f3_fetch_bundle.ghist.ras_idx)} " +
-          p"top=${Hexadecimal(f3_fetch_bundle.ras_top)}, pc=${Hexadecimal(ret_pc)}\n")
-      }
-    }
+    // val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
+    // when (cmd_ras_printf(0)) {
+    //   when (ftq.io.ras_update) {
+    //     printf(p"[${cycleCount} RAS Update] idx=${Hexadecimal(ftq.io.ras_update_idx)} " +
+    //       p"addr=${Hexadecimal(ftq.io.ras_update_pc)}\n")
+    //   } .elsewhen(bpd.io.f3_write_valid) {
+    //     val call_pc = bpd.io.f3_write_addr - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+    //     printf(p"[${cycleCount} RAS Push] idx=${Hexadecimal(bpd.io.f3_write_idx)} " +
+    //       p"addr=${Hexadecimal(bpd.io.f3_write_addr)} pc=${Hexadecimal(call_pc)}\n")
+    //   }
+    //   when (f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid && f3.io.deq.fire) {
+    //     val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+    //       f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+    //     printf(p"[${cycleCount} RAS Pop] idx=${Hexadecimal(f3_fetch_bundle.ghist.ras_idx)} " +
+    //       p"top=${Hexadecimal(f3_fetch_bundle.ras_top)}, pc=${Hexadecimal(ret_pc)}\n")
+    //   }
+    // }
   }
 
   // Assertions
   when (f3.io.deq.fire) {
-    // Check all preds(i).ras_top are identical for i in [0, fetchWidth)
-    val f3_ras_top_eq = (0 until fetchWidth-1).map { i =>
-      f3_bpd_resp.io.deq.bits.preds(i).ras_top === f3_bpd_resp.io.deq.bits.preds(i+1).ras_top
-    }.reduce(_ && _)
-    assert(f3_ras_top_eq, "RAS tops should be the same in BPD response across instructions")
-
     assert (f3_bpd_resp.io.deq.fire, "BPD F3 response should fire when F3 fires" )
   }
 

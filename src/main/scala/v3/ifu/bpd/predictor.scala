@@ -46,15 +46,39 @@ class BranchPredictionBundle(implicit p: Parameters) extends BoomBundle()(p)
   val lhist = Output(Vec(nBanks, UInt(localHistoryLength.W)))
 }
 
-class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
+class FetchPacketPredsInfo(implicit p: Parameters) extends BoomBundle()(p)
+  with HasBoomFrontendParameters
+{
+  val br_taken = UInt(fetchWidth.W)
+  // 第一个无条件跳转指令的目标地址
+  val jal_target = UInt(vaddrBitsExtended.W)
+  val jal_targets_debug = Vec(fetchWidth, UInt(vaddrBitsExtended.W))
+  val ras_top = UInt(vaddrBitsExtended.W)
+  // ras top 的 idx，用于修正 ras
+  val ras_idx = UInt(log2Ceil(nRasEntries).W)
+}
+
+class FetchPacketMetaInfo(implicit p: Parameters) extends BoomBundle()(p)
   with HasBoomFrontendParameters
 {
   val pc = UInt(vaddrBitsExtended.W)
-  val preds = Vec(fetchWidth, new BranchPrediction)
   val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
-  val lhist = Output(Vec(nBanks, UInt(localHistoryLength.W)))
   val ghist = new GlobalHistory
+}
+
+class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
+  with HasBoomFrontendParameters
+{
+  // 应该存放在 FTQ 中，不需要传递到 predecode 的信息
+  val pc = UInt(vaddrBitsExtended.W)
+  val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
+  // 分支预测器提供的预测信息，可能来自 f3 预测或 ftq
+  val preds = new FetchPacketPredsInfo
+  // 分支预测器的结果，可能来自 f2 预测， f3 预测或 ftq
   val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
+  val target = UInt(vaddrBitsExtended.W)
+  // 取该 fetch packet 时的信息，来自 ftq
+  val ghist = new GlobalHistory
 }
 
 
@@ -227,13 +251,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val f0_req = Input(Valid(new BranchPredictionRequest))
 
     val resp = Output(new Bundle {
-      val f1 = new BranchPredictionBundle
-      val f2 = new BranchPredictionBundle
       // 外部应该只关心 f3 的 prediction bundle
       // 因为只有 f3 的 meta, preds, ghist 会被写入到 FTQ 中
-      val f3 = new BranchPredictionBundle
-      val f3_ghist = new GlobalHistory
-      val f3_ghist_update_type = UInt(GHR_UPDATE_SZ.W)
+      val f3_meta = new FetchPacketMetaInfo
+      val f3_preds_info = new FetchPacketPredsInfo
       // 用于 replay
       val f2_ghist = new GlobalHistory
 
@@ -247,6 +268,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       val f1_next_ghist = new GlobalHistory
       val f2_next_ghist = new GlobalHistory
       val f3_next_ghist = new GlobalHistory
+      val f3_ghist_update_type = UInt(GHR_UPDATE_SZ.W)
 
       // predicted next pc
       val f1_next_pc = UInt(vaddrBitsExtended.W)
@@ -269,12 +291,21 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     // Update
     val update = Input(Valid(new BranchPredictionUpdate))
-    // For RAS
-    val f2_read_idx   = Input(UInt(log2Ceil(nRasEntries).W))
 
-    val f3_write_valid = Input(Bool())
-    val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
-    val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
+    // 预译码修改 ras 的表项内容
+    val predecode_ras_update_valid = Input(Bool())
+    val predecode_ras_update_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+    val predecode_ras_update_addr  = Input(UInt(vaddrBitsExtended.W))
+    // 预译码修改 ras top 位置
+    val predecode_ras_top_update_valid = Input(Bool())
+    val predecode_ras_top_update_idx   = Input(UInt(log2Ceil(nRasEntries).W)) 
+    // 后端重定向修正 ras 表项内容
+    val backend_ras_update_valid = Input(Bool())
+    val backend_ras_update_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+    val backend_ras_update_addr  = Input(UInt(vaddrBitsExtended.W))    
+    // 后端重定向修正 ras top 位置
+    val backend_ras_top_update_valid = Input(Bool())
+    val backend_ras_top_update_idx   = Input(UInt(log2Ceil(nRasEntries).W))
   })
 
   var total_memsize = 0
@@ -293,6 +324,37 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 
+  // RAS 相关
+  // 会不会改为 f3_ras_top_idx 更合适一些？
+  val f2_ras_top_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
+  val f2_ras_top_idx_write = WireDefault(f2_ras_top_idx)
+  f2_ras_top_idx := f2_ras_top_idx_write
+  
+  // 修改 ras top 的最高优先级是后端重定向
+  when (io.backend_ras_top_update_valid) {
+    f2_ras_top_idx_write := io.backend_ras_top_update_idx
+  // 其次是预译码修改
+  } .elsewhen (io.predecode_ras_top_update_valid) {
+    f2_ras_top_idx_write := io.predecode_ras_top_update_idx
+  }
+
+  val ras_write_valid = WireDefault(false.B)
+  val ras_write_idx   = Wire(UInt(log2Ceil(nRasEntries).W))
+  ras_write_idx := DontCare
+  val ras_write_addr  = Wire(UInt(vaddrBitsExtended.W))
+  ras_write_addr := DontCare
+  // 修改 ras 表项内容的最高优先级是后端重定向
+  when (io.backend_ras_update_valid) {
+    ras_write_valid := true.B
+    ras_write_idx   := io.backend_ras_update_idx
+    ras_write_addr  := io.backend_ras_update_addr
+  // 其次是预译码修改
+  } .elsewhen (io.predecode_ras_update_valid) {
+    ras_write_valid := true.B
+    ras_write_idx   := io.predecode_ras_update_idx
+    ras_write_addr  := io.predecode_ras_update_addr
+  }
+  // TODO: 加上 f3 对 ras 的修改逻辑
 
   if (nBanks == 1) {
     banked_lhist_providers(0).io.f0_valid := io.f0_req.valid
@@ -307,10 +369,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     banked_predictors(0).io.resp_in(0)           := (0.U).asTypeOf(new BranchPredictionBankResponse)
     // For RAS
-    banked_predictors(0).io.f2_read_idx := io.f2_read_idx
-    banked_predictors(0).io.f3_write_valid := io.f3_write_valid
-    banked_predictors(0).io.f3_write_idx := io.f3_write_idx
-    banked_predictors(0).io.f3_write_addr := io.f3_write_addr
+    banked_predictors(0).io.f2_read_idx := f2_ras_top_idx_write
+    banked_predictors(0).io.f3_write_valid := ras_write_valid
+    banked_predictors(0).io.f3_write_idx := ras_write_idx
+    banked_predictors(0).io.f3_write_addr := ras_write_addr
   } else {
     require(nBanks == 2)
 
@@ -369,11 +431,6 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val f1_preds = banked_predictors(0).io.resp.f1
     val f2_preds = banked_predictors(0).io.resp.f2
     val f3_preds = banked_predictors(0).io.resp.f3
-    io.resp.f1.preds    := f1_preds
-    io.resp.f2.preds    := f2_preds
-    io.resp.f3.preds    := f3_preds
-    io.resp.f3.meta(0)  := banked_predictors(0).io.f3_meta
-    io.resp.f3.lhist(0) := banked_lhist_providers(0).io.f3_lhist
 
     banked_predictors(0).io.f3_fire := io.f3_fire
     banked_lhist_providers(0).io.f3_fire := io.f3_fire
@@ -493,14 +550,30 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       f3_is_call(f3_redirect_idx),
       f3_is_ret(f3_redirect_idx))   
     
-    // 输出 f3 的基本信息
-    io.resp.f3_ghist := s3_ghist
-    io.resp.f3_ghist_update_type := f3_ghist_update_type
+    // 输出 f3 的 meta info
+    io.resp.f3_meta.ghist := s3_ghist
+    io.resp.f3_meta.pc := s3_vpc    
+    io.resp.f3_meta.meta(0) := banked_predictors(0).io.f3_meta
 
-    // 输出 f3 的预测
+    // 输出 f3 的 preds info
+    val f3_br_taken = f3_preds.map(p => p.taken)
+    io.resp.f3_preds_info.br_taken := VecInit(f3_br_taken).asUInt
+    val f3_is_jal = (0 until fetchWidth) map { i =>
+      f3_mask(i) && f3_preds(i).predicted_pc.valid && (f3_preds(i).is_jal)
+    }
+    val f3_jal_idx = PriorityEncoder(f3_is_jal)
+    val f3_jal_target = f3_preds(f3_jal_idx).predicted_pc.bits
+    io.resp.f3_preds_info.jal_target := f3_jal_target
+    io.resp.f3_preds_info.jal_targets_debug := f3_preds.map(p => p.predicted_pc.bits)
+    io.resp.f3_preds_info.ras_top := f3_preds(0).ras_top
+    // TODO
+    io.resp.f3_preds_info.ras_idx := f2_ras_top_idx
+
+    // 输出 f3 的预测结果
     io.resp.f3_pred_valid := s3_valid
     io.resp.f3_next_ghist := f3_predicted_ghist
     io.resp.f3_next_pc := f3_predicted_target
+    io.resp.f3_ghist_update_type := f3_ghist_update_type
     
     // f3 重定向 f1/f2
     val f3_ghist_all_zero = s3_ghist === (0.U).asTypeOf(new GlobalHistory)
@@ -587,62 +660,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_lhist_providers(0).io.f3_fire := b0_fire
     banked_lhist_providers(1).io.f3_fire := b1_fire
 
-
-
-    // The branch prediction metadata is stored un-shuffled
-    io.resp.f3.meta(0)    := banked_predictors(0).io.f3_meta
-    io.resp.f3.meta(1)    := banked_predictors(1).io.f3_meta
-
-    io.resp.f3.lhist(0)   := banked_lhist_providers(0).io.f3_lhist
-    io.resp.f3.lhist(1)   := banked_lhist_providers(1).io.f3_lhist
-
-    when (bank(io.resp.f1.pc) === 0.U) {
-      for (i <- 0 until bankWidth) {
-        io.resp.f1.preds(i)           := banked_predictors(0).io.resp.f1(i)
-        io.resp.f1.preds(i+bankWidth) := banked_predictors(1).io.resp.f1(i)
-      }
-    } .otherwise {
-      for (i <- 0 until bankWidth) {
-        io.resp.f1.preds(i)           := banked_predictors(1).io.resp.f1(i)
-        io.resp.f1.preds(i+bankWidth) := banked_predictors(0).io.resp.f1(i)
-      }
-    }
-
-    when (bank(io.resp.f2.pc) === 0.U) {
-      for (i <- 0 until bankWidth) {
-        io.resp.f2.preds(i)           := banked_predictors(0).io.resp.f2(i)
-        io.resp.f2.preds(i+bankWidth) := banked_predictors(1).io.resp.f2(i)
-      }
-    } .otherwise {
-      for (i <- 0 until bankWidth) {
-        io.resp.f2.preds(i)           := banked_predictors(1).io.resp.f2(i)
-        io.resp.f2.preds(i+bankWidth) := banked_predictors(0).io.resp.f2(i)
-      }
-    }
-
-    when (bank(io.resp.f3.pc) === 0.U) {
-      for (i <- 0 until bankWidth) {
-        io.resp.f3.preds(i)           := banked_predictors(0).io.resp.f3(i)
-        io.resp.f3.preds(i+bankWidth) := banked_predictors(1).io.resp.f3(i)
-      }
-    } .otherwise {
-      for (i <- 0 until bankWidth) {
-        io.resp.f3.preds(i)           := banked_predictors(1).io.resp.f3(i)
-        io.resp.f3.preds(i+bankWidth) := banked_predictors(0).io.resp.f3(i)
-      }
-    }
   }
-
-  io.resp.f1.pc := RegNext(io.f0_req.bits.pc)
-  io.resp.f2.pc := RegNext(io.resp.f1.pc)
-  io.resp.f3.pc := RegNext(io.resp.f2.pc)
-
-  // We don't care about meta from the f1 and f2 resps
-  // Use the meta from the latest resp
-  io.resp.f1.meta := DontCare
-  io.resp.f2.meta := DontCare
-  io.resp.f1.lhist := DontCare
-  io.resp.f2.lhist := DontCare
 
 
   for (i <- 0 until nBanks) {
