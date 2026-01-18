@@ -64,7 +64,7 @@ class FetchPacketMetaInfo(implicit p: Parameters) extends BoomBundle()(p)
   with HasBoomFrontendParameters
 {
   val pc = UInt(vaddrBitsExtended.W)
-  val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
+  val meta = Vec(nBanks, UInt(bpdMaxMetaLength.W))
   val ghist = new GlobalHistory
 }
 

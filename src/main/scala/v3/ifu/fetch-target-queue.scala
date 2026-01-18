@@ -166,11 +166,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val meta     = SyncReadMem(num_entries, Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   val ram      = Reg(Vec(num_entries, new FTQBundle))
   val ghist    = Seq.fill(2) { SyncReadMem(num_entries, new GlobalHistory) }
-  val lhist    = if (useLHist) {
-    Some(SyncReadMem(num_entries, Vec(nBanks, UInt(localHistoryLength.W))))
-  } else {
-    None
-  }
 
   val do_enq = io.enq.fire
 
@@ -202,7 +197,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     val new_ghist = io.enq.bits.ghist
 
-    lhist.map( l => l.write(enq_ptr.value, io.enq.bits.lhist))
     ghist.map( g => g.write(enq_ptr.value, new_ghist))
     meta.write(enq_ptr.value, io.enq.bits.bpd_meta)
     ram(enq_ptr.value) := new_entry
@@ -249,11 +243,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_idx = bpd_ptr.value
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
-  val bpd_lhist = if (useLHist) {
-    lhist.get.read(bpd_idx, true.B)
-  } else {
-    VecInit(Seq.fill(nBanks) { 0.U })
-  }
+
   val bpd_meta  = meta.read(bpd_idx, true.B) // TODO fix these SRAMs
   val bpd_pc    = RegNext(pcs(bpd_idx))
   // TODO: 不怎么写不知道为啥 verilator 那边模拟的时候显示
@@ -318,7 +308,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.cfi_is_br  := bpd_entry.br_mask(cfi_idx)
     io.bpdupdate.bits.cfi_is_jal := bpd_entry.cfi_type === CFI_JAL || bpd_entry.cfi_type === CFI_JALR
     io.bpdupdate.bits.ghist      := bpd_ghist
-    io.bpdupdate.bits.lhist      := bpd_lhist
+    io.bpdupdate.bits.lhist      := DontCare
     io.bpdupdate.bits.meta       := bpd_meta
     io.bpdupdate.bits.cfi_is_call  := bpd_entry.cfi_is_call
     io.bpdupdate.bits.cfi_is_ret   := bpd_entry.cfi_is_ret

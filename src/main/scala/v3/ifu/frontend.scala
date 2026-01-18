@@ -232,7 +232,6 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val br_mask       = UInt(fetchWidth.W)
 
   val ghist         = new GlobalHistory
-  val lhist         = Vec(nBanks, UInt(localHistoryLength.W))
 
   val xcpt_pf_if    = Bool() // I-TLB miss (instruction fetch fault).
   val xcpt_ae_if    = Bool() // Access exception.
@@ -744,7 +743,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.ghist    := f3_bpd_resp.io.deq.bits.ghist
   // 忽略 f1, f2, f3 ghist 的 ras_idx 字段
   f3_fetch_bundle.ghist.ras_idx := f3_bpd_resp.io.deq.bits.preds.ras_idx
-  f3_fetch_bundle.lhist    := DontCare
   f3_fetch_bundle.bpd_meta := f3_bpd_resp.io.deq.bits.meta
   f3_fetch_bundle.btb_mispredicts := f3_btb_mispredicts.asUInt
 
@@ -863,7 +861,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f4_btb_corrections.io.enq.bits.btb_mispredicts      := f3_btb_mispredicts.asUInt
   f4_btb_corrections.io.enq.bits.pc                   := f3_fetch_bundle.pc
   f4_btb_corrections.io.enq.bits.ghist                := f3_fetch_bundle.ghist
-  f4_btb_corrections.io.enq.bits.lhist                := f3_fetch_bundle.lhist
   f4_btb_corrections.io.enq.bits.meta                 := f3_fetch_bundle.bpd_meta
 
 
