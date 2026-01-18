@@ -29,6 +29,7 @@ import boom.v3.util._
 
 
 class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
+  val ftq_idx = new FTQPtr
   val pc = UInt(vaddrBitsExtended.W)  // ID stage PC
   val data = UInt((fetchWidth * coreInstBits).W)
   val mask = UInt(fetchWidth.W)
@@ -226,7 +227,7 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
 
   val ras_top       = UInt(vaddrBitsExtended.W)
 
-  val ftq_idx       = UInt(log2Ceil(ftqSz).W)
+  val ftq_idx       = new FTQPtr
   val mask          = UInt(fetchWidth.W) // mark which words are valid instructions
 
   val br_mask       = UInt(fetchWidth.W)
@@ -346,6 +347,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val bpd = Module(new BranchPredictor)
   bpd.io.f3_fire := false.B
 
+  val ftq = Module(new FetchTargetQueue)
+
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache
   val tlb = Module(new TLB(true, log2Ceil(fetchBytes), TLBConfig(nTLBSets, nTLBWays)))
@@ -359,6 +362,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // --------------------------------------------------------
 
   val s0_vpc       = WireInit(0.U(vaddrBitsExtended.W))
+  val s0_ftq_idx   = WireInit(FTQPtr(false.B, 0.U))
   val s0_ghist     = WireInit((0.U).asTypeOf(new GlobalHistory))
   val s0_tsrc      = WireInit(0.U(BSRC_SZ.W))
   val s0_valid     = WireInit(false.B)
@@ -381,16 +385,20 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   icache.io.req.valid     := s0_valid
   icache.io.req.bits.addr := s0_vpc
+  
+  val s0_bpd_ftq_idx = WireInit(FTQPtr(false.B, 0.U))
 
   bpd.io.f0_req.valid      := s0_valid
   bpd.io.f0_req.bits.pc    := s0_vpc
   bpd.io.f0_req.bits.ghist := s0_ghist
+  bpd.io.f0_req.bits.ftq_idx := s0_bpd_ftq_idx
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
   //      Translate VPC
   // --------------------------------------------------------
   val s1_vpc       = RegNext(s0_vpc)
+  val s1_ftq_idx   = RegNext(s0_ftq_idx)
   val s1_valid     = RegNext(s0_valid, false.B)
   val s1_ghist     = RegNext(s0_ghist)
   val s1_is_replay = RegNext(s0_is_replay)
@@ -423,6 +431,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_vpc       := bpd.io.resp.f1_next_pc
     s0_ghist     := bpd.io.resp.f1_next_ghist
     s0_is_replay := false.B
+
+    s0_ftq_idx     := bpd.io.resp.f1_ftq_idx + 1.U
+    s0_bpd_ftq_idx := bpd.io.resp.f1_ftq_idx + 1.U
   }
 
   io.cpu.itlb_valid_access := tlb.io.req.valid
@@ -433,6 +444,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // --------------------------------------------------------
 
   val s2_valid = RegNext(s1_valid && !f1_clear, false.B)
+  val s2_ftq_idx   = RegNext(s1_ftq_idx)
   val s2_vpc   = RegNext(s1_vpc)
   val s2_ppc  = RegNext(s1_ppc)
   val s2_tsrc = RegNext(s1_tsrc) // tsrc provides the predictor component which provided the prediction TO this instruction
@@ -460,6 +472,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     bpd_f1_clear := true.B
     // flush bpd 的 f2 流水线，避免给出 f3 预测进入到 f3_bpd_resp queue 中
     bpd_f2_clear := true.B
+
+    s0_ftq_idx     := s2_ftq_idx
+    s0_bpd_ftq_idx := s2_ftq_idx
   // s0_vpc 来源 2: bpd f2 预测重定向
   } .elsewhen (bpd.io.resp.f2_redirect) {
     s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
@@ -470,6 +485,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_tsrc      := BSRC_2
     f1_clear := true.B
     bpd_f1_clear := true.B
+
+    s0_ftq_idx     := bpd.io.resp.f2_ftq_idx + 1.U
+    s0_bpd_ftq_idx := bpd.io.resp.f2_ftq_idx + 1.U
   }
   s0_replay_resp := s2_tlb_resp
   s0_replay_ppc  := s2_ppc
@@ -497,6 +515,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.valid   := (s2_valid && !f2_clear &&
     (icache.io.resp.valid || ((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_tlb_miss))
   )
+  f3.io.enq.bits.ftq_idx := s2_ftq_idx
   f3.io.enq.bits.pc := s2_vpc
   f3.io.enq.bits.data  := Mux(s2_xcpt, 0.U, icache.io.resp.bits.data)
   f3.io.enq.bits.mask := fetchMask(s2_vpc)
@@ -542,7 +561,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.mask := f3_mask.asUInt
   f3_fetch_bundle.br_mask := f3_br_mask.asUInt
   f3_fetch_bundle.pc := f3_imemresp.pc
-  f3_fetch_bundle.ftq_idx := 0.U // This gets assigned later
+  f3_fetch_bundle.ftq_idx := f3.io.deq.bits.ftq_idx
   f3_fetch_bundle.xcpt_pf_if := f3_imemresp.xcpt.pf.inst
   f3_fetch_bundle.xcpt_ae_if := f3_imemresp.xcpt.ae.inst
   f3_fetch_bundle.fsrc := f3_imemresp.fsrc
@@ -849,6 +868,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_tsrc      := BSRC_3
 
       f3_fetch_bundle.fsrc := BSRC_3
+
+      s0_ftq_idx     := f3_fetch_bundle.ftq_idx + 1.U
+      s0_bpd_ftq_idx := f3_fetch_bundle.ftq_idx + 1.U
     }
   }
 
@@ -872,7 +894,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     Module(new Queue(new FetchBundle, 1, pipe=true, flow=false))}
 
   val fb  = Module(new FetchBuffer)
-  val ftq = Module(new FetchTargetQueue)
 
   // When we mispredict, we need to repair
 
@@ -924,7 +945,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   fb.io.enq.valid := f4.io.deq.valid && ftq.io.predecode_enq.ready && !f4_delay
   fb.io.enq.bits  := f4.io.deq.bits
-  fb.io.enq.bits.ftq_idx := ftq.io.enq_idx
   fb.io.enq.bits.sfbs    := Mux(f4_sfb_valid, UIntToOH(f4_sfb_idx), 0.U(fetchWidth.W)).asBools
   fb.io.enq.bits.shadowed_mask := (
     Mux(f4_sfb_valid, f4_sfb_mask(fetchWidth-1,0), 0.U(fetchWidth.W)) |
@@ -1009,6 +1029,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // 后端重定向更新 ras top 指针的内容
     bpd.io.backend_ras_top_update_valid := true.B
     bpd.io.backend_ras_top_update_idx  := io.cpu.redirect_ghist.ras_idx
+
+    s0_ftq_idx     := ftq.io.redirect_ftq_idx + 1.U
+    s0_bpd_ftq_idx := ftq.io.redirect_ftq_idx + 1.U
   }
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx

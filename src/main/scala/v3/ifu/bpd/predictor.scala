@@ -162,6 +162,7 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
 
 class BranchPredictionRequest(implicit p: Parameters) extends BoomBundle()(p)
 {
+  val ftq_idx = new FTQPtr
   val pc    = UInt(vaddrBitsExtended.W)
   val ghist = new GlobalHistory
 }
@@ -276,6 +277,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       val f1_next_pc = UInt(vaddrBitsExtended.W)
       val f2_next_pc = UInt(vaddrBitsExtended.W)
       val f3_next_pc = UInt(vaddrBitsExtended.W)
+
+      val f1_ftq_idx = new FTQPtr
+      val f2_ftq_idx = new FTQPtr
+      val f3_ftq_idx = new FTQPtr
 
       // 表示 f2 或 f3 是否重定向之前的预测
       val f2_redirect = Bool()
@@ -438,6 +443,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_lhist_providers(0).io.f3_fire := io.f3_fire
 
     // 重定向相关逻辑
+    val s1_ftq_idx = RegNext(io.f0_req.bits.ftq_idx)
+    val s2_ftq_idx = RegNext(s1_ftq_idx)
+    val s3_ftq_idx = RegNext(s2_ftq_idx)
+
     val s1_valid = RegNext(io.f0_req.valid, false.B)
     val s2_valid = RegNext(s1_valid && !io.f1_clear, false.B)
     val s3_valid = RegNext(s2_valid && !io.f2_clear, false.B)
@@ -480,6 +489,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f1_pred_valid := s1_valid
     io.resp.f1_next_ghist := f1_predicted_ghist
     io.resp.f1_next_pc := f1_predicted_target
+    io.resp.f1_ftq_idx := s1_ftq_idx
 
     // 根据 f2 预测计算新的 ghist 和 next pc
     val f2_ghist_update_type = RegNext(f1_pred_ghist_update_type)
@@ -519,6 +529,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
                               f2_pred_ghist_update_type =/= f2_ghist_update_type && enableGHistStallRepair.B
     val f2_redirect_f1 = f2_correct_f1_ghist || s1_vpc =/= f2_predicted_target
 
+    io.resp.f2_ftq_idx := s2_ftq_idx
     io.resp.f2_redirect := false.B
     when (s2_valid) {
       when (!s1_valid || f2_redirect_f1) {
@@ -587,6 +598,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val f3_redirect_f2 = f3_correct_ghist || s2_vpc =/= f3_predicted_target
     val f3_redirect_f1 = f3_correct_ghist || s1_vpc =/= f3_predicted_target
 
+    io.resp.f3_ftq_idx := s3_ftq_idx
     io.resp.f3_redirect := false.B
     when (s3_valid) {
       when (s2_valid && f3_redirect_f2) {

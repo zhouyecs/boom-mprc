@@ -127,8 +127,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val io = IO(new BoomBundle {
     // predeocde 信息存入 FTQ
     val predecode_enq = Flipped(Decoupled(new FetchBundle()))
-    // Pass to FetchBuffer (newly fetched instructions).
-    val enq_idx = Output(UInt(idx_sz.W))
+    // TODO: remove this
+    val redirect_ftq_idx = Output(new FTQPtr())
     // ROB tells us the youngest committed ftq_idx to remove from FTQ.
     val deq = Flipped(Valid(UInt(idx_sz.W)))
 
@@ -157,9 +157,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   })
   val bpd_commit_ptr    = RegInit(FTQPtr(false.B, 0.U))
   val deq_ptr    = RegInit(FTQPtr(false.B, 0.U))
-  val enq_ptr    = RegInit(FTQPtr(false.B, 0.U))
+  val predecode_enq_ptr    = io.predecode_enq.bits.ftq_idx
+  val next_predecode_enq_ptr_debug = RegInit(FTQPtr(false.B, 0.U))
 
-  val full = isFull(enq_ptr, bpd_commit_ptr)
+  val full = isFull(predecode_enq_ptr, bpd_commit_ptr)
 
 
   val pcs      = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
@@ -176,7 +177,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val prev_pc    = RegInit(0.U(vaddrBitsExtended.W))
   when (do_predecode_enq) {
 
-    pcs(enq_ptr.value)           := io.predecode_enq.bits.pc
+    pcs(predecode_enq_ptr.value)           := io.predecode_enq.bits.pc
 
     val new_entry = Wire(new FTQBundle)
 
@@ -197,18 +198,16 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     val new_ghist = io.predecode_enq.bits.ghist
 
-    ghist.map( g => g.write(enq_ptr.value, new_ghist))
-    meta.write(enq_ptr.value, io.predecode_enq.bits.bpd_meta)
-    ram(enq_ptr.value) := new_entry
+    ghist.map( g => g.write(predecode_enq_ptr.value, new_ghist))
+    meta.write(predecode_enq_ptr.value, io.predecode_enq.bits.bpd_meta)
+    ram(predecode_enq_ptr.value) := new_entry
 
     prev_pc    := io.predecode_enq.bits.pc
     prev_entry := new_entry
     prev_ghist := new_ghist
 
-    enq_ptr := enq_ptr + 1.U
+    next_predecode_enq_ptr_debug := next_predecode_enq_ptr_debug + 1.U
   }
-
-  io.enq_idx := enq_ptr.value
 
   io.bpdupdate.valid := false.B
   io.bpdupdate.bits  := DontCare
@@ -234,12 +233,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   io.ras_update_pc  := RegNext(ras_update_pc)
   io.ras_update_idx := RegNext(ras_update_idx)
 
-  val bpd_update_mispredict = RegInit(false.B)
-  val bpd_update_repair = RegInit(false.B)
-  val bpd_repair_idx = Reg(UInt(log2Ceil(ftqSz).W))
-  val bpd_end_idx = Reg(UInt(log2Ceil(ftqSz).W))
-  val bpd_repair_pc = Reg(UInt(vaddrBitsExtended.W))
-
   val bpd_idx = bpd_commit_ptr.value
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
@@ -258,29 +251,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   dontTouch(readout_target)
 
   val bpd_target = RegNext(readout_target)
-
-  when (io.redirect.valid) {
-    bpd_update_mispredict := false.B
-    bpd_update_repair     := false.B
-  } .elsewhen (RegNext(io.brupdate.b2.mispredict)) {
-    bpd_update_mispredict := true.B
-    bpd_repair_idx        := RegNext(io.brupdate.b2.uop.ftq_idx)
-    bpd_end_idx           := RegNext(enq_ptr.value)
-  } .elsewhen (bpd_update_mispredict) {
-    bpd_update_mispredict := false.B
-    bpd_update_repair     := true.B
-    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
-  } .elsewhen (bpd_update_repair && RegNext(bpd_update_mispredict)) {
-    bpd_repair_pc         := bpd_pc
-    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
-  } .elsewhen (bpd_update_repair) {
-    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
-    when (WrapInc(bpd_repair_idx, num_entries) === bpd_end_idx ||
-      bpd_pc === bpd_repair_pc)  {
-      bpd_update_repair := false.B
-    }
-
-  }
 
   // 这里的判断中将原来的
   // bpd_ptr =/= deq_ptr && enq_ptr =/= WrapInc(bpd_ptr, num_entries)
@@ -334,12 +304,14 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_ghist_debug = ghist(0).read(bpd_idx_debug, true.B)
   val bpd_pc_debug = RegNext(pcs(bpd_idx_debug))
 
+  io.redirect_ftq_idx := DontCare
   when (io.redirect.valid) {
     // 类似于 deq_ptr 的处理。因为新的 enq_ptr 只可能减小或者不变
-    val new_enq_ptr1 = FTQPtr(enq_ptr.flag, io.redirect.bits)
+    val new_enq_ptr1 = FTQPtr(next_predecode_enq_ptr_debug.flag, io.redirect.bits)
     val new_enq_ptr2 = FTQPtr.inverse(new_enq_ptr1)
-    val proper_enq_ptr = Mux(enq_ptr > new_enq_ptr1, new_enq_ptr1, new_enq_ptr2)
-    enq_ptr    := proper_enq_ptr + 1.U
+    val proper_enq_ptr = Mux(next_predecode_enq_ptr_debug > new_enq_ptr1, new_enq_ptr1, new_enq_ptr2)
+    next_predecode_enq_ptr_debug    := proper_enq_ptr + 1.U
+    io.redirect_ftq_idx := proper_enq_ptr
 
     when (io.rob_flush) {
       val new_cfi_idx = (io.rob_flush_pc_lob ^
@@ -383,7 +355,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   for (i <- 0 until 2) {
     val idx = io.get_ftq_pc(i).ftq_idx
     val next_idx = WrapInc(idx, num_entries)
-    val next_is_enq = (next_idx === enq_ptr.value) && io.predecode_enq.fire
+    // TODO: remove this
+    val next_is_enq = (next_idx === next_predecode_enq_ptr_debug.value) && io.predecode_enq.fire
     val next_pc = Mux(next_is_enq, io.predecode_enq.bits.pc, pcs(next_idx))
     val get_entry = ram(idx)
     val next_entry = ram(next_idx)
@@ -394,7 +367,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       io.get_ftq_pc(i).ghist   := DontCare
     io.get_ftq_pc(i).pc        := RegNext(pcs(idx))
     io.get_ftq_pc(i).next_pc   := RegNext(next_pc)
-    io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= enq_ptr.value || next_is_enq)
+    io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= next_predecode_enq_ptr_debug.value || next_is_enq)
     
     val com_pc_ptr = Wire(UInt(log2Ceil(ftqSz).W))
     com_pc_ptr := Mux(io.deq.valid, io.deq.bits, deq_ptr.value)
@@ -436,7 +409,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     }
     val enq_ghist_printf = PlusArg("enq-ghist-update", 0, "Print FTQ enq ghist update", 1)
     when (do_predecode_enq && enq_ghist_printf(0)) {
-      printf(p"[${cycleCount} FTQ] enq_ptr=${enq_ptr.value}, enq_pc=${Hexadecimal(io.predecode_enq.bits.pc)}, " +
+      printf(p"[${cycleCount} FTQ] enq_ptr=${predecode_enq_ptr.value}, enq_pc=${Hexadecimal(io.predecode_enq.bits.pc)}, " +
         p"enq_cfi_idx=${io.predecode_enq.bits.cfi_idx}, " +
         p"enq_br_mask=${Binary(io.predecode_enq.bits.br_mask)}, " +
         p"enq_ghist=${Binary(io.predecode_enq.bits.ghist.histories(0))}\n")
@@ -468,7 +441,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     }
   }
   
-  assert (deq_ptr < enq_ptr || !done_commit_update_debug,
+  assert (deq_ptr < next_predecode_enq_ptr_debug || !done_commit_update_debug,
           """After commit update, deq_ptr should always point to 
           |a valid fetch packet, and deq_ptr points to next enqueue position"""
   )
@@ -488,7 +461,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // 没有检测 mispredict 和 repair update，因为我们暂时不用 loop predictor
     // 没有检测 redirect ghist read，因为 BOOM 里没有一个 valid 信号
     // 来指示 io.get_ftq_pc(i).ftq_idx 是否有效
-    assert (bpd_commit_ptr < enq_ptr, "bpd_ptr should never commit a invalid ftq entry")
+    assert (bpd_commit_ptr < next_predecode_enq_ptr_debug, "bpd_ptr should never commit a invalid ftq entry")
   }
   when (io.bpdupdate.valid) {
     assert (io.bpdupdate.bits.target =/= 0.U,
@@ -498,5 +471,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       assert ((MaskLower(UIntToOH(bpd_entry.cfi_idx.bits)) & bpd_entry.br_mask) === bpd_entry.br_mask,
         "FTQ: bpd_update br_mask has bits set outside of valid fetch bundle")
     }
+  }
+  when (io.predecode_enq.fire) {
+    assert (next_predecode_enq_ptr_debug === predecode_enq_ptr)
   }
 }
