@@ -125,8 +125,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   private val idx_sz = log2Ceil(num_entries)
 
   val io = IO(new BoomBundle {
-    // Enqueue one entry for every fetch cycle.
-    val enq = Flipped(Decoupled(new FetchBundle()))
+    // predeocde 信息存入 FTQ
+    val predecode_enq = Flipped(Decoupled(new FetchBundle()))
     // Pass to FetchBuffer (newly fetched instructions).
     val enq_idx = Output(UInt(idx_sz.W))
     // ROB tells us the youngest committed ftq_idx to remove from FTQ.
@@ -167,41 +167,41 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val ram      = Reg(Vec(num_entries, new FTQBundle))
   val ghist    = Seq.fill(2) { SyncReadMem(num_entries, new GlobalHistory) }
 
-  val do_enq = io.enq.fire
+  val do_predecode_enq = io.predecode_enq.fire
 
 
   // This register lets us initialize the ghist to 0
   val prev_ghist = RegInit((0.U).asTypeOf(new GlobalHistory))
   val prev_entry = RegInit((0.U).asTypeOf(new FTQBundle))
   val prev_pc    = RegInit(0.U(vaddrBitsExtended.W))
-  when (do_enq) {
+  when (do_predecode_enq) {
 
-    pcs(enq_ptr.value)           := io.enq.bits.pc
+    pcs(enq_ptr.value)           := io.predecode_enq.bits.pc
 
     val new_entry = Wire(new FTQBundle)
 
-    new_entry.cfi_idx   := io.enq.bits.cfi_idx
+    new_entry.cfi_idx   := io.predecode_enq.bits.cfi_idx
     // Initially, if we see a CFI, it is assumed to be taken.
     // Branch resolutions may change this
-    new_entry.cfi_taken     := io.enq.bits.cfi_idx.valid
+    new_entry.cfi_taken     := io.predecode_enq.bits.cfi_idx.valid
     new_entry.cfi_mispredicted := false.B
-    new_entry.cfi_type      := io.enq.bits.cfi_type
-    new_entry.cfi_is_call   := io.enq.bits.cfi_is_call
-    new_entry.cfi_is_ret    := io.enq.bits.cfi_is_ret
-    new_entry.cfi_npc_plus4 := io.enq.bits.cfi_npc_plus4
-    new_entry.ras_top       := io.enq.bits.ras_top
-    new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
-    new_entry.br_mask       := io.enq.bits.br_mask
-    new_entry.btb_mispredicts := io.enq.bits.btb_mispredicts
-    new_entry.start_bank    := bank(io.enq.bits.pc)
+    new_entry.cfi_type      := io.predecode_enq.bits.cfi_type
+    new_entry.cfi_is_call   := io.predecode_enq.bits.cfi_is_call
+    new_entry.cfi_is_ret    := io.predecode_enq.bits.cfi_is_ret
+    new_entry.cfi_npc_plus4 := io.predecode_enq.bits.cfi_npc_plus4
+    new_entry.ras_top       := io.predecode_enq.bits.ras_top
+    new_entry.ras_idx       := io.predecode_enq.bits.ghist.ras_idx
+    new_entry.br_mask       := io.predecode_enq.bits.br_mask
+    new_entry.btb_mispredicts := io.predecode_enq.bits.btb_mispredicts
+    new_entry.start_bank    := bank(io.predecode_enq.bits.pc)
 
-    val new_ghist = io.enq.bits.ghist
+    val new_ghist = io.predecode_enq.bits.ghist
 
     ghist.map( g => g.write(enq_ptr.value, new_ghist))
-    meta.write(enq_ptr.value, io.enq.bits.bpd_meta)
+    meta.write(enq_ptr.value, io.predecode_enq.bits.bpd_meta)
     ram(enq_ptr.value) := new_entry
 
-    prev_pc    := io.enq.bits.pc
+    prev_pc    := io.predecode_enq.bits.pc
     prev_entry := new_entry
     prev_ghist := new_ghist
 
@@ -323,7 +323,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // 因为 ghist 用的 sync read mem，文档里说不能在同一周期读和写相同地址
   // 因此这里就保守一些，在 ftq 满的时候就拉低 ready 信号，即使这周期的
   // do_commit_update 信号为 true
-  io.enq.ready := !full
+  io.predecode_enq.ready := !full
 
   val redirect_idx = io.redirect.bits
   val redirect_entry = ram(redirect_idx)
@@ -383,8 +383,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   for (i <- 0 until 2) {
     val idx = io.get_ftq_pc(i).ftq_idx
     val next_idx = WrapInc(idx, num_entries)
-    val next_is_enq = (next_idx === enq_ptr.value) && io.enq.fire
-    val next_pc = Mux(next_is_enq, io.enq.bits.pc, pcs(next_idx))
+    val next_is_enq = (next_idx === enq_ptr.value) && io.predecode_enq.fire
+    val next_pc = Mux(next_is_enq, io.predecode_enq.bits.pc, pcs(next_idx))
     val get_entry = ram(idx)
     val next_entry = ram(next_idx)
     io.get_ftq_pc(i).entry     := RegNext(get_entry)
@@ -410,7 +410,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // Add a free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
     val prev_update_printf = PlusArg("prev-ras-update", 0, "Print FTQ prev entry update", 1)
-    when (do_enq && prev_update_printf(0)) {
+    when (do_predecode_enq && prev_update_printf(0)) {
        val (ghist_by_prev, _) = prev_ghist.update(
         prev_entry.br_mask,
         prev_entry.cfi_taken,
@@ -421,35 +421,35 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         prev_entry.cfi_is_call,
         prev_entry.cfi_is_ret
       )
-      when (io.enq.bits.ghist.current_saw_branch_not_taken) {
-        ghist_by_prev := io.enq.bits.ghist
+      when (io.predecode_enq.bits.ghist.current_saw_branch_not_taken) {
+        ghist_by_prev := io.predecode_enq.bits.ghist
       }
       when (ghist_by_prev.ras_idx =/= prev_ghist.ras_idx || 
-            io.enq.bits.ghist.ras_idx =/= prev_ghist.ras_idx) {
+            io.predecode_enq.bits.ghist.ras_idx =/= prev_ghist.ras_idx) {
         printf(p"[${cycleCount} FTQ] prev_ras_idx=${Hexadecimal(prev_ghist.ras_idx)}, " +
           p"prev_cfi_call=${prev_entry.cfi_is_call && prev_entry.cfi_idx.valid}, " +
           p"prev_cfi_ret=${prev_entry.cfi_is_ret && prev_entry.cfi_idx.valid}, " +
           p"prev_pc=${Hexadecimal(prev_pc)}, " +
           p"now_ras_idx=${Hexadecimal(ghist_by_prev.ras_idx)}, " +
-          p"real_ras_idx=${Hexadecimal(io.enq.bits.ghist.ras_idx)}\n")
+          p"real_ras_idx=${Hexadecimal(io.predecode_enq.bits.ghist.ras_idx)}\n")
       }
     }
     val enq_ghist_printf = PlusArg("enq-ghist-update", 0, "Print FTQ enq ghist update", 1)
-    when (do_enq && enq_ghist_printf(0)) {
-      printf(p"[${cycleCount} FTQ] enq_ptr=${enq_ptr.value}, enq_pc=${Hexadecimal(io.enq.bits.pc)}, " +
-        p"enq_cfi_idx=${io.enq.bits.cfi_idx}, " +
-        p"enq_br_mask=${Binary(io.enq.bits.br_mask)}, " +
-        p"enq_ghist=${Binary(io.enq.bits.ghist.histories(0))}\n")
+    when (do_predecode_enq && enq_ghist_printf(0)) {
+      printf(p"[${cycleCount} FTQ] enq_ptr=${enq_ptr.value}, enq_pc=${Hexadecimal(io.predecode_enq.bits.pc)}, " +
+        p"enq_cfi_idx=${io.predecode_enq.bits.cfi_idx}, " +
+        p"enq_br_mask=${Binary(io.predecode_enq.bits.br_mask)}, " +
+        p"enq_ghist=${Binary(io.predecode_enq.bits.ghist.histories(0))}\n")
     }
   }
 
   // Assertion
-  when (do_enq) {
+  when (do_predecode_enq) {
     // 前端在计算 f3_br_mask 时已经考虑了 fetch bundle 内部的 mask 了
-    assert ((io.enq.bits.br_mask & io.enq.bits.mask) === io.enq.bits.br_mask,
+    assert ((io.predecode_enq.bits.br_mask & io.predecode_enq.bits.mask) === io.predecode_enq.bits.br_mask,
       "FTQ: br_mask has bits set outside of valid fetch bundle")
     
-    when (!io.enq.bits.ghist.current_saw_branch_not_taken) {
+    when (!io.predecode_enq.bits.ghist.current_saw_branch_not_taken) {
       val (ghist_by_prev, _) = prev_ghist.update(
         prev_entry.br_mask,
         prev_entry.cfi_taken,
@@ -461,10 +461,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         prev_entry.cfi_is_ret
       )
       // 按我的理解这俩应该是相等的
-      assert (io.enq.bits.ghist === ghist_by_prev,
+      assert (io.predecode_enq.bits.ghist === ghist_by_prev,
         "FTQ: ghist mismatch on enqueue. ")
-      assert (io.enq.bits.ghist.ras_idx === ghist_by_prev.ras_idx,
-        p"FTQ: ras_idx mismatch on enqueue. enq: ${io.enq.bits.ghist.ras_idx}, prev: ${ghist_by_prev.ras_idx}")
+      assert (io.predecode_enq.bits.ghist.ras_idx === ghist_by_prev.ras_idx,
+        p"FTQ: ras_idx mismatch on enqueue. enq: ${io.predecode_enq.bits.ghist.ras_idx}, prev: ${ghist_by_prev.ras_idx}")
     }
   }
   

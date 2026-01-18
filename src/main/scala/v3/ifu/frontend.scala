@@ -920,9 +920,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f4_ready := f4.io.enq.ready
   f4.io.enq.valid := f3.io.deq.valid && !f3_clear
   f4.io.enq.bits  := f3_fetch_bundle
-  f4.io.deq.ready := fb.io.enq.ready && ftq.io.enq.ready && !f4_delay
+  f4.io.deq.ready := fb.io.enq.ready && ftq.io.predecode_enq.ready && !f4_delay
 
-  fb.io.enq.valid := f4.io.deq.valid && ftq.io.enq.ready && !f4_delay
+  fb.io.enq.valid := f4.io.deq.valid && ftq.io.predecode_enq.ready && !f4_delay
   fb.io.enq.bits  := f4.io.deq.bits
   fb.io.enq.bits.ftq_idx := ftq.io.enq_idx
   fb.io.enq.bits.sfbs    := Mux(f4_sfb_valid, UIntToOH(f4_sfb_idx), 0.U(fetchWidth.W)).asBools
@@ -932,8 +932,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ).asBools
 
 
-  ftq.io.enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay
-  ftq.io.enq.bits           := f4.io.deq.bits
+  ftq.io.predecode_enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay
+  ftq.io.predecode_enq.bits           := f4.io.deq.bits
 
   val bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 2))
   bpd_update_arbiter.io.in(0).valid := ftq.io.bpdupdate.valid
