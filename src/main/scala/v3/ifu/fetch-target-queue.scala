@@ -63,6 +63,9 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   val ras_top = UInt(vaddrBitsExtended.W)
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
 
+  // btb 将非分支指令或者非指令预测为了分支指令
+  val btb_mispredicts = UInt(fetchWidth.W)
+
   // Which bank did this start from?
   val start_bank = UInt(1.W)
 
@@ -194,6 +197,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.ras_top       := io.enq.bits.ras_top
     new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
     new_entry.br_mask       := io.enq.bits.br_mask
+    new_entry.btb_mispredicts := io.enq.bits.btb_mispredicts
     new_entry.start_bank    := bank(io.enq.bits.pc)
 
     val new_ghist = io.enq.bits.ghist
@@ -305,7 +309,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.is_mispredict_update := false.B
     io.bpdupdate.bits.is_repair_update     := false.B
     io.bpdupdate.bits.pc      := bpd_pc
-    io.bpdupdate.bits.btb_mispredicts := 0.U
+    io.bpdupdate.bits.btb_mispredicts := bpd_entry.btb_mispredicts
     io.bpdupdate.bits.br_mask :=  bpd_entry.br_mask
     io.bpdupdate.bits.cfi_idx := bpd_entry.cfi_idx
     io.bpdupdate.bits.cfi_mispredicted := bpd_entry.cfi_mispredicted

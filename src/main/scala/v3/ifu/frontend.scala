@@ -245,6 +245,9 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
 
   val bpd_meta      = Vec(nBanks, UInt())
 
+  // btb 将非分支指令或者非指令预测为了分支指令
+  val btb_mispredicts = UInt(fetchWidth.W)
+
   // Source of the prediction from this bundle
   val fsrc    = UInt(BSRC_SZ.W)
   // Source of the prediction to this bundle
@@ -537,7 +540,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_ret_mask     = Wire(Vec(fetchWidth, Bool()))
   val f3_npc_plus4_mask = Wire(Vec(fetchWidth, Bool()))
   val f3_btb_mispredicts = Wire(Vec(fetchWidth, Bool()))
-  f3_btb_mispredicts := DontCare
   f3_fetch_bundle.mask := f3_mask.asUInt
   f3_fetch_bundle.br_mask := f3_br_mask.asUInt
   f3_fetch_bundle.pc := f3_imemresp.pc
@@ -721,11 +723,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         f3_bpd_resp.io.deq.bits.preds.jal_target,
         predecode_targets(i))
 
-      // Flush BTB entries for JALs if we mispredict the target
-      // f3_btb_mispredicts(i) := (predecode_cfi_type(i) === CFI_JAL && predecode_valid(i) &&
-      //   f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.valid &&
-      //   (f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits =/= predecode_targets(i))
-      // )
+      // 如果从 fetch pc 开始的非指令或者非分支指令被预测为分支指令，清空该 btb 表项
+      f3_btb_mispredicts(i) := (predecode_cfi_type(i) === CFI_X || !predecode_valid(i)) &&
+                                f3_bpd_resp.io.deq.bits.preds.btb_hits(i) && f3_imemresp.mask(i)
 
       f3_br_mask(i)   := f3_mask(i) && predecode_cfi_type(i) === CFI_BR
       f3_cfi_types(i) := predecode_cfi_type(i)
@@ -746,6 +746,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.ghist.ras_idx := f3_bpd_resp.io.deq.bits.preds.ras_idx
   f3_fetch_bundle.lhist    := DontCare
   f3_fetch_bundle.bpd_meta := f3_bpd_resp.io.deq.bits.meta
+  f3_fetch_bundle.btb_mispredicts := f3_btb_mispredicts.asUInt
 
   f3_fetch_bundle.end_half.valid := bank_prev_is_half
   f3_fetch_bundle.end_half.bits  := bank_prev_half
@@ -942,7 +943,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd_update_arbiter.io.in(0).bits  := ftq.io.bpdupdate.bits
   assert(bpd_update_arbiter.io.in(0).ready)
   bpd_update_arbiter.io.in(1) <> f4_btb_corrections.io.deq
-  bpd.io.update := bpd_update_arbiter.io.out
+  bpd.io.update := ftq.io.bpdupdate
   bpd_update_arbiter.io.out.ready := true.B
 
   // 从 FTQ 来的 RAS 更新具有更高优先级 

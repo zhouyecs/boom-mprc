@@ -51,6 +51,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   class BTBPredictMeta extends Bundle {
     val write_way = UInt(log2Ceil(nWays).W)
+    // 用于 btb fix
+    val hit_ways = Vec(bankWidth, UInt(log2Ceil(nWays).W))
   }
 
   val s1_meta = Wire(new BTBPredictMeta)
@@ -147,6 +149,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   s1_meta.write_way := Mux(s1_hits.reduce(_||_),
     PriorityEncoder(s1_hit_ohs.map(_.asUInt).reduce(_|_)),
     alloc_way)
+  s1_meta.hit_ways := s1_hit_ways
 
   val s1_update_cfi_idx = s1_update.bits.cfi_idx.bits
   val s1_update_meta    = s1_update.bits.meta.asTypeOf(new BTBPredictMeta)
@@ -165,18 +168,32 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val s1_update_wbtb_mask = (UIntToOH(s1_update_cfi_idx) &
     Fill(bankWidth, s1_update.bits.cfi_idx.valid && s1_update.valid && s1_update.bits.cfi_taken && s1_update.bits.is_commit_update))
 
-  val s1_update_wmeta_mask = ((s1_update_wbtb_mask | s1_update.bits.br_mask) &
-    (Fill(bankWidth, s1_update.valid && s1_update.bits.is_commit_update) |
-     (Fill(bankWidth, s1_update.valid) & s1_update.bits.btb_mispredicts)
-    )
-  )
-  val s1_update_wmeta_data = Wire(Vec(bankWidth, new BTBMeta))
+  val commit_update_mask = (s1_update_wbtb_mask | s1_update.bits.br_mask) &
+                            Fill(bankWidth, s1_update.valid && s1_update.bits.is_commit_update)
+  val mispredict_update_mask = Wire(Vec(nWays, UInt(bankWidth.W)))
+  for (w <- 0 until nWays) {
+    mispredict_update_mask(w) := Cat((0 until bankWidth).reverse.map { b =>
+      s1_meta.hit_ways(b) === w.U &&
+      s1_update.bits.btb_mispredicts(b) && enableBTBFastRepair.B &&
+      s1_update.valid && s1_update.bits.is_commit_update
+    })
+  }
+  val s1_update_wmeta_mask = Wire(Vec(nWays, UInt(bankWidth.W)))
+  for (w <- 0 until nWays) {
+    when (s1_update_meta.write_way === w.U) {
+      s1_update_wmeta_mask(w) := commit_update_mask | mispredict_update_mask(w)
+    } .otherwise {
+      s1_update_wmeta_mask(w) := mispredict_update_mask(w)
+    }
+  }
+
+  val s1_update_wmeta_data = WireDefault(VecInit.fill(nWays)(VecInit.fill(bankWidth)(0.U.asTypeOf(new BTBMeta))))
 
   for (w <- 0 until bankWidth) {
-    s1_update_wmeta_data(w).tag     := Mux(s1_update.bits.btb_mispredicts(w), 0.U, s1_update_idx >> log2Ceil(nSets))
-    s1_update_wmeta_data(w).is_br   := s1_update.bits.br_mask(w)
-    s1_update_wmeta_data(w).is_call := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_call
-    s1_update_wmeta_data(w).is_ret  := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_ret
+    s1_update_wmeta_data(s1_update_meta.write_way)(w).tag     := Mux(commit_update_mask(w), s1_update_idx >> log2Ceil(nSets), 0.U)
+    s1_update_wmeta_data(s1_update_meta.write_way)(w).is_br   := s1_update.bits.br_mask(w)
+    s1_update_wmeta_data(s1_update_meta.write_way)(w).is_call := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_call
+    s1_update_wmeta_data(s1_update_meta.write_way)(w).is_ret  := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_ret
   }
 
   val btb_reset_value = WireDefault(0.U(btbEntrySz.W))
@@ -244,10 +261,23 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
         offset_is_extended
       )
     }
+    val btb_mis_update_printf = PlusArg("f2btb-mis-update-printf", 0, "Enable F2 BTB mispredict update printf debugging", 1)
+    when (s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.btb_mispredicts.asUInt =/= 0.U &&
+          !doing_reset && btb_mis_update_printf(0)) {
+      printf("[%d F2 BTB Mispredict Update] PC: 0x%x, idx: 0x%x, tag: 0x%x, btb_mispredicts: %b, hit_ways: %b, write_way: %d\n",
+        cycleCount,
+        s1_update.bits.pc,
+        s1_update_idx(log2Ceil(nSets)-1,0),
+        s1_update_idx >> log2Ceil(nSets),
+        s1_update.bits.btb_mispredicts.asUInt,
+        s1_update_meta.hit_ways.asUInt,
+        s1_update_meta.write_way
+      )
+    }
   }
 
   for (w <- 0 until nWays) {
-    when (doing_reset || s1_update_meta.write_way === w.U || (w == 0 && nWays == 1).B) {
+    when (doing_reset || s1_update_meta.write_way === w.U) {
       btb(w).write(
         Mux(doing_reset,
           reset_idx,
@@ -259,20 +289,20 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
           (~(0.U(bankWidth.W))),
           s1_update_wbtb_mask).asBools
       )
+    }
+  }
+  for (w <- 0 until nWays) {
       meta(w).write(
         Mux(doing_reset,
           reset_idx,
           s1_update_idx),
         Mux(doing_reset,
           VecInit(Seq.fill(bankWidth) { meta_reset_value }),
-          VecInit(s1_update_wmeta_data.map(_.asUInt))),
+          VecInit(s1_update_wmeta_data(w).map(_.asUInt))),
         Mux(doing_reset,
           (~(0.U(bankWidth.W))),
-          s1_update_wmeta_mask).asBools
+          s1_update_wmeta_mask(w)).asBools
       )
-
-
-    }
   }
   when (s1_update_wbtb_mask =/= 0.U && offset_is_extended) {
     ebtb.write(s1_update_idx, s1_update.bits.target)
@@ -313,5 +343,8 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
         p"cfi cannot be both CALL and RET\n")
     }
   }
+  when (s1_update.valid) {
+    assert ((commit_update_mask & s1_update.bits.btb_mispredicts) === 0.U,
+      p"BTB update can't commit update and mispredict update the same bank\n")
+  }
 }
-

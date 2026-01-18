@@ -56,6 +56,8 @@ class FetchPacketPredsInfo(implicit p: Parameters) extends BoomBundle()(p)
   val ras_top = UInt(vaddrBitsExtended.W)
   // ras top 的 idx，用于修正 ras
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
+  // btb 是否命中
+  val btb_hits = UInt(fetchWidth.W)
 }
 
 class FetchPacketMetaInfo(implicit p: Parameters) extends BoomBundle()(p)
@@ -93,7 +95,7 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val is_repair_update = Bool()
   val btb_mispredicts = UInt(fetchWidth.W)
   def is_btb_mispredict_update = btb_mispredicts =/= 0.U
-  def is_commit_update = !(is_mispredict_update || is_repair_update || is_btb_mispredict_update)
+  def is_commit_update = !(is_mispredict_update || is_repair_update)
 
   val pc            = UInt(vaddrBitsExtended.W)
   // Mask of instructions which are branches.
@@ -135,7 +137,7 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val btb_mispredicts  = UInt(bankWidth.W)
   def is_btb_mispredict_update = btb_mispredicts =/= 0.U
 
-  def is_commit_update = !(is_mispredict_update || is_repair_update || is_btb_mispredict_update)
+  def is_commit_update = !(is_mispredict_update || is_repair_update)
 
   val pc               = UInt(vaddrBitsExtended.W)
 
@@ -566,8 +568,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f3_preds_info.jal_target := f3_jal_target
     io.resp.f3_preds_info.jal_targets_debug := f3_preds.map(p => p.predicted_pc.bits)
     io.resp.f3_preds_info.ras_top := f3_preds(0).ras_top
-    // TODO
     io.resp.f3_preds_info.ras_idx := f2_ras_top_idx
+    io.resp.f3_preds_info.btb_hits := f3_preds.map(p => p.predicted_pc.valid).asUInt
 
     // 输出 f3 的预测结果
     io.resp.f3_pred_valid := s3_valid
