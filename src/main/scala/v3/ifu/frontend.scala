@@ -1026,6 +1026,25 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // Add a free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
 
+    val predecode_targte_printf = PlusArg("predecode-target-printf", 0, "print predecode targets", 1)
+    when (predecode_targte_printf(0)) {
+      when (f3.io.deq.fire) {
+        val f3_fetch_pc = f3_aligned_pc + (PriorityEncoder(f3_imemresp.mask.asUInt) << 1)
+        printf(p"[${cycleCount} F3] pc=${Hexadecimal(f3_fetch_pc)} " +
+          p"mask=${Binary(f3_fetch_bundle.mask)} " +
+          p"target=${Hexadecimal(f3_fetch_bundle.next_pc)} " +
+          p"pred source=${f3_fetch_bundle.fsrc} " +
+          p"taken=${Binary(f3_fetch_bundle.cfi_idx.valid)} " +
+          p"cfi_idx=${f3_fetch_bundle.cfi_idx} " +
+          p"cfi_is_call=${f3_fetch_bundle.cfi_is_call} " +
+          p"cfi_is_ret=${f3_fetch_bundle.cfi_is_ret}\n")
+        printf(p"f3 target0=${Hexadecimal(f3_bpd_resp.io.deq.bits.preds.jal_targets_debug(0))} " +
+          p"target1=${Hexadecimal(f3_bpd_resp.io.deq.bits.preds.jal_targets_debug(1))} " +
+          p"target2=${Hexadecimal(f3_bpd_resp.io.deq.bits.preds.jal_targets_debug(2))} " +
+          p"target3=${Hexadecimal(f3_bpd_resp.io.deq.bits.preds.jal_targets_debug(3))}\n")
+      }
+    }
+
     // val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
     // when (cmd_ras_printf(0)) {
     //   when (ftq.io.ras_update) {
