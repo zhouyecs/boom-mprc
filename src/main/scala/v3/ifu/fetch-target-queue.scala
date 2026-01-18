@@ -155,11 +155,11 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val ras_update_pc  = Output(UInt(vaddrBitsExtended.W))
 
   })
-  val bpd_ptr    = RegInit(FTQPtr(false.B, 0.U))
+  val bpd_commit_ptr    = RegInit(FTQPtr(false.B, 0.U))
   val deq_ptr    = RegInit(FTQPtr(false.B, 0.U))
   val enq_ptr    = RegInit(FTQPtr(false.B, 0.U))
 
-  val full = isFull(enq_ptr, bpd_ptr)
+  val full = isFull(enq_ptr, bpd_commit_ptr)
 
 
   val pcs      = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
@@ -240,7 +240,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_end_idx = Reg(UInt(log2Ceil(ftqSz).W))
   val bpd_repair_pc = Reg(UInt(vaddrBitsExtended.W))
 
-  val bpd_idx = bpd_ptr.value
+  val bpd_idx = bpd_commit_ptr.value
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
 
@@ -286,7 +286,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // bpd_ptr =/= deq_ptr && enq_ptr =/= WrapInc(bpd_ptr, num_entries)
   // 简化为了 bpd_ptr =/= deq_ptr，因为 deq_ptr < enq_ptr 在第一次 commit
   // update 后总是成立，而 bpd_ptr <= deq_ptr
-  val do_commit_update     = (bpd_ptr =/= deq_ptr &&
+  val do_commit_update     = (bpd_commit_ptr =/= deq_ptr &&
                               !io.brupdate.b2.mispredict &&
                               !io.redirect.valid && !RegNext(io.redirect.valid))
 
@@ -317,7 +317,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
 
   when (do_commit_update) {
-    bpd_ptr := bpd_ptr + 1.U
+    bpd_commit_ptr := bpd_commit_ptr + 1.U
   }
 
   // 因为 ghist 用的 sync read mem，文档里说不能在同一周期读和写相同地址
@@ -473,7 +473,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
           |a valid fetch packet, and deq_ptr points to next enqueue position"""
   )
 
-  assert (bpd_ptr <= deq_ptr, "bpd_ptr should always behind deq_ptr")
+  assert (bpd_commit_ptr <= deq_ptr, "bpd_ptr should always behind deq_ptr")
   when (io.deq.valid) {
     // 因为 rob 每周期至多提交 coreWidth 条指令，而一条指令最多占据两
     // 个 fetch packet。因此每次 commit, deq_ptr 至多前进 2 * coreWidth
@@ -488,7 +488,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // 没有检测 mispredict 和 repair update，因为我们暂时不用 loop predictor
     // 没有检测 redirect ghist read，因为 BOOM 里没有一个 valid 信号
     // 来指示 io.get_ftq_pc(i).ftq_idx 是否有效
-    assert (bpd_ptr < enq_ptr, "bpd_ptr should never commit a invalid ftq entry")
+    assert (bpd_commit_ptr < enq_ptr, "bpd_ptr should never commit a invalid ftq entry")
   }
   when (io.bpdupdate.valid) {
     assert (io.bpdupdate.bits.target =/= 0.U,
