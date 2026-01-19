@@ -362,14 +362,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // --------------------------------------------------------
 
   // bpd s0 信号声明
-  val s0_bpd_valid = WireInit(false.B)
-  val s0_bpd_vpc = WireInit(0.U(vaddrBitsExtended.W))
+  val s0_bpd_valid   = WireInit(false.B)
+  val s0_bpd_vpc     = WireInit(0.U(vaddrBitsExtended.W))
   val s0_bpd_ftq_idx = WireInit(FTQPtr(false.B, 0.U))
+  val s0_bpd_ghist   = WireInit((0.U).asTypeOf(new GlobalHistory))
 
 
   val s0_ifu_vpc   = WireInit(0.U(vaddrBitsExtended.W))
   val s0_ftq_idx   = WireInit(FTQPtr(false.B, 0.U))
-  val s0_ghist     = WireInit((0.U).asTypeOf(new GlobalHistory))
   val s0_tsrc      = WireInit(0.U(BSRC_SZ.W))
   val s0_valid     = WireInit(false.B)
   val s0_is_replay = WireInit(false.B)
@@ -387,7 +387,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   when (RegNext(reset.asBool) && !reset.asBool) {
     s0_valid   := true.B
     s0_ifu_vpc := io_reset_vector
-    s0_ghist   := (0.U).asTypeOf(new GlobalHistory)
+    s0_bpd_ghist := (0.U).asTypeOf(new GlobalHistory)
     s0_tsrc    := BSRC_C
   }
 
@@ -397,7 +397,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   bpd.io.f0_req.valid      := s0_bpd_valid
   bpd.io.f0_req.bits.pc    := s0_bpd_vpc
-  bpd.io.f0_req.bits.ghist := s0_ghist
+  bpd.io.f0_req.bits.ghist := s0_bpd_ghist
   bpd.io.f0_req.bits.ftq_idx := s0_bpd_ftq_idx
 
   // --------------------------------------------------------
@@ -407,7 +407,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_vpc       = RegNext(s0_ifu_vpc)
   val s1_ftq_idx   = RegNext(s0_ftq_idx)
   val s1_valid     = RegNext(s0_valid, false.B)
-  val s1_ghist     = RegNext(s0_ghist)
+  val s1_ghist     = RegNext(s0_bpd_ghist)
   val s1_is_replay = RegNext(s0_is_replay)
   val s1_is_sfence = RegNext(s0_is_sfence)
   val f1_clear     = WireInit(false.B)
@@ -436,7 +436,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := !(s1_tlb_resp.ae.inst || s1_tlb_resp.pf.inst)
     s0_tsrc      := BSRC_1
     s0_ifu_vpc   := bpd.io.resp.f1_next_pc
-    s0_ghist     := bpd.io.resp.f1_next_ghist
+    s0_bpd_ghist := bpd.io.resp.f1_next_ghist
     s0_is_replay := false.B
 
     s0_ftq_idx     := bpd.io.resp.f1_ftq_idx + 1.U
@@ -472,7 +472,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
     s0_ifu_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
-    s0_ghist := bpd.io.resp.f2_ghist
+    s0_bpd_ghist := bpd.io.resp.f2_ghist
     // replay 就不需要设置 s2_fsrc
     s0_tsrc  := s2_tsrc
     f1_clear := true.B
@@ -487,7 +487,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
     s0_ifu_vpc   := bpd.io.resp.f2_next_pc
     s0_is_replay := false.B
-    s0_ghist     := bpd.io.resp.f2_next_ghist
+    s0_bpd_ghist := bpd.io.resp.f2_next_ghist
     s2_fsrc      := BSRC_2
     s0_tsrc      := BSRC_2
     f1_clear := true.B
@@ -871,7 +871,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
       s0_ifu_vpc   := f3_predicted_target
       s0_is_replay := false.B
-      s0_ghist     := f3_predicted_ghist
+      s0_bpd_ghist := f3_predicted_ghist
       s0_tsrc      := BSRC_3
 
       f3_fetch_bundle.fsrc := BSRC_3
@@ -1024,7 +1024,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
     s0_valid     := io.cpu.redirect_val
     s0_ifu_vpc   := io.cpu.redirect_pc
-    s0_ghist     := io.cpu.redirect_ghist
+    s0_bpd_ghist := io.cpu.redirect_ghist
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B
 
