@@ -361,7 +361,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   //      Send request to ICache
   // --------------------------------------------------------
 
-  val s0_vpc       = WireInit(0.U(vaddrBitsExtended.W))
+  // bpd s0 信号声明
+  val s0_bpd_valid = WireInit(false.B)
+  val s0_bpd_vpc = WireInit(0.U(vaddrBitsExtended.W))
+  val s0_bpd_ftq_idx = WireInit(FTQPtr(false.B, 0.U))
+
+
+  val s0_ifu_vpc   = WireInit(0.U(vaddrBitsExtended.W))
   val s0_ftq_idx   = WireInit(FTQPtr(false.B, 0.U))
   val s0_ghist     = WireInit((0.U).asTypeOf(new GlobalHistory))
   val s0_tsrc      = WireInit(0.U(BSRC_SZ.W))
@@ -375,21 +381,22 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.icache_valid_access := icache.io.icache_valid_access
   io.cpu.icache_hit := icache.io.resp.valid
 
+  s0_bpd_valid := s0_valid
+  s0_bpd_vpc := s0_ifu_vpc
 
   when (RegNext(reset.asBool) && !reset.asBool) {
     s0_valid   := true.B
-    s0_vpc     := io_reset_vector
+    s0_ifu_vpc := io_reset_vector
     s0_ghist   := (0.U).asTypeOf(new GlobalHistory)
     s0_tsrc    := BSRC_C
   }
 
   icache.io.req.valid     := s0_valid
-  icache.io.req.bits.addr := s0_vpc
+  icache.io.req.bits.addr := s0_ifu_vpc
   
-  val s0_bpd_ftq_idx = WireInit(FTQPtr(false.B, 0.U))
 
-  bpd.io.f0_req.valid      := s0_valid
-  bpd.io.f0_req.bits.pc    := s0_vpc
+  bpd.io.f0_req.valid      := s0_bpd_valid
+  bpd.io.f0_req.bits.pc    := s0_bpd_vpc
   bpd.io.f0_req.bits.ghist := s0_ghist
   bpd.io.f0_req.bits.ftq_idx := s0_bpd_ftq_idx
 
@@ -397,7 +404,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // **** ICache Access (F1) ****
   //      Translate VPC
   // --------------------------------------------------------
-  val s1_vpc       = RegNext(s0_vpc)
+  val s1_vpc       = RegNext(s0_ifu_vpc)
   val s1_ftq_idx   = RegNext(s0_ftq_idx)
   val s1_valid     = RegNext(s0_valid, false.B)
   val s1_ghist     = RegNext(s0_ghist)
@@ -428,7 +435,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // Stop fetching on fault
     s0_valid     := !(s1_tlb_resp.ae.inst || s1_tlb_resp.pf.inst)
     s0_tsrc      := BSRC_1
-    s0_vpc       := bpd.io.resp.f1_next_pc
+    s0_ifu_vpc   := bpd.io.resp.f1_next_pc
     s0_ghist     := bpd.io.resp.f1_next_ghist
     s0_is_replay := false.B
 
@@ -463,7 +470,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   when ((s2_valid && !icache.io.resp.valid) ||
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
     s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
-    s0_vpc   := s2_vpc
+    s0_ifu_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
     s0_ghist := bpd.io.resp.f2_ghist
     // replay 就不需要设置 s2_fsrc
@@ -478,7 +485,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // s0_vpc 来源 2: bpd f2 预测重定向
   } .elsewhen (bpd.io.resp.f2_redirect) {
     s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
-    s0_vpc       := bpd.io.resp.f2_next_pc
+    s0_ifu_vpc   := bpd.io.resp.f2_next_pc
     s0_is_replay := false.B
     s0_ghist     := bpd.io.resp.f2_next_ghist
     s2_fsrc      := BSRC_2
@@ -862,7 +869,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       bpd_f1_clear := true.B
 
       s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
-      s0_vpc       := f3_predicted_target
+      s0_ifu_vpc   := f3_predicted_target
       s0_is_replay := false.B
       s0_ghist     := f3_predicted_ghist
       s0_tsrc      := BSRC_3
@@ -1000,7 +1007,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     bpd_f1_clear := true.B
 
     s0_valid     := false.B
-    s0_vpc       := io.cpu.sfence.bits.addr
+    s0_ifu_vpc   := io.cpu.sfence.bits.addr
     s0_is_replay := false.B
     s0_is_sfence := true.B
 
@@ -1016,7 +1023,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_prev_is_half := false.B
 
     s0_valid     := io.cpu.redirect_val
-    s0_vpc       := io.cpu.redirect_pc
+    s0_ifu_vpc   := io.cpu.redirect_pc
     s0_ghist     := io.cpu.redirect_ghist
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B
