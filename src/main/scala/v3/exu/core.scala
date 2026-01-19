@@ -37,7 +37,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.tile.{TraceBundle}
 import freechips.rocketchip.rocket.{Causes, PRV, TracedInstruction}
-import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle}
+import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle, PlusArg}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
 
 import boom.v3.common._
@@ -1608,7 +1608,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
 
 
-  if (COMMIT_LOG_PRINTF) {
+  if (IN_SIMULATION) {
+    // Add a free-running cycle counter for simulation
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+    val commit_printf = PlusArg("commit-printf", 0, "print predecode targets", 1)
+    when (commit_printf(0)) {
     var new_commit_cnt = 0.U
 
     for (w <- 0 until coreWidth) {
@@ -1624,8 +1628,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       }
 
       when (rob.io.commit.valids(w)) {
-        printf("%d 0x%x ",
-          priv,
+        printf("[%d] %d 0x%x ",
+          cycleCount, priv,
           Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen))
         printf_inst(rob.io.commit.uops(w))
         when (!rob.io.commit.arch_valids(w)) {
@@ -1645,7 +1649,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
           printf(" ftq_idx 0x%x\n", rob.io.commit.uops(w).ftq_idx)
         }
       }
-    }
+    }}
   } else if (BRANCH_PRINTF) {
     val debug_ghist = RegInit(0.U(globalHistoryLength.W))
     when (rob.io.flush.valid && FlushTypes.useCsrEvec(rob.io.flush.bits.flush_typ)) {

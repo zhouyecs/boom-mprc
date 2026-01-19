@@ -126,7 +126,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   val io = IO(new BoomBundle {
     // predeocde 信息存入 FTQ
-    val predecode_enq = Flipped(Decoupled(new FetchBundle()))
+    val predecode_enq = Flipped(Valid(new FetchBundle()))
+    // 指示当前队尾指针
+    val bpd_commit_ptr = Output(new FTQPtr())
     // TODO: remove this
     val redirect_ftq_idx = Output(new FTQPtr())
     // ROB tells us the youngest committed ftq_idx to remove from FTQ.
@@ -160,6 +162,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val predecode_enq_ptr    = io.predecode_enq.bits.ftq_idx
   val next_predecode_enq_ptr_debug = RegInit(FTQPtr(false.B, 0.U))
 
+  io.bpd_commit_ptr := bpd_commit_ptr
   val full = isFull(predecode_enq_ptr, bpd_commit_ptr)
 
 
@@ -168,7 +171,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val ram      = Reg(Vec(num_entries, new FTQBundle))
   val ghist    = Seq.fill(2) { SyncReadMem(num_entries, new GlobalHistory) }
 
-  val do_predecode_enq = io.predecode_enq.fire
+  val do_predecode_enq = io.predecode_enq.valid
 
 
   // This register lets us initialize the ghist to 0
@@ -293,7 +296,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // 因为 ghist 用的 sync read mem，文档里说不能在同一周期读和写相同地址
   // 因此这里就保守一些，在 ftq 满的时候就拉低 ready 信号，即使这周期的
   // do_commit_update 信号为 true
-  io.predecode_enq.ready := !full
 
   val redirect_idx = io.redirect.bits
   val redirect_entry = ram(redirect_idx)
@@ -418,6 +420,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   // Assertion
   when (do_predecode_enq) {
+    assert (full === false.B, "We should have allocated FTQ space in s0")
+
     // 前端在计算 f3_br_mask 时已经考虑了 fetch bundle 内部的 mask 了
     assert ((io.predecode_enq.bits.br_mask & io.predecode_enq.bits.mask) === io.predecode_enq.bits.br_mask,
       "FTQ: br_mask has bits set outside of valid fetch bundle")

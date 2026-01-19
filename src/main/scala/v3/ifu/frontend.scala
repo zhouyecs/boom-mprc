@@ -338,6 +338,7 @@ class BoomFrontendBundle(val outer: BoomFrontend) extends CoreBundle()(outer.p)
 class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   with HasBoomCoreParameters
   with HasBoomFrontendParameters
+  with HasCircularQueuePtrHelper
 {
   val io = IO(new BoomFrontendBundle(outer))
   val io_reset_vector = outer.resetVectorSinkNode.bundle
@@ -361,21 +362,48 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   //      Send request to ICache
   // --------------------------------------------------------
 
+  // 这里额外加一级 s0_reg 要解决的问题是：f3 预测尝试写入 FTQ 时
+  // FTQ 已满，应该如何处理？
+  // 策略 1: 暂停 bpd f3 流水线，逐级反压。这样做的麻烦是，原本的
+  // bpd 流水线是没有反压机制的，加 ready 信号有点麻烦，BOOM 本来的
+  // 的前端实现也是假定了 bpd 这边没有暂停机制
+  // 策略 2: bpd replay，让 f3 又回到 f1，重新预测。这样做也存在许
+  // 多 corner case。根本问题在于，如果在 F3 预测要写入时才检查 FTQ
+  // 是否满了，会导致 F1 和 F2 的 ftq idx 会可能会超 ifu 那边的 ftq
+  // idx 1 圈，在环形指针的比较上会引入一些麻烦。
+  // 目前是采取的最保守的策略，需要在发起 f1 预测或者 f1 取指时就分配
+  // 合法的 ftq idx，这样保证 f3 预测或者预译码结果是一定能够写入的，虽
+  // 然这可能带来一点性能损失
+
   // bpd s0 信号声明
-  val s0_bpd_valid   = WireInit(false.B)
-  val s0_bpd_vpc     = WireInit(0.U(vaddrBitsExtended.W))
-  val s0_bpd_ftq_idx = WireInit(FTQPtr(false.B, 0.U))
-  val s0_bpd_ghist   = WireInit((0.U).asTypeOf(new GlobalHistory))
+  val s0_bpd_valid_reg   = RegInit(false.B)
+  val s0_bpd_vpc_reg     = RegInit(0.U(vaddrBitsExtended.W))
+  val s0_bpd_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
+  val s0_bpd_ghist_reg   = RegInit((0.U).asTypeOf(new GlobalHistory))
 
+  val s0_bpd_valid   = WireInit(s0_bpd_valid_reg)
+  val s0_bpd_vpc     = WireInit(s0_bpd_vpc_reg)
+  val s0_bpd_ftq_idx = WireInit(s0_bpd_ftq_idx_reg)
+  val s0_bpd_ghist   = WireInit(s0_bpd_ghist_reg)
 
-  val s0_ifu_vpc   = WireInit(0.U(vaddrBitsExtended.W))
-  val s0_ftq_idx   = WireInit(FTQPtr(false.B, 0.U))
-  val s0_tsrc      = WireInit(0.U(BSRC_SZ.W))
-  val s0_valid     = WireInit(false.B)
+  // ifu s0 信号声明
+  val s0_ifu_valid_reg   = RegInit(false.B)
+  val s0_ifu_vpc_reg     = RegInit(0.U(vaddrBitsExtended.W))
+  val s0_ifu_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
+  val s0_tsrc_reg        = RegInit(0.U(BSRC_SZ.W))
+
+  val s0_ifu_vpc   = WireInit(s0_ifu_vpc_reg)
+  val s0_ftq_idx   = WireInit(s0_ifu_ftq_idx_reg)
+  val s0_tsrc      = WireInit(s0_tsrc_reg)
+  val s0_valid     = WireInit(s0_ifu_valid_reg)
   val s0_is_replay = WireInit(false.B)
   val s0_is_sfence = WireInit(false.B)
   val s0_replay_resp = Wire(new TLBResp(log2Ceil(fetchBytes)))
   val s0_replay_ppc  = Wire(UInt())
+
+  // 考虑了 ftq full 后的 s0 valid 信号
+  val s0_bpd_real_valid = Wire(Bool())
+  val s0_ifu_real_valid = Wire(Bool())
 
   //Enable_PerfCounter_Support
   io.cpu.icache_valid_access := icache.io.icache_valid_access
@@ -391,11 +419,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_tsrc    := BSRC_C
   }
 
-  icache.io.req.valid     := s0_valid
+  icache.io.req.valid     := s0_ifu_real_valid
   icache.io.req.bits.addr := s0_ifu_vpc
   
 
-  bpd.io.f0_req.valid      := s0_bpd_valid
+  bpd.io.f0_req.valid      := s0_bpd_real_valid
   bpd.io.f0_req.bits.pc    := s0_bpd_vpc
   bpd.io.f0_req.bits.ghist := s0_bpd_ghist
   bpd.io.f0_req.bits.ftq_idx := s0_bpd_ftq_idx
@@ -406,7 +434,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // --------------------------------------------------------
   val s1_vpc       = RegNext(s0_ifu_vpc)
   val s1_ftq_idx   = RegNext(s0_ftq_idx)
-  val s1_valid     = RegNext(s0_valid, false.B)
+  val s1_valid     = RegNext(s0_ifu_real_valid, false.B)
   val s1_ghist     = RegNext(s0_bpd_ghist)
   val s1_is_replay = RegNext(s0_is_replay)
   val s1_is_sfence = RegNext(s0_is_sfence)
@@ -951,9 +979,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f4_ready := f4.io.enq.ready
   f4.io.enq.valid := f3.io.deq.valid && !f3_clear
   f4.io.enq.bits  := f3_fetch_bundle
-  f4.io.deq.ready := fb.io.enq.ready && ftq.io.predecode_enq.ready && !f4_delay
+  f4.io.deq.ready := fb.io.enq.ready && !f4_delay
 
-  fb.io.enq.valid := f4.io.deq.valid && ftq.io.predecode_enq.ready && !f4_delay
+  fb.io.enq.valid := f4.io.deq.valid && !f4_delay
   fb.io.enq.bits  := f4.io.deq.bits
   fb.io.enq.bits.sfbs    := Mux(f4_sfb_valid, UIntToOH(f4_sfb_idx), 0.U(fetchWidth.W)).asBools
   fb.io.enq.bits.shadowed_mask := (
@@ -1043,6 +1071,27 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ftq_idx     := ftq.io.redirect_ftq_idx + 1.U
     s0_bpd_ftq_idx := ftq.io.redirect_ftq_idx + 1.U
   }
+  // 当 ifu s0 希望写入的 ftq full 时，暂停前端流水线，使用
+  // s0 寄存器暂存 fetch 请求
+  val ifu_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_ftq_idx)
+  s0_ifu_real_valid := s0_valid && !ifu_to_ftq_not_ready
+  when (!s0_ifu_real_valid) {
+    s0_ifu_valid_reg   := s0_valid
+    s0_ifu_vpc_reg     := s0_ifu_vpc
+    s0_ifu_ftq_idx_reg := s0_ftq_idx
+    s0_tsrc_reg        := s0_tsrc
+  }
+
+  // 当 bpd s0 希望写入的 ftq full 时，暂停 bpd 流水线，使用
+  // s0 寄存器暂存 bpd 预测请求
+  val bpd_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_bpd_ftq_idx)
+  s0_bpd_real_valid := s0_bpd_valid && !bpd_to_ftq_not_ready
+  when (!s0_bpd_real_valid) {
+    s0_bpd_valid_reg     := s0_bpd_valid
+    s0_bpd_vpc_reg       := s0_bpd_vpc
+    s0_bpd_ghist_reg     := s0_bpd_ghist
+    s0_bpd_ftq_idx_reg   := s0_bpd_ftq_idx
+  }
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
   io.cpu.debug_fetch_pc := ftq.io.debug_fetch_pc
@@ -1075,6 +1124,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           p"target3=${Hexadecimal(f3_bpd_resp.io.deq.bits.preds.jal_targets_debug(3))}\n")
       }
     }
+    val ftq_full_stall = PlusArg("ftq-full-stall-printf", 0, "print ftq full stalls", 1)
+    when (ftq_full_stall(0)) {
+      when (!s0_ifu_real_valid && s0_valid) {
+        printf(p"[${cycleCount} FTQ Full Stall] IFU s0 valid pc=${Hexadecimal(s0_ifu_vpc)}\n")
+      }
+      when (!s0_bpd_real_valid && s0_bpd_valid) {
+        printf(p"[${cycleCount} FTQ Full Stall] BPD s0 valid pc=${Hexadecimal(s0_bpd_vpc)}\n")
+      }
+    }
 
     // val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
     // when (cmd_ras_printf(0)) {
@@ -1104,5 +1162,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   assert (s2_valid === bpd.io.resp.f2_pred_valid, "S2 valid should match BPD F2 prediction valid" )
   when (bpd.io.resp.f3_pred_valid) {
     assert (f3.io.deq.valid, "F3 valid should be high when BPD F3 prediction valid is high" )
+  }
+  when (!s0_ifu_real_valid) {
+    assert(!s0_is_replay, "ifu should not stall replay")
   }
 }
