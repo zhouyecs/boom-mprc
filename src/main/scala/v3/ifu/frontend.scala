@@ -428,7 +428,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_ppc  = Mux(s1_is_replay, RegNext(s0_replay_ppc), tlb.io.resp.paddr)
 
   icache.io.s1_paddr := s1_ppc
-  icache.io.s1_kill  := tlb.io.resp.miss || f1_clear
+  icache.io.s1_kill  := s1_tlb_miss || f1_clear
 
   // s0_vpc 来源 1: f1 预测
   when (s1_valid && !s1_tlb_miss) {
@@ -466,10 +466,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   icache.io.s2_kill := s2_xcpt
 
+  val f3_enq_fire = Wire(Bool())
   // s0_vpc 来源 3: icache/tlb miss 或者 f3 没有 ready 发生 replay
   when ((s2_valid && !icache.io.resp.valid) ||
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
-    s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
+    s0_valid     := !f3_enq_fire
     s0_ifu_vpc   := s2_vpc
     s0_is_replay := s2_valid && icache.io.resp.valid
     s0_bpd_ghist := bpd.io.resp.f2_ghist
@@ -529,6 +530,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
+
+  f3_enq_fire := f3.io.enq.fire
 
   // The BPD resp comes in f3
   f3_bpd_resp.io.enq.valid := f3.io.deq.valid && RegNext(f3.io.enq.ready)
