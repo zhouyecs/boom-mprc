@@ -263,6 +263,7 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
 {
   // Give the backend a packet of instructions.
   val fetchpacket       = Flipped(new DecoupledIO(new FetchBufferResp))
+  val dec_fire          = Output(Vec(coreWidth, Bool()))
 
   // 1 for xcpt/jalr/auipc/flush
   val get_pc            = Flipped(Vec(2, new GetPCFromFtqIO()))
@@ -1125,14 +1126,28 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       }
     }
     val ftq_full_stall = PlusArg("ftq-full-stall-printf", 0, "print ftq full stalls", 1)
+    val fb_insts_num = RegInit(0.U(32.W))
+    val fb_enq_number = PopCount(fb.io.enq.bits.mask).asUInt
+    val fb_deq_number = PopCount(io.cpu.dec_fire).asUInt
+    // val fb_deq_number = Mux(fb.io.deq.fire, coreWidth.U, 0.U).asSInt
+    when (fb.io.clear) {
+      fb_insts_num := 0.U
+    } .elsewhen (fb.io.enq.fire) {
+      fb_insts_num := (fb_insts_num + fb_enq_number) - fb_deq_number
+    } .otherwise {
+      fb_insts_num := fb_insts_num - fb_deq_number
+    }
     when (ftq_full_stall(0)) {
       when (!s0_ifu_real_valid && s0_valid) {
-        printf(p"[${cycleCount} FTQ Full Stall] IFU s0 valid pc=${Hexadecimal(s0_ifu_vpc)}\n")
+        printf(p"[${cycleCount} FTQ Full Stall] IFU pc=${Hexadecimal(s0_ifu_vpc)}, fb number=${fb_insts_num}\n")
       }
       when (!s0_bpd_real_valid && s0_bpd_valid) {
-        printf(p"[${cycleCount} FTQ Full Stall] BPD s0 valid pc=${Hexadecimal(s0_bpd_vpc)}\n")
+        printf(p"[${cycleCount} FTQ Full Stall] BPD pc=${Hexadecimal(s0_bpd_vpc)}, fb number=${fb_insts_num}\n")
       }
     }
+    // assert (fb_insts_num >= 0.U, "FetchBuffer instruction count should never be negative")
+    assert (fb_insts_num <= numFetchBufferEntries.U,
+            "FetchBuffer instruction count should never exceed fetch buffer size")
 
     // val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
     // when (cmd_ras_printf(0)) {

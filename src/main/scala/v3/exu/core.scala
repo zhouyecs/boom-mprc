@@ -159,6 +159,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val dec_uops   = Wire(Vec(coreWidth, new MicroOp()))
   val dec_fire   = Wire(Vec(coreWidth, Bool()))  // can the instruction fire beyond decode?
                                                     // (can still be stopped in ren or dis)
+  io.ifu.dec_fire := dec_fire
+
   val dec_ready  = Wire(Bool())
   val dec_xcpts  = Wire(Vec(coreWidth, Bool()))
   val ren_stalls = Wire(Vec(coreWidth, Bool()))
