@@ -457,9 +457,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   icache.io.s1_kill  := s1_tlb_miss || f1_clear
 
   // s0_vpc 来源 1: f1 预测
-  when (s1_valid && !s1_tlb_miss) {
-    // Stop fetching on fault
-    s0_valid     := !(s1_tlb_resp.ae.inst || s1_tlb_resp.pf.inst)
+  when (s1_valid) {
+    s0_valid     := true.B
     s0_bpd_tsrc  := BSRC_1
     s0_ifu_vpc   := bpd.io.resp.f1_next_pc
     s0_bpd_ghist := bpd.io.resp.f1_next_ghist
@@ -860,6 +859,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_correct_ghist = !(f3_ghist_all_zero && shift_zero_or_no_shift_f3) &&
                           f3_pred_ghist_update_type =/= f3_bpd_resp.io.deq.bits.ghist_update_type &&
                           enableGHistStallRepair.B
+  val itlb_exception = f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if
 
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
@@ -875,26 +875,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     when (f3_redirects.reduce(_||_)) {
       f3_prev_is_half := false.B
     }
-    when (s2_valid && s2_vpc === f3_predicted_target && !f3_correct_ghist) {
-      // f3.io.enq.bits.ghist.ras_idx := f3_predicted_ghist.ras_idx
-      // 说明发生了 f2 replay, 我们需要把预测的 ghist 更新回去
-      // replay 的原因有 f2_clear 为 true 或 icache resp valid
-      // 为 false，这里如果发生了 f2_clear，仅可能是来自后端的重定向, 
-      // 它设置 s0_ghist 的优先级会更高
-      // when (!f3.io.enq.fire) {
-      //   s0_ghist.ras_idx := f3_predicted_ghist.ras_idx
-      // }
-    } .elsewhen (!s2_valid && s1_valid && s1_vpc === f3_predicted_target && !f3_correct_ghist) {
-      // s2_ghist.ras_idx := f3_predicted_ghist.ras_idx
-    } .elsewhen (( s2_valid &&  (s2_vpc =/= f3_predicted_target || f3_correct_ghist)) ||
-          (!s2_valid &&  s1_valid && (s1_vpc =/= f3_predicted_target || f3_correct_ghist)) ||
-          (!s2_valid && !s1_valid)) {
+    when (( s2_valid &&  s2_vpc =/= f3_predicted_target) ||
+          (!s2_valid &&  s1_valid && s1_vpc =/= f3_predicted_target) ||
+          (!s2_valid && !s1_valid) || f3_correct_ghist || itlb_exception) {
       f2_clear := true.B
       bpd_f2_clear := true.B
       f1_clear := true.B
       bpd_f1_clear := true.B
 
-      s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
+      s0_valid     := !itlb_exception
       s0_ifu_vpc   := f3_predicted_target
       s0_is_replay := false.B
       s0_bpd_ghist := f3_predicted_ghist
