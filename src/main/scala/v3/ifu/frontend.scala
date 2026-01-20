@@ -379,11 +379,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // bpd s0 信号声明
   val s0_bpd_valid_reg   = RegInit(false.B)
   val s0_bpd_vpc_reg     = RegInit(0.U(vaddrBitsExtended.W))
+  // 表示 s0 周期 ifu 要使用的 ftq idx，始终有效
   val s0_bpd_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
   val s0_bpd_ghist_reg   = RegInit((0.U).asTypeOf(new GlobalHistory))
 
   val s0_bpd_valid   = WireInit(s0_bpd_valid_reg)
   val s0_bpd_vpc     = WireInit(s0_bpd_vpc_reg)
+  // 表示 s0 周期 bpd 要使用的 ftq idx，始终有效
   val s0_bpd_ftq_idx = WireInit(s0_bpd_ftq_idx_reg)
   val s0_bpd_ghist   = WireInit(s0_bpd_ghist_reg)
 
@@ -1043,6 +1045,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_is_replay := false.B
     s0_is_sfence := true.B
 
+    s0_ftq_idx   := s0_ifu_ftq_idx_reg
+    s0_bpd_ftq_idx := s0_bpd_ftq_idx_reg
+
   }.elsewhen (io.cpu.redirect_flush) {
     fb.io.clear := true.B
     f4_clear    := true.B
@@ -1069,8 +1074,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     bpd.io.backend_ras_top_update_valid := true.B
     bpd.io.backend_ras_top_update_idx  := io.cpu.redirect_ghist.ras_idx
 
-    s0_ftq_idx     := ftq.io.redirect_ftq_idx + 1.U
-    s0_bpd_ftq_idx := ftq.io.redirect_ftq_idx + 1.U
+    s0_ftq_idx     := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_ifu_ftq_idx_reg)
+    s0_bpd_ftq_idx := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_bpd_ftq_idx_reg)
   }
   // 当 ifu s0 希望写入的 ftq full 时，暂停前端流水线，使用
   // s0 寄存器暂存 fetch 请求
@@ -1081,6 +1086,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ifu_vpc_reg     := s0_ifu_vpc
     s0_ifu_ftq_idx_reg := s0_ftq_idx
     s0_tsrc_reg        := s0_tsrc
+  } .otherwise {
+    // 如果成功发射到 s1，则清空 valid 寄存器
+    s0_ifu_valid_reg   := false.B
+    s0_ifu_ftq_idx_reg := s0_ftq_idx + 1.U
   }
 
   // 当 bpd s0 希望写入的 ftq full 时，暂停 bpd 流水线，使用
@@ -1092,6 +1101,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_bpd_vpc_reg       := s0_bpd_vpc
     s0_bpd_ghist_reg     := s0_bpd_ghist
     s0_bpd_ftq_idx_reg   := s0_bpd_ftq_idx
+  } .otherwise {
+    // 如果成功发射到 s1，则清空 valid 寄存器
+    s0_bpd_valid_reg     := false.B
+    s0_bpd_ftq_idx_reg   := s0_bpd_ftq_idx + 1.U
   }
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
