@@ -34,11 +34,6 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val data = UInt((fetchWidth * coreInstBits).W)
   val mask = UInt(fetchWidth.W)
   val xcpt = new FrontendExceptions
-
-  // fsrc provides the prediction FROM a branch in this packet
-  // tsrc provides the prediction TO this packet
-  val fsrc = UInt(BSRC_SZ.W)
-  val tsrc = UInt(BSRC_SZ.W)
 }
 
 class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
@@ -382,22 +377,22 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // 表示 s0 周期 ifu 要使用的 ftq idx，始终有效
   val s0_bpd_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
   val s0_bpd_ghist_reg   = RegInit((0.U).asTypeOf(new GlobalHistory))
+  val s0_bpd_tsrc_reg    = RegInit(0.U(BSRC_SZ.W))
 
   val s0_bpd_valid   = WireInit(s0_bpd_valid_reg)
   val s0_bpd_vpc     = WireInit(s0_bpd_vpc_reg)
   // 表示 s0 周期 bpd 要使用的 ftq idx，始终有效
   val s0_bpd_ftq_idx = WireInit(s0_bpd_ftq_idx_reg)
   val s0_bpd_ghist   = WireInit(s0_bpd_ghist_reg)
+  val s0_bpd_tsrc    = WireInit(s0_bpd_tsrc_reg)
 
   // ifu s0 信号声明
   val s0_ifu_valid_reg   = RegInit(false.B)
   val s0_ifu_vpc_reg     = RegInit(0.U(vaddrBitsExtended.W))
   val s0_ifu_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
-  val s0_tsrc_reg        = RegInit(0.U(BSRC_SZ.W))
 
   val s0_ifu_vpc   = WireInit(s0_ifu_vpc_reg)
   val s0_ftq_idx   = WireInit(s0_ifu_ftq_idx_reg)
-  val s0_tsrc      = WireInit(s0_tsrc_reg)
   val s0_valid     = WireInit(s0_ifu_valid_reg)
   val s0_is_replay = WireInit(false.B)
   val s0_is_sfence = WireInit(false.B)
@@ -419,7 +414,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid   := true.B
     s0_ifu_vpc := io_reset_vector
     s0_bpd_ghist := (0.U).asTypeOf(new GlobalHistory)
-    s0_tsrc    := BSRC_C
+    s0_bpd_tsrc    := BSRC_C
   }
 
   icache.io.req.valid     := s0_ifu_real_valid
@@ -430,6 +425,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f0_req.bits.pc    := s0_bpd_vpc
   bpd.io.f0_req.bits.ghist := s0_bpd_ghist
   bpd.io.f0_req.bits.ftq_idx := s0_bpd_ftq_idx
+  bpd.io.f0_req.bits.tsrc    := s0_bpd_tsrc
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
@@ -443,7 +439,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_is_sfence = RegNext(s0_is_sfence)
   val f1_clear     = WireInit(false.B)
   val bpd_f1_clear = WireInit(false.B)
-  val s1_tsrc      = RegNext(s0_tsrc)
   tlb.io.req.valid      := (s1_valid && !s1_is_replay && !f1_clear) || s1_is_sfence
   tlb.io.req.bits.cmd   := DontCare
   tlb.io.req.bits.vaddr := s1_vpc
@@ -465,7 +460,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   when (s1_valid && !s1_tlb_miss) {
     // Stop fetching on fault
     s0_valid     := !(s1_tlb_resp.ae.inst || s1_tlb_resp.pf.inst)
-    s0_tsrc      := BSRC_1
+    s0_bpd_tsrc  := BSRC_1
     s0_ifu_vpc   := bpd.io.resp.f1_next_pc
     s0_bpd_ghist := bpd.io.resp.f1_next_ghist
     s0_is_replay := false.B
@@ -485,8 +480,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s2_ftq_idx   = RegNext(s1_ftq_idx)
   val s2_vpc   = RegNext(s1_vpc)
   val s2_ppc  = RegNext(s1_ppc)
-  val s2_tsrc = RegNext(s1_tsrc) // tsrc provides the predictor component which provided the prediction TO this instruction
-  val s2_fsrc = WireInit(BSRC_1) // fsrc provides the predictor component which provided the prediction FROM this instruction
   val f2_clear = WireInit(false.B)
   val bpd_f2_clear = WireInit(false.B)
   val s2_tlb_resp = RegNext(s1_tlb_resp)
@@ -506,7 +499,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_is_replay := s2_valid && icache.io.resp.valid
     s0_bpd_ghist := bpd.io.resp.f2_ghist
     // replay 就不需要设置 s2_fsrc
-    s0_tsrc  := s2_tsrc
+    s0_bpd_tsrc  := bpd.io.resp.f2_tsrc
     f1_clear := true.B
     bpd_f1_clear := true.B
     // flush bpd 的 f2 流水线，避免给出 f3 预测进入到 f3_bpd_resp queue 中
@@ -520,9 +513,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ifu_vpc   := bpd.io.resp.f2_next_pc
     s0_is_replay := false.B
     s0_bpd_ghist := bpd.io.resp.f2_next_ghist
-    s2_fsrc      := BSRC_2
-    s0_tsrc      := BSRC_2
-    f1_clear := true.B
+    s0_bpd_tsrc  := BSRC_2
+    f1_clear     := true.B
     bpd_f1_clear := true.B
 
     s0_ftq_idx     := bpd.io.resp.f2_ftq_idx + 1.U
@@ -559,8 +551,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.data  := Mux(s2_xcpt, 0.U, icache.io.resp.bits.data)
   f3.io.enq.bits.mask := fetchMask(s2_vpc)
   f3.io.enq.bits.xcpt := s2_tlb_resp
-  f3.io.enq.bits.fsrc := s2_fsrc
-  f3.io.enq.bits.tsrc := s2_tsrc
 
   f3_enq_fire := f3.io.enq.fire
 
@@ -571,6 +561,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_bpd_resp.io.enq.bits.meta  := bpd.io.resp.f3_meta.meta
   f3_bpd_resp.io.enq.bits.ghist := bpd.io.resp.f3_meta.ghist
   f3_bpd_resp.io.enq.bits.ghist_update_type := bpd.io.resp.f3_ghist_update_type
+  f3_bpd_resp.io.enq.bits.fsrc := bpd.io.resp.f3_meta.fsrc
+  f3_bpd_resp.io.enq.bits.tsrc := bpd.io.resp.f3_meta.tsrc
   // 同步运行时预译码阶段不需要做校验
   f3_bpd_resp.io.enq.bits.target := DontCare
 
@@ -605,8 +597,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.ftq_idx := f3.io.deq.bits.ftq_idx
   f3_fetch_bundle.xcpt_pf_if := f3_imemresp.xcpt.pf.inst
   f3_fetch_bundle.xcpt_ae_if := f3_imemresp.xcpt.ae.inst
-  f3_fetch_bundle.fsrc := f3_imemresp.fsrc
-  f3_fetch_bundle.tsrc := f3_imemresp.tsrc
+  f3_fetch_bundle.fsrc := f3_bpd_resp.io.deq.bits.fsrc
+  f3_fetch_bundle.tsrc := f3_bpd_resp.io.deq.bits.tsrc
   f3_fetch_bundle.shadowed_mask := f3_shadowed_mask
 
   // Tracks trailing 16b of previous fetch packet
@@ -906,7 +898,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_ifu_vpc   := f3_predicted_target
       s0_is_replay := false.B
       s0_bpd_ghist := f3_predicted_ghist
-      s0_tsrc      := BSRC_3
+      s0_bpd_tsrc      := BSRC_3
 
       f3_fetch_bundle.fsrc := BSRC_3
 
@@ -1062,7 +1054,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := io.cpu.redirect_val
     s0_ifu_vpc   := io.cpu.redirect_pc
     s0_bpd_ghist := io.cpu.redirect_ghist
-    s0_tsrc      := BSRC_C
+    s0_bpd_tsrc  := BSRC_C
     s0_is_replay := false.B
 
     ftq.io.redirect.valid := io.cpu.redirect_val
@@ -1085,7 +1077,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ifu_valid_reg   := s0_valid
     s0_ifu_vpc_reg     := s0_ifu_vpc
     s0_ifu_ftq_idx_reg := s0_ftq_idx
-    s0_tsrc_reg        := s0_tsrc
+    s0_bpd_tsrc_reg    := s0_bpd_tsrc
   } .otherwise {
     // 如果成功发射到 s1，则清空 valid 寄存器
     s0_ifu_valid_reg   := false.B

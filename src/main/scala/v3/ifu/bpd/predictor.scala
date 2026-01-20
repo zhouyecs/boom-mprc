@@ -66,6 +66,8 @@ class FetchPacketMetaInfo(implicit p: Parameters) extends BoomBundle()(p)
   val pc = UInt(vaddrBitsExtended.W)
   val meta = Vec(nBanks, UInt(bpdMaxMetaLength.W))
   val ghist = new GlobalHistory
+  val tsrc = UInt(BSRC_SZ.W)
+  val fsrc = UInt(BSRC_SZ.W)
 }
 
 class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
@@ -76,6 +78,8 @@ class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
   val meta = Output(Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   // 分支预测器提供的预测信息，可能来自 f3 预测或 ftq
   val preds = new FetchPacketPredsInfo
+  val tsrc = UInt(BSRC_SZ.W)
+  val fsrc = UInt(BSRC_SZ.W)
   // 分支预测器的结果，可能来自 f2 预测， f3 预测或 ftq
   val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
   val target = UInt(vaddrBitsExtended.W)
@@ -165,6 +169,7 @@ class BranchPredictionRequest(implicit p: Parameters) extends BoomBundle()(p)
   val ftq_idx = new FTQPtr
   val pc    = UInt(vaddrBitsExtended.W)
   val ghist = new GlobalHistory
+  val tsrc = UInt(BSRC_SZ.W)
 }
 
 
@@ -260,6 +265,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       val f3_preds_info = new FetchPacketPredsInfo
       // 用于 replay
       val f2_ghist = new GlobalHistory
+      val f2_tsrc  = UInt(BSRC_SZ.W)
 
       // prediction valid
       // TODO：是否要考虑 clear 信号呢？目前是没考虑的
@@ -461,6 +467,14 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val s3_ghist_write = WireDefault(s2_ghist)
     val s3_ghist = RegNext(s3_ghist_write) 
 
+    val s1_tsrc = RegNext(io.f0_req.bits.tsrc)
+    val s2_tsrc = RegNext(s1_tsrc)
+    val s3_tsrc = RegNext(s2_tsrc)
+
+    val s3_fsrc = Reg(UInt(BSRC_SZ.W))
+    // 默认是 f1 预测
+    s3_fsrc := BSRC_1
+
     // 根据 f1 预测计算新的 ghist 和 next pc 
     val f1_mask = fetchMask(s1_vpc)
     val f1_redirects = (0 until fetchWidth) map { i =>
@@ -519,6 +533,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f2_next_ghist := f2_predicted_ghist
     io.resp.f2_next_pc := f2_predicted_target
     io.resp.f2_ghist := s2_ghist
+    io.resp.f2_tsrc := s2_tsrc
 
     // f2 重定向 f1
     require(NO_SHIFT_CONST == 0)
@@ -534,6 +549,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     when (s2_valid) {
       when (!s1_valid || f2_redirect_f1) {
         io.resp.f2_redirect := true.B
+        s3_fsrc := BSRC_2
       }
     }
 
@@ -567,6 +583,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f3_meta.ghist := s3_ghist
     io.resp.f3_meta.pc := s3_vpc    
     io.resp.f3_meta.meta(0) := banked_predictors(0).io.f3_meta
+    io.resp.f3_meta.tsrc := s3_tsrc
+    io.resp.f3_meta.fsrc := s3_fsrc
 
     // 输出 f3 的 preds info
     val f3_br_taken = f3_preds.map(p => p.taken)
