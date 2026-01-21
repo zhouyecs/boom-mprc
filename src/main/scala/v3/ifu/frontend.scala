@@ -619,12 +619,24 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       bpu.io.mcontext := io.cpu.mcontext
       bpu.io.scontext := io.cpu.scontext
 
+      val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+      val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
+
       val brsigs = Wire(new BranchDecodeSignals)
       if (w == 0) {
         val inst0 = Cat(bank_data(15,0), f3_prev_half)
         val inst1 = bank_data(31,0)
-        val exp_inst0 = ExpandRVC(inst0)
-        val exp_inst1 = ExpandRVC(inst1)
+        val exp_rvc_0 = Module(new ExpandRVCompressed)
+        exp_rvc_0.io.in := inst0
+        val exp_inst0 = exp_rvc_0.io.inst
+        val rvc0 = exp_rvc_0.io.rvc
+        val exp_rvc_1 = Module(new ExpandRVCompressed)
+        exp_rvc_1.io.in := inst1
+        val exp_inst1 = exp_rvc_1.io.inst
+        val rvc1 = exp_rvc_1.io.rvc
+
+        // val exp_inst0 = ExpandRVC(inst0)
+        // val exp_inst1 = ExpandRVC(inst1)
         val pc0 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U - 2.U)
         val pc1 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U)
 
@@ -642,6 +654,24 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           bpu.io.pc                    := pc0
           brsigs                       := bpd_decoder0.io.out
           f3_fetch_bundle.edge_inst(b) := true.B
+
+          if (IN_SIMULATION) {
+            when (rvc_expand_printf(0) && rvc0) {
+              printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is half)\n", cycleCount, pc0, inst0(15,0), exp_inst0)
+              // printf("rvc (prev bank): %x\n", f3_prev_half)
+              when (brsigs.is_call) {
+                printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
+              }.elsewhen (brsigs.is_ret) {
+                printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
+              }
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
+              printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc0, inst0)
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
+              printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc0, inst0)
+            }
+            printf("[%d RVCExpand+Predecode] prev bank is half of 32-bit: PC: %x\n", cycleCount, pc0)
+          }
+
           if (b > 0) {
             val inst0b     = Cat(bank_data(15,0), last_inst)
             val exp_inst0b = ExpandRVC(inst0b)
@@ -663,11 +693,33 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           bpu.io.pc                    := pc1
           brsigs                       := bpd_decoder1.io.out
           f3_fetch_bundle.edge_inst(b) := false.B
+
+          if (IN_SIMULATION) {
+            when (rvc_expand_printf(0) && rvc1) {
+              printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is not half)\n", cycleCount, pc1, inst1(15, 0), exp_inst1)
+              // printf("rvc: %x\n", inst1(15, 0))
+              when (brsigs.is_call) {
+                printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
+              }.elsewhen (brsigs.is_ret) {
+                printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
+              }
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
+              printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc1, inst1)
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
+              printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc1, inst1)
+            }
+          }
+
         }
         valid := true.B
       } else {
         val inst = Wire(UInt(32.W))
-        val exp_inst = ExpandRVC(inst)
+        val exp_rvc = Module(new ExpandRVCompressed)
+        exp_rvc.io.in := inst
+        val exp_inst = exp_rvc.io.inst
+        val rvc = exp_rvc.io.rvc
+
+        // val exp_inst = ExpandRVC(inst)
         val pc = f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U
         val bpd_decoder = Module(new BranchDecode)
         bpd_decoder.io.inst := exp_inst
@@ -678,6 +730,23 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         f3_fetch_bundle.exp_insts(i) := exp_inst
         bpu.io.pc                    := pc
         brsigs                       := bpd_decoder.io.out
+
+        if (IN_SIMULATION) {
+          when (rvc_expand_printf(0) && rvc) {
+            printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x\n", cycleCount, pc, inst(15, 0), exp_inst)
+            // printf("rvc: %x\n", inst(15, 0))
+            when (brsigs.is_call) {
+              printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
+            }.elsewhen (brsigs.is_ret) {
+              printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
+            }
+          } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
+              printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc, inst)
+          } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
+              printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc, inst)
+          }
+        }
+
         if (w == 1) {
           // Need special case since 0th instruction may carry over the wrap around
           inst  := bank_data(47,16)

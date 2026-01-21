@@ -366,6 +366,20 @@ trait RISCVConstants
     Mux(rvc_exp.io.rvc, rvc_exp.io.out.bits, inst)
   }
 
+  class ExpandRVCompressed(implicit p: Parameters) extends Module {
+    val io = IO(new Bundle {
+      val in = Input(UInt(32.W))
+      val rvc = Output(Bool())
+      val inst = Output(UInt(32.W))
+    })
+
+    val rvc_exp = Module(new RVCExpander)
+
+    rvc_exp.io.in := io.in
+    io.rvc := rvc_exp.io.rvc
+    io.inst := Mux(rvc_exp.io.rvc, rvc_exp.io.out.bits, io.in)
+  }
+
   // Note: Accepts only EXPANDED rvc instructions
   def ComputeBranchTarget(pc: UInt, inst: UInt, xlen: Int)(implicit p: Parameters): UInt = {
     val b_imm32 = Cat(Fill(20,inst(31)), inst(7), inst(30,25), inst(11,8), 0.U(1.W))
