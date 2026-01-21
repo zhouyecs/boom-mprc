@@ -262,6 +262,7 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
 
   // 1 for xcpt/jalr/auipc/flush
   val get_pc            = Flipped(Vec(2, new GetPCFromFtqIO()))
+  val mispredict_val    = Output(Bool()) // 表示 get_pc_1 是否有效
   val debug_ftq_idx     = Output(Vec(coreWidth, UInt(log2Ceil(ftqSz).W)))
   val debug_fetch_pc    = Input(Vec(coreWidth, UInt(vaddrBitsExtended.W)))
 
@@ -345,6 +346,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f3_fire := false.B
 
   val ftq = Module(new FetchTargetQueue)
+  ftq.io.f3_preds_enq.valid            := bpd.io.resp.f3_pred_valid
+  ftq.io.f3_preds_enq.bits.preds_info  := bpd.io.resp.f3_preds_info
+  ftq.io.f3_preds_enq.bits.fetch_info  := bpd.io.resp.f3_meta
+  ftq.io.f3_preds_enq.bits.pred_target := bpd.io.resp.f3_next_pc
+  ftq.io.f3_ftq_idx_debug              := bpd.io.resp.f3_ftq_idx
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache
@@ -377,7 +383,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // 表示 s0 周期 ifu 要使用的 ftq idx，始终有效
   val s0_bpd_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
   val s0_bpd_ghist_reg   = RegInit((0.U).asTypeOf(new GlobalHistory))
-  val s0_bpd_tsrc_reg    = RegInit(0.U(BSRC_SZ.W))
+  val s0_bpd_tsrc_reg    = RegInit(BSRC_C)
 
   val s0_bpd_valid   = WireInit(s0_bpd_valid_reg)
   val s0_bpd_vpc     = WireInit(s0_bpd_vpc_reg)
@@ -403,18 +409,24 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_bpd_real_valid = Wire(Bool())
   val s0_ifu_real_valid = Wire(Bool())
 
+  // f3 预测重定向和预译码重定向可能同时发生，如果它们对应同一级流水线
+  // 预译码重定向优先级更高
+  val predecode_redirect = WireDefault(false.B)
+  val bpd_f3_real_redirect = WireDefault(false.B)
+  val s2_replay_happen = WireDefault(false.B)
+
   //Enable_PerfCounter_Support
   io.cpu.icache_valid_access := icache.io.icache_valid_access
   io.cpu.icache_hit := icache.io.resp.valid
 
-  s0_bpd_valid := s0_valid
-  s0_bpd_vpc := s0_ifu_vpc
-
   when (RegNext(reset.asBool) && !reset.asBool) {
     s0_valid   := true.B
     s0_ifu_vpc := io_reset_vector
-    s0_bpd_ghist := (0.U).asTypeOf(new GlobalHistory)
-    s0_bpd_tsrc    := BSRC_C
+    // s0_ftq_idx 使用 reset 后的初始值即可
+
+    s0_bpd_valid := true.B
+    s0_bpd_vpc   := io_reset_vector
+    // s0_bpd_ftq_idx, s0_bpd_ghist, s0_bpd_tsrc 使用 reset 后的初始值即可
   }
 
   icache.io.req.valid     := s0_ifu_real_valid
@@ -456,18 +468,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   icache.io.s1_paddr := s1_ppc
   icache.io.s1_kill  := s1_tlb_miss || f1_clear
 
-  // s0_vpc 来源 1: f1 预测
-  when (s1_valid) {
-    s0_valid     := true.B
-    s0_bpd_tsrc  := BSRC_1
-    s0_ifu_vpc   := bpd.io.resp.f1_next_pc
-    s0_bpd_ghist := bpd.io.resp.f1_next_ghist
-    s0_is_replay := false.B
-
-    s0_ftq_idx     := bpd.io.resp.f1_ftq_idx + 1.U
-    s0_bpd_ftq_idx := bpd.io.resp.f1_ftq_idx + 1.U
-  }
-
   io.cpu.itlb_valid_access := tlb.io.req.valid
   io.cpu.itlb_hit := tlb.io.req.valid && !s1_tlb_miss
 
@@ -490,40 +490,17 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   icache.io.s2_kill := s2_xcpt
 
   val f3_enq_fire = Wire(Bool())
-  // s0_vpc 来源 3: icache/tlb miss 或者 f3 没有 ready 发生 replay
   when ((s2_valid && !icache.io.resp.valid) ||
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
-    s0_valid     := !f3_enq_fire
-    s0_ifu_vpc   := s2_vpc
-    s0_is_replay := s2_valid && icache.io.resp.valid
-    s0_bpd_ghist := bpd.io.resp.f2_ghist
-    // replay 就不需要设置 s2_fsrc
-    s0_bpd_tsrc  := bpd.io.resp.f2_tsrc
-    f1_clear := true.B
-    bpd_f1_clear := true.B
-    // flush bpd 的 f2 流水线，避免给出 f3 预测进入到 f3_bpd_resp queue 中
-    bpd_f2_clear := true.B
-
-    s0_ftq_idx     := s2_ftq_idx
-    s0_bpd_ftq_idx := s2_ftq_idx
-  // s0_vpc 来源 2: bpd f2 预测重定向
-  } .elsewhen (bpd.io.resp.f2_redirect) {
-    s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
-    s0_ifu_vpc   := bpd.io.resp.f2_next_pc
-    s0_is_replay := false.B
-    s0_bpd_ghist := bpd.io.resp.f2_next_ghist
-    s0_bpd_tsrc  := BSRC_2
-    f1_clear     := true.B
-    bpd_f1_clear := true.B
-
-    s0_ftq_idx     := bpd.io.resp.f2_ftq_idx + 1.U
-    s0_bpd_ftq_idx := bpd.io.resp.f2_ftq_idx + 1.U
-  }
+    s2_replay_happen := true.B
+  } 
   s0_replay_resp := s2_tlb_resp
   s0_replay_ppc  := s2_ppc
 
   bpd.io.f1_clear := bpd_f1_clear
   bpd.io.f2_clear := bpd_f2_clear
+
+  ftq.io.s2_ftq_idx := s2_ftq_idx
 
   // --------------------------------------------------------
   // **** F3 ****
@@ -555,15 +532,19 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   // The BPD resp comes in f3
   f3_bpd_resp.io.enq.valid := f3.io.deq.valid && RegNext(f3.io.enq.ready)
-  f3_bpd_resp.io.enq.bits.pc  := bpd.io.resp.f3_meta.pc
-  f3_bpd_resp.io.enq.bits.preds := bpd.io.resp.f3_preds_info
-  f3_bpd_resp.io.enq.bits.meta  := bpd.io.resp.f3_meta.meta
-  f3_bpd_resp.io.enq.bits.ghist := bpd.io.resp.f3_meta.ghist
-  f3_bpd_resp.io.enq.bits.ghist_update_type := bpd.io.resp.f3_ghist_update_type
-  f3_bpd_resp.io.enq.bits.fsrc := bpd.io.resp.f3_meta.fsrc
-  f3_bpd_resp.io.enq.bits.tsrc := bpd.io.resp.f3_meta.tsrc
-  // 同步运行时预译码阶段不需要做校验
-  f3_bpd_resp.io.enq.bits.target := DontCare
+  f3_bpd_resp.io.enq.bits.pc  := ftq.io.s3_preds_info.pc_debug
+  f3_bpd_resp.io.enq.bits.preds.br_taken := ftq.io.s3_preds_info.preds_info.br_taken
+  f3_bpd_resp.io.enq.bits.preds.jal_target := ftq.io.s3_preds_info.preds_info.jal_target
+  f3_bpd_resp.io.enq.bits.preds.jal_targets_debug := DontCare
+  f3_bpd_resp.io.enq.bits.preds.ras_top := ftq.io.s3_preds_info.ras_top
+  f3_bpd_resp.io.enq.bits.preds.ras_idx := ftq.io.s3_preds_info.ras_idx
+  f3_bpd_resp.io.enq.bits.preds.btb_hits := ftq.io.s3_preds_info.preds_info.btb_hits
+  f3_bpd_resp.io.enq.bits.preds.ghist_update_type := ftq.io.s3_preds_info.preds_info.ghist_update_type
+  f3_bpd_resp.io.enq.bits.meta  := DontCare
+  f3_bpd_resp.io.enq.bits.ghist := ftq.io.s3_preds_info.ghist
+  f3_bpd_resp.io.enq.bits.fsrc := ftq.io.s3_preds_info.preds_info.fsrc
+  f3_bpd_resp.io.enq.bits.tsrc := ftq.io.s3_preds_info.preds_info.tsrc
+  f3_bpd_resp.io.enq.bits.target := ftq.io.s3_preds_info.pred_target
 
   when (f3_bpd_resp.io.enq.fire) {
     bpd.io.f3_fire := true.B
@@ -855,10 +836,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val f3_ghist_all_zero = f3_fetch_bundle.ghist === (0.U).asTypeOf(new GlobalHistory)
   val shift_zero_or_no_shift_f3 = f3_pred_ghist_update_type(1) === 0.U &&
-                                  f3_bpd_resp.io.deq.bits.ghist_update_type(1) === 0.U
+                                  f3_bpd_resp.io.deq.bits.preds.ghist_update_type(1) === 0.U
   val f3_correct_ghist = !(f3_ghist_all_zero && shift_zero_or_no_shift_f3) &&
-                          f3_pred_ghist_update_type =/= f3_bpd_resp.io.deq.bits.ghist_update_type &&
+                          f3_pred_ghist_update_type =/= f3_bpd_resp.io.deq.bits.preds.ghist_update_type &&
                           enableGHistStallRepair.B
+  val f3_correct_target = f3_predicted_target =/= f3_bpd_resp.io.deq.bits.target
   val itlb_exception = f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if
 
   when (f3.io.deq.valid && f4_ready) {
@@ -875,26 +857,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     when (f3_redirects.reduce(_||_)) {
       f3_prev_is_half := false.B
     }
-    when (( s2_valid &&  s2_vpc =/= f3_predicted_target) ||
-          (!s2_valid &&  s1_valid && s1_vpc =/= f3_predicted_target) ||
-          (!s2_valid && !s1_valid) || f3_correct_ghist || itlb_exception) {
-      f2_clear := true.B
-      bpd_f2_clear := true.B
-      f1_clear := true.B
-      bpd_f1_clear := true.B
-
-      s0_valid     := !itlb_exception
-      s0_ifu_vpc   := f3_predicted_target
-      s0_is_replay := false.B
-      s0_bpd_ghist := f3_predicted_ghist
-      s0_bpd_tsrc      := BSRC_3
-
+    when (f3_correct_ghist || f3_correct_target || itlb_exception) {
+      predecode_redirect   := true.B
       f3_fetch_bundle.fsrc := BSRC_3
-
-      s0_ftq_idx     := f3_fetch_bundle.ftq_idx + 1.U
-      s0_bpd_ftq_idx := f3_fetch_bundle.ftq_idx + 1.U
     }
   }
+
+  ftq.io.predecode_redirect.valid := predecode_redirect
+  ftq.io.predecode_redirect.bits  := f3_fetch_bundle.ftq_idx
 
   // When f3 finds a btb mispredict, queue up a bpd correction update
   val f4_btb_corrections = Module(new Queue(new BranchPredictionUpdate, 2))
@@ -1003,6 +973,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   io.cpu.fetchpacket <> fb.io.deq
   io.cpu.get_pc <> ftq.io.get_ftq_pc
+
+  // TODO: 当没有发生 mispredict 时, ghist 
+  // when (!io.cpu.mispredict_val) {
+  //   ftq.io.get_ftq_pc(1).ftq_idx := s2_ftq_idx
+  // }
+
   ftq.io.deq := io.cpu.commit
   ftq.io.brupdate := io.cpu.brupdate
 
@@ -1013,38 +989,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   fb.io.clear := false.B
 
   when (io.cpu.sfence.valid) {
-    fb.io.clear := true.B
-    f4_clear    := true.B
-    f3_clear    := true.B
-    f2_clear    := true.B
-    bpd_f2_clear := true.B
-    f1_clear    := true.B
-    bpd_f1_clear := true.B
-
-    s0_valid     := false.B
-    s0_ifu_vpc   := io.cpu.sfence.bits.addr
-    s0_is_replay := false.B
-    s0_is_sfence := true.B
-
-    s0_ftq_idx   := s0_ifu_ftq_idx_reg
-    s0_bpd_ftq_idx := s0_bpd_ftq_idx_reg
 
   }.elsewhen (io.cpu.redirect_flush) {
-    fb.io.clear := true.B
-    f4_clear    := true.B
-    f3_clear    := true.B
-    f2_clear    := true.B
-    bpd_f2_clear := true.B
-    f1_clear    := true.B
-    bpd_f1_clear := true.B
-
-    f3_prev_is_half := false.B
-
-    s0_valid     := io.cpu.redirect_val
-    s0_ifu_vpc   := io.cpu.redirect_pc
-    s0_bpd_ghist := io.cpu.redirect_ghist
-    s0_bpd_tsrc  := BSRC_C
-    s0_is_replay := false.B
 
     ftq.io.redirect.valid := io.cpu.redirect_val
     ftq.io.redirect.bits  := io.cpu.redirect_ftq_idx
@@ -1054,23 +1000,73 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // 后端重定向更新 ras top 指针的内容
     bpd.io.backend_ras_top_update_valid := true.B
     bpd.io.backend_ras_top_update_idx  := io.cpu.redirect_ghist.ras_idx
-
-    s0_ftq_idx     := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_ifu_ftq_idx_reg)
-    s0_bpd_ftq_idx := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_bpd_ftq_idx_reg)
   }
-  // 当 ifu s0 希望写入的 ftq full 时，暂停前端流水线，使用
-  // s0 寄存器暂存 fetch 请求
-  val ifu_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_ftq_idx)
-  s0_ifu_real_valid := s0_valid && !ifu_to_ftq_not_ready
-  when (!s0_ifu_real_valid) {
-    s0_ifu_valid_reg   := s0_valid
-    s0_ifu_vpc_reg     := s0_ifu_vpc
-    s0_ifu_ftq_idx_reg := s0_ftq_idx
-    s0_bpd_tsrc_reg    := s0_bpd_tsrc
-  } .otherwise {
-    // 如果成功发射到 s1，则清空 valid 寄存器
-    s0_ifu_valid_reg   := false.B
-    s0_ifu_ftq_idx_reg := s0_ftq_idx + 1.U
+
+  ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
+  io.cpu.debug_fetch_pc := ftq.io.debug_fetch_pc
+
+  //////////////////////////////////////
+  // bpd s0 逻辑                       //
+  //////////////////////////////////////
+
+  // TODO: s0 和 s1 寄存器可以合并吗
+  bpd_f3_real_redirect := bpd.io.resp.f3_redirect &&
+                          (!predecode_redirect || bpd.io.resp.f3_ftq_idx =/= f3_fetch_bundle.ftq_idx)
+
+  when (bpd.io.resp.f1_pred_valid) {
+    s0_bpd_valid   := true.B
+    s0_bpd_vpc     := bpd.io.resp.f1_next_pc
+    s0_bpd_ftq_idx := bpd.io.resp.f1_ftq_idx + 1.U
+    s0_bpd_ghist   := bpd.io.resp.f1_next_ghist
+    s0_bpd_tsrc    := BSRC_1
+  }
+  when (bpd.io.resp.f2_redirect) {
+    s0_bpd_valid   := true.B
+    s0_bpd_vpc     := bpd.io.resp.f2_next_pc
+    s0_bpd_ftq_idx := bpd.io.resp.f2_ftq_idx + 1.U
+    s0_bpd_ghist   := bpd.io.resp.f2_next_ghist
+    s0_bpd_tsrc    := BSRC_2
+
+    bpd_f1_clear   := true.B
+  }
+  when (bpd_f3_real_redirect) {
+    s0_bpd_valid   := true.B
+    s0_bpd_vpc     := bpd.io.resp.f3_next_pc
+    s0_bpd_ftq_idx := bpd.io.resp.f3_ftq_idx + 1.U
+    s0_bpd_ghist   := bpd.io.resp.f3_next_ghist
+    s0_bpd_tsrc    := BSRC_3
+
+    bpd_f1_clear   := true.B
+    bpd_f2_clear   := true.B
+  }
+  when (predecode_redirect) {
+    // 取指发生异常时暂停 bpd 流水线
+    s0_bpd_valid   := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
+    s0_bpd_vpc     := f3_predicted_target
+    s0_bpd_ftq_idx := f3_fetch_bundle.ftq_idx + 1.U
+    s0_bpd_ghist   := f3_predicted_ghist
+    // TODO: 增加 predecode tsrc / fsrc
+    s0_bpd_tsrc    := BSRC_3
+
+    bpd_f1_clear   := true.B
+    bpd_f2_clear   := true.B
+  }
+  // TODO: 对于 sfence.vma，有必要 flush bpd 吗
+  when (io.cpu.sfence.valid) {
+    s0_bpd_valid   := false.B
+    s0_bpd_ftq_idx := s0_bpd_ftq_idx_reg
+
+    bpd_f1_clear   := true.B
+    bpd_f2_clear   := true.B
+  }.elsewhen (io.cpu.redirect_flush) {
+    s0_bpd_valid   := io.cpu.redirect_val
+    s0_bpd_vpc     := io.cpu.redirect_pc
+    s0_bpd_ftq_idx := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_bpd_ftq_idx_reg)
+    s0_bpd_ghist   := io.cpu.redirect_ghist
+    s0_bpd_tsrc    := BSRC_C
+  
+    bpd_f1_clear   := true.B
+    bpd_f2_clear   := true.B
   }
 
   // 当 bpd s0 希望写入的 ftq full 时，暂停 bpd 流水线，使用
@@ -1082,15 +1078,129 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_bpd_vpc_reg       := s0_bpd_vpc
     s0_bpd_ghist_reg     := s0_bpd_ghist
     s0_bpd_ftq_idx_reg   := s0_bpd_ftq_idx
+    s0_bpd_tsrc_reg      := s0_bpd_tsrc
   } .otherwise {
     // 如果成功发射到 s1，则清空 valid 寄存器
     s0_bpd_valid_reg     := false.B
     s0_bpd_ftq_idx_reg   := s0_bpd_ftq_idx + 1.U
   }
 
-  ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
-  io.cpu.debug_fetch_pc := ftq.io.debug_fetch_pc
+  //////////////////////////////////////
+  // ifu s0 逻辑                       //
+  //////////////////////////////////////
+  
+  // 向 ftq 请求新的 fetch pc
+  ftq.io.ifu_fetch_ftq_idx := s0_ifu_ftq_idx_reg
 
+  val f1_next_ftq_idx = bpd.io.resp.f1_ftq_idx + 1.U
+  val f2_next_ftq_idx = bpd.io.resp.f2_ftq_idx + 1.U
+  val f3_next_ftq_idx = bpd.io.resp.f3_ftq_idx + 1.U
+  val can_use_ftq_info = ftq.io.ifu_fetch_pc.valid
+  val last_is_f1_pred = s0_ifu_ftq_idx_reg === f1_next_ftq_idx && bpd.io.resp.f1_pred_valid
+  val last_is_f2_pred = s0_ifu_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
+  val last_is_f3_pred = s0_ifu_ftq_idx_reg === f3_next_ftq_idx && bpd.io.resp.f3_pred_valid
+
+  // 因为 f2_next_ftq_idx / f3_next_ftq_idx 可能超过 s0_ifu_ftq_idx_reg 一圈，
+  // 但是 s0_ifu_ftq_idx_reg 至多比它们大 1 或者 2，因此使用 !(s0_ifu_ftq_idx_reg < ...)
+  // 来判断，而不能使用 s0_ifu_ftq_idx_reg > ...
+  val s0_redirect_by_f2 = !(s0_ifu_ftq_idx_reg < f2_next_ftq_idx) && bpd.io.resp.f2_redirect
+  val s0_redirect_by_f3 = !(s0_ifu_ftq_idx_reg < f3_next_ftq_idx) && bpd_f3_real_redirect
+
+  val can_use_f1_pred = last_is_f1_pred
+  val can_use_f2_pred = last_is_f2_pred || s0_redirect_by_f2
+  val can_use_f3_pred = last_is_f3_pred || s0_redirect_by_f3
+  
+  // f3 redirect 和 s2 replay 可能同时发生，当 f3 是更早一级流水线时，f3 redirect 优先级更高
+  val f3_suppress_s2_replay = s2_ftq_idx === f3_next_ftq_idx && bpd_f3_real_redirect
+
+  // ifu f1 可能被 f2 预测, f3 预测, s2 重放, predecode 重定向, sfence, 后端重定向清空
+  val s1_clear_by_f2 = bpd.io.resp.f2_redirect && (s1_ftq_idx > bpd.io.resp.f2_ftq_idx)
+  val s1_clear_by_f3 = bpd_f3_real_redirect && (s1_ftq_idx > bpd.io.resp.f3_ftq_idx)
+  f1_clear := s1_clear_by_f2 || s1_clear_by_f3 || s2_replay_happen ||
+              predecode_redirect || io.cpu.sfence.valid || io.cpu.redirect_flush
+
+  // ifu f2 可能被 f3 预测, predecode 重定向, sfence, 后端重定向清空
+  val s2_clear_by_f3 = bpd_f3_real_redirect && (s2_ftq_idx > bpd.io.resp.f3_ftq_idx)
+  f2_clear := s2_clear_by_f3 || predecode_redirect ||
+              io.cpu.sfence.valid || io.cpu.redirect_flush
+
+  // ifu predecode 和 f4 可能被 sfence, 后端重定向清空
+  f3_clear    := io.cpu.sfence.valid || io.cpu.redirect_flush
+  f4_clear    := io.cpu.sfence.valid || io.cpu.redirect_flush
+  fb.io.clear := io.cpu.sfence.valid || io.cpu.redirect_flush
+
+  // 来源 1: 来自 ftq 的新 fetch 请求
+  when (can_use_ftq_info) {
+    s0_valid     := true.B
+    s0_ifu_vpc   := ftq.io.ifu_fetch_pc.bits
+    s0_ftq_idx   := s0_ifu_ftq_idx_reg
+    s0_is_replay := false.B
+  }
+  // 来源 2: 来自 bpd 的 f1 预测
+  when (can_use_f1_pred) {
+    s0_valid     := true.B
+    s0_ifu_vpc   := bpd.io.resp.f1_next_pc
+    s0_ftq_idx   := f1_next_ftq_idx
+    s0_is_replay := false.B
+  }
+  // 来源 3: 来自 bpd 的 f2 预测或重定向
+  when (can_use_f2_pred) {
+    s0_valid     := true.B
+    s0_ifu_vpc   := bpd.io.resp.f2_next_pc
+    s0_ftq_idx   := f2_next_ftq_idx
+    s0_is_replay := false.B
+  }
+  // 来源 4: 来自 bpd 的 f3 预测或重定向
+  when (can_use_f3_pred) {
+    s0_valid     := true.B
+    s0_ifu_vpc   := bpd.io.resp.f3_next_pc
+    s0_ftq_idx   := f3_next_ftq_idx
+    s0_is_replay := false.B
+  }
+  // 来源 5: 来自 s2 重放
+  when (s2_replay_happen && !f3_suppress_s2_replay) {
+    // TODO: 设置为 true 就行了？因为 s3 预译码检测到异常会 flush 的
+    s0_valid     := !f3_enq_fire
+    s0_ifu_vpc   := s2_vpc
+    s0_ftq_idx   := s2_ftq_idx
+    s0_is_replay := icache.io.resp.valid
+  }
+  // 来源 6: 来自预译码重定向
+  when (predecode_redirect) {
+    // 发生取指异常时暂停前端流水线
+    s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
+    s0_ifu_vpc   := f3_predicted_target
+    s0_ftq_idx   := f3_fetch_bundle.ftq_idx + 1.U
+    s0_is_replay := false.B
+  }
+  // 来源 7: 来自 sfence.vma flush 或后端重定向
+  when (io.cpu.sfence.valid) {
+    s0_valid     := false.B
+    s0_ifu_vpc   := io.cpu.sfence.bits.addr
+    s0_ftq_idx   := s0_ifu_ftq_idx_reg
+    s0_is_replay := false.B
+
+    s0_is_sfence := true.B
+  }.elsewhen (io.cpu.redirect_flush) {
+    s0_valid     := io.cpu.redirect_val
+    s0_ifu_vpc   := io.cpu.redirect_pc
+    s0_ftq_idx   := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_ifu_ftq_idx_reg)
+    s0_is_replay := false.B
+  }
+
+  // 当 ifu s0 希望写入的 ftq full 时，暂停前端流水线，使用
+  // s0 寄存器暂存 fetch 请求
+  val ifu_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_ftq_idx)
+  s0_ifu_real_valid := s0_valid && !ifu_to_ftq_not_ready
+  when (!s0_ifu_real_valid) {
+    s0_ifu_valid_reg   := s0_valid
+    s0_ifu_vpc_reg     := s0_ifu_vpc
+    s0_ifu_ftq_idx_reg := s0_ftq_idx
+  } .otherwise {
+    // 如果成功发射到 s1，则清空 valid 寄存器
+    s0_ifu_valid_reg   := false.B
+    s0_ifu_ftq_idx_reg := s0_ftq_idx + 1.U
+  }
 
   override def toString: String =
     (BoomCoreStringPrefix("====Overall Frontend Params====") + "\n"
@@ -1167,12 +1277,60 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     assert (f3_bpd_resp.io.deq.fire, "BPD F3 response should fire when F3 fires" )
   }
 
-  assert (s1_valid === bpd.io.resp.f1_pred_valid, "S1 valid should match BPD F1 prediction valid" )
-  assert (s2_valid === bpd.io.resp.f2_pred_valid, "S2 valid should match BPD F2 prediction valid" )
-  when (bpd.io.resp.f3_pred_valid) {
-    assert (f3.io.deq.valid, "F3 valid should be high when BPD F3 prediction valid is high" )
-  }
   when (!s0_ifu_real_valid) {
     assert(!s0_is_replay, "ifu should not stall replay")
   }
+  assert (!(can_use_f1_pred && can_use_ftq_info), "should not be able to use both BPD F1 and FTQ info" )
+  assert (!(can_use_f2_pred && can_use_ftq_info), "should not be able to use both BPD F2 and FTQ info" )
+  assert (!(can_use_f3_pred && can_use_ftq_info), "should not be able to use both BPD F3 and FTQ info" )
+
+  when (s2_clear_by_f3) {
+    assert (!s2_replay_happen || f3_suppress_s2_replay,
+      "s2 should not be cleared by both f3 redirect and s2 replay" )
+  }
+  // 断言 bpd 和 ifu 的相对进度
+  when (s1_valid) {
+    when (bpd.io.resp.f1_pred_valid) {
+      assert (s1_ftq_idx <= bpd.io.resp.f1_ftq_idx,
+              "s1 ftq idx can't go faster than bpd f1 ftq idx")
+      assert (!isFull(s1_ftq_idx, bpd.io.resp.f1_ftq_idx),
+              "bpd f1 ftq idx should not lap s1 ftq idx")
+    }
+    when (bpd.io.resp.f2_pred_valid) {
+      assert (s1_ftq_idx <= bpd.io.resp.f2_ftq_idx || s1_ftq_idx === bpd.io.resp.f2_ftq_idx + 1.U,
+        "s1 ftq idx can't go faster than bpd f2 ftq idx + 1")
+      assert (!isFull(s1_ftq_idx, bpd.io.resp.f2_ftq_idx),
+        "bpd f2 ftq idx should not lap s1 ftq idx")
+    }
+    when (bpd.io.resp.f3_pred_valid) {
+      assert (s1_ftq_idx <= bpd.io.resp.f3_ftq_idx || s1_ftq_idx === bpd.io.resp.f3_ftq_idx + 1.U ||
+              s1_ftq_idx === bpd.io.resp.f3_ftq_idx + 2.U,
+        "s1 ftq idx can't go faster than bpd f3 ftq idx + 2")
+      assert (!isFull(s1_ftq_idx, bpd.io.resp.f3_ftq_idx),
+        "bpd f3 ftq idx should not lap s1 ftq idx")
+    }
+  }
+  when (s2_valid) {
+    when (bpd.io.resp.f2_pred_valid) {
+      assert (s2_ftq_idx <= bpd.io.resp.f2_ftq_idx,
+              "s2 ftq idx can't go faster than bpd f2 ftq idx")
+      assert (!isFull(s2_ftq_idx, bpd.io.resp.f2_ftq_idx),
+              "bpd f2 ftq idx should not lap s2 ftq idx")
+    }
+    when (bpd.io.resp.f3_pred_valid) {
+      assert (s2_ftq_idx <= bpd.io.resp.f3_ftq_idx || s2_ftq_idx === bpd.io.resp.f3_ftq_idx + 1.U,
+        "s2 ftq idx can't go faster than bpd f3 ftq idx + 1")
+      assert (!isFull(s2_ftq_idx, bpd.io.resp.f3_ftq_idx),
+        "bpd f3 ftq idx should not lap s2 ftq idx")
+    }
+  }
+  when (f3.io.deq.valid) {
+    when (bpd.io.resp.f3_pred_valid) {
+      assert (f3_fetch_bundle.ftq_idx <= bpd.io.resp.f3_ftq_idx,
+        "f3 ftq idx can't go faster than bpd f3 ftq idx")
+      assert (!isFull(f3_fetch_bundle.ftq_idx, bpd.io.resp.f3_ftq_idx),
+        "bpd f3 ftq idx should not lap f3 ftq idx")
+    }
+  }
+  // TODO: 断言 bpd 给 ftq 的输入和 ftq 给 predecode 的输入一致 
 }

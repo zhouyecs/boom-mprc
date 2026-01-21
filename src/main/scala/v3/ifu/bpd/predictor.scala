@@ -58,6 +58,7 @@ class FetchPacketPredsInfo(implicit p: Parameters) extends BoomBundle()(p)
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
   // btb 是否命中
   val btb_hits = UInt(fetchWidth.W)
+  val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
 }
 
 class FetchPacketMetaInfo(implicit p: Parameters) extends BoomBundle()(p)
@@ -70,6 +71,15 @@ class FetchPacketMetaInfo(implicit p: Parameters) extends BoomBundle()(p)
   val fsrc = UInt(BSRC_SZ.W)
 }
 
+class F3PredsToFTQ(implicit p: Parameters) extends BoomBundle()(p)
+  with HasBoomFrontendParameters
+{
+  val fetch_info  = new FetchPacketMetaInfo
+  val preds_info  = new FetchPacketPredsInfo
+  val pred_target = UInt(vaddrBitsExtended.W)
+}
+
+
 class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
   with HasBoomFrontendParameters
 {
@@ -81,7 +91,6 @@ class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
   val tsrc = UInt(BSRC_SZ.W)
   val fsrc = UInt(BSRC_SZ.W)
   // 分支预测器的结果，可能来自 f2 预测， f3 预测或 ftq
-  val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
   val target = UInt(vaddrBitsExtended.W)
   // 取该 fetch packet 时的信息，来自 ftq
   val ghist = new GlobalHistory
@@ -263,9 +272,6 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       // 因为只有 f3 的 meta, preds, ghist 会被写入到 FTQ 中
       val f3_meta = new FetchPacketMetaInfo
       val f3_preds_info = new FetchPacketPredsInfo
-      // 用于 replay
-      val f2_ghist = new GlobalHistory
-      val f2_tsrc  = UInt(BSRC_SZ.W)
 
       // prediction valid
       // TODO：是否要考虑 clear 信号呢？目前是没考虑的
@@ -277,7 +283,6 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       val f1_next_ghist = new GlobalHistory
       val f2_next_ghist = new GlobalHistory
       val f3_next_ghist = new GlobalHistory
-      val f3_ghist_update_type = UInt(GHR_UPDATE_SZ.W)
 
       // predicted next pc
       val f1_next_pc = UInt(vaddrBitsExtended.W)
@@ -532,8 +537,6 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f2_pred_valid := s2_valid
     io.resp.f2_next_ghist := f2_predicted_ghist
     io.resp.f2_next_pc := f2_predicted_target
-    io.resp.f2_ghist := s2_ghist
-    io.resp.f2_tsrc := s2_tsrc
 
     // f2 重定向 f1
     require(NO_SHIFT_CONST == 0)
@@ -599,12 +602,12 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f3_preds_info.ras_top := f3_preds(0).ras_top
     io.resp.f3_preds_info.ras_idx := f2_ras_top_idx
     io.resp.f3_preds_info.btb_hits := f3_preds.map(p => p.predicted_pc.valid).asUInt
+    io.resp.f3_preds_info.ghist_update_type := f3_ghist_update_type
 
     // 输出 f3 的预测结果
     io.resp.f3_pred_valid := s3_valid
     io.resp.f3_next_ghist := f3_predicted_ghist
     io.resp.f3_next_pc := f3_predicted_target
-    io.resp.f3_ghist_update_type := f3_ghist_update_type
     
     // f3 重定向 f1/f2
     val f3_ghist_all_zero = s3_ghist === (0.U).asTypeOf(new GlobalHistory)
@@ -631,13 +634,12 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // Assertion
     assert (!(s2_valid && RegNext(io.resp.f2_redirect, false.B)), 
     "s2_valid should be false if last cycle redirected")
-    // TODO: 目前前端会忽略 bpd 的 f3 重定向
-    // assert (!(s2_valid && RegNext(io.resp.f2_redirect || io.resp.f3_redirect, false.B)), 
-    // "s2_valid should be false if last cycle redirected")
-    // assert (!(s3_valid && RegNext(io.resp.f3_redirect, false.B)),
-    // "s3_valid should be false if last cycle redirected")
-    // assert (!(s3_valid && RegNext(RegNext(io.resp.f3_redirect, false.B), false.B)),
-    // "s3_valid should be false if redirected two cycles ago")
+    assert (!(s2_valid && RegNext(io.resp.f2_redirect || io.resp.f3_redirect, false.B)), 
+    "s2_valid should be false if last cycle redirected")
+    assert (!(s3_valid && RegNext(io.resp.f3_redirect, false.B)),
+    "s3_valid should be false if last cycle redirected")
+    assert (!(s3_valid && RegNext(RegNext(io.resp.f3_redirect, false.B), false.B)),
+    "s3_valid should be false if redirected two cycles ago")
     when (s3_valid) {
       // 检测 jal/jalr 指令是否正确处理了跳转以及跳转目标
       val f3_is_jal = (0 until fetchWidth) map { i =>

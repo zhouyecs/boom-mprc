@@ -757,6 +757,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // Mispredict requests (to get the correct target)
   io.ifu.get_pc(1).ftq_idx := oldest_mispredict_ftq_idx
+  io.ifu.mispredict_val    := mispredict_val
 
 
   //-------------------------------------------------------------
