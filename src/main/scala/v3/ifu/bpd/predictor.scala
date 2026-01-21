@@ -58,7 +58,15 @@ class FetchPacketPredsInfo(implicit p: Parameters) extends BoomBundle()(p)
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
   // btb 是否命中
   val btb_hits = UInt(fetchWidth.W)
-  val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
+}
+
+class FetchPacketPredTarget(implicit p: Parameters) extends BoomBundle()(p)
+  with HasBoomFrontendParameters
+{
+  val f2_pred_target            = UInt(vaddrBitsExtended.W)
+  val f2_pred_ghist_update_type = UInt(GHR_UPDATE_SZ.W)
+  val f3_pred_target            = UInt(vaddrBitsExtended.W)
+  val f3_pred_ghist_update_type = UInt(GHR_UPDATE_SZ.W)
 }
 
 class FetchPacketMetaInfo(implicit p: Parameters) extends BoomBundle()(p)
@@ -76,7 +84,7 @@ class F3PredsToFTQ(implicit p: Parameters) extends BoomBundle()(p)
 {
   val fetch_info  = new FetchPacketMetaInfo
   val preds_info  = new FetchPacketPredsInfo
-  val pred_target = UInt(vaddrBitsExtended.W)
+  val target_info = new FetchPacketPredTarget
 }
 
 
@@ -92,6 +100,7 @@ class BranchPredBundleWithGHist(implicit p: Parameters) extends BoomBundle()(p)
   val fsrc = UInt(BSRC_SZ.W)
   // 分支预测器的结果，可能来自 f2 预测， f3 预测或 ftq
   val target = UInt(vaddrBitsExtended.W)
+  val ghist_update_type = UInt(GHR_UPDATE_SZ.W)
   // 取该 fetch packet 时的信息，来自 ftq
   val ghist = new GlobalHistory
 }
@@ -272,6 +281,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       // 因为只有 f3 的 meta, preds, ghist 会被写入到 FTQ 中
       val f3_meta = new FetchPacketMetaInfo
       val f3_preds_info = new FetchPacketPredsInfo
+      val f3_preds_target = new FetchPacketPredTarget
 
       // prediction valid
       // TODO：是否要考虑 clear 信号呢？目前是没考虑的
@@ -511,6 +521,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f1_ftq_idx := s1_ftq_idx
 
     // 根据 f2 预测计算新的 ghist 和 next pc
+    val f2_last_pred_target = RegNext(f1_predicted_target)
     val f2_ghist_update_type = RegNext(f1_pred_ghist_update_type)
     val f2_mask = fetchMask(s2_vpc)
     val f2_redirects = (0 until fetchWidth) map { i =>
@@ -543,20 +554,19 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     require(SHIFT_ZERO_CONST == 1)
     val s2_ghist_all_zero = s2_ghist === (0.U).asTypeOf(new GlobalHistory)
     val shift_zero_or_no_shift = f2_pred_ghist_update_type(1) === 0.U && f2_ghist_update_type(1) === 0.U
-    val f2_correct_f1_ghist = !(s2_ghist_all_zero && shift_zero_or_no_shift) &&
+    val f2_correct_ghist = !(s2_ghist_all_zero && shift_zero_or_no_shift) &&
                               f2_pred_ghist_update_type =/= f2_ghist_update_type && enableGHistStallRepair.B
-    val f2_redirect_f1 = f2_correct_f1_ghist || s1_vpc =/= f2_predicted_target
+    val f2_do_redirection = f2_correct_ghist || f2_predicted_target =/= f2_last_pred_target
 
     io.resp.f2_ftq_idx := s2_ftq_idx
     io.resp.f2_redirect := false.B
-    when (s2_valid) {
-      when (!s1_valid || f2_redirect_f1) {
-        io.resp.f2_redirect := true.B
-        s3_fsrc := BSRC_2
-      }
+    when (s2_valid && f2_do_redirection) {
+      io.resp.f2_redirect := true.B
+      s3_fsrc := BSRC_2
     }
 
     // 根据 f3 预测, 结合预译码信息计算新的 ghist 和 next pc
+    val f3_last_pred_target = RegNext(f2_predicted_target)
     val f3_ghist_update_type = RegNext(f2_pred_ghist_update_type)
     val f3_mask = fetchMask(s3_vpc)
     val f3_is_call = f3_preds.map(p => p.is_call && p.predicted_pc.valid)
@@ -602,7 +612,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f3_preds_info.ras_top := f3_preds(0).ras_top
     io.resp.f3_preds_info.ras_idx := f2_ras_top_idx
     io.resp.f3_preds_info.btb_hits := f3_preds.map(p => p.predicted_pc.valid).asUInt
-    io.resp.f3_preds_info.ghist_update_type := f3_ghist_update_type
+    io.resp.f3_preds_target.f2_pred_target := f3_last_pred_target
+    io.resp.f3_preds_target.f2_pred_ghist_update_type := f3_ghist_update_type
+    io.resp.f3_preds_target.f3_pred_target := f3_predicted_target
+    io.resp.f3_preds_target.f3_pred_ghist_update_type := f3_pred_ghist_update_type
+
 
     // 输出 f3 的预测结果
     io.resp.f3_pred_valid := s3_valid
@@ -616,19 +630,12 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
                             f3_pred_ghist_update_type =/= f3_ghist_update_type &&
                             enableGHistStallRepair.B
 
-    val f3_redirect_f2 = f3_correct_ghist || s2_vpc =/= f3_predicted_target
-    val f3_redirect_f1 = f3_correct_ghist || s1_vpc =/= f3_predicted_target
+    val f3_do_redirection = f3_correct_ghist || f3_predicted_target =/= f3_last_pred_target
 
     io.resp.f3_ftq_idx := s3_ftq_idx
     io.resp.f3_redirect := false.B
-    when (s3_valid) {
-      when (s2_valid && f3_redirect_f2) {
-        io.resp.f3_redirect := true.B
-      } .elsewhen (!s2_valid && s1_valid && f3_redirect_f1) {
-        io.resp.f3_redirect := true.B
-      } .elsewhen (!s2_valid && !s1_valid) {
-        io.resp.f3_redirect := true.B
-      }
+    when (s3_valid && f3_do_redirection) {
+      io.resp.f3_redirect := true.B
     }
 
     // Assertion

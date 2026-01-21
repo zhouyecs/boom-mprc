@@ -349,7 +349,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ftq.io.f3_preds_enq.valid            := bpd.io.resp.f3_pred_valid
   ftq.io.f3_preds_enq.bits.preds_info  := bpd.io.resp.f3_preds_info
   ftq.io.f3_preds_enq.bits.fetch_info  := bpd.io.resp.f3_meta
-  ftq.io.f3_preds_enq.bits.pred_target := bpd.io.resp.f3_next_pc
+  ftq.io.f3_preds_enq.bits.target_info := bpd.io.resp.f3_preds_target
   ftq.io.f3_ftq_idx_debug              := bpd.io.resp.f3_ftq_idx
 
   val icache = outer.icache.module
@@ -539,7 +539,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_bpd_resp.io.enq.bits.preds.ras_top := ftq.io.s3_preds_info.ras_top
   f3_bpd_resp.io.enq.bits.preds.ras_idx := ftq.io.s3_preds_info.ras_idx
   f3_bpd_resp.io.enq.bits.preds.btb_hits := ftq.io.s3_preds_info.preds_info.btb_hits
-  f3_bpd_resp.io.enq.bits.preds.ghist_update_type := ftq.io.s3_preds_info.preds_info.ghist_update_type
+  f3_bpd_resp.io.enq.bits.ghist_update_type := ftq.io.s3_preds_info.preds_info.ghist_update_type
   f3_bpd_resp.io.enq.bits.meta  := DontCare
   f3_bpd_resp.io.enq.bits.ghist := ftq.io.s3_preds_info.ghist
   f3_bpd_resp.io.enq.bits.fsrc := ftq.io.s3_preds_info.preds_info.fsrc
@@ -836,14 +836,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val f3_ghist_all_zero = f3_fetch_bundle.ghist === (0.U).asTypeOf(new GlobalHistory)
   val shift_zero_or_no_shift_f3 = f3_pred_ghist_update_type(1) === 0.U &&
-                                  f3_bpd_resp.io.deq.bits.preds.ghist_update_type(1) === 0.U
+                                  f3_bpd_resp.io.deq.bits.ghist_update_type(1) === 0.U
   val f3_correct_ghist = !(f3_ghist_all_zero && shift_zero_or_no_shift_f3) &&
-                          f3_pred_ghist_update_type =/= f3_bpd_resp.io.deq.bits.preds.ghist_update_type &&
+                          f3_pred_ghist_update_type =/= f3_bpd_resp.io.deq.bits.ghist_update_type &&
                           enableGHistStallRepair.B
   val f3_correct_target = f3_predicted_target =/= f3_bpd_resp.io.deq.bits.target
   val itlb_exception = f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if
 
-  when (f3.io.deq.valid && f4_ready) {
+  val f3_bp_check_happened = RegInit(false.B)
+
+  when (f3.io.deq.valid && !f3_bp_check_happened) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
       // 预译码检测到 call 指令时，ras top idx 更新和 ras top 内容更新同时发生 
       bpd.io.predecode_ras_update_valid := true.B
@@ -854,13 +856,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       bpd.io.predecode_ras_top_update_valid := true.B 
       bpd.io.predecode_ras_top_update_idx := WrapDec(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
     }
-    when (f3_redirects.reduce(_||_)) {
-      f3_prev_is_half := false.B
-    }
     when (f3_correct_ghist || f3_correct_target || itlb_exception) {
       predecode_redirect   := true.B
       f3_fetch_bundle.fsrc := BSRC_3
     }
+    f3_bp_check_happened := true.B
+  }
+
+  when (f3.io.deq.valid && f4_ready) {
+    when (f3_redirects.reduce(_||_)) {
+      f3_prev_is_half := false.B
+    }
+  }
+
+  when (f3.io.enq.valid && f3_ready) {
+    f3_bp_check_happened := false.B
   }
 
   ftq.io.predecode_redirect.valid := predecode_redirect
@@ -1010,8 +1020,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   //////////////////////////////////////
 
   // TODO: s0 和 s1 寄存器可以合并吗
-  bpd_f3_real_redirect := bpd.io.resp.f3_redirect &&
-                          (!predecode_redirect || bpd.io.resp.f3_ftq_idx =/= f3_fetch_bundle.ftq_idx)
+  val predecode_suppress_f3_redirect = f3.io.deq.valid && bpd.io.resp.f3_ftq_idx === f3_fetch_bundle.ftq_idx
+  bpd_f3_real_redirect := bpd.io.resp.f3_redirect && !predecode_suppress_f3_redirect
 
   when (bpd.io.resp.f1_pred_valid) {
     s0_bpd_valid   := true.B

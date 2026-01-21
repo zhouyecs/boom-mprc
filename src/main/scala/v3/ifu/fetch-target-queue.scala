@@ -234,7 +234,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_preds_info.btb_hits    := io.f3_preds_enq.bits.preds_info.btb_hits
     new_preds_info.tsrc        := io.f3_preds_enq.bits.fetch_info.tsrc
     new_preds_info.fsrc        := io.f3_preds_enq.bits.fetch_info.fsrc
-    new_preds_info.ghist_update_type := io.f3_preds_enq.bits.preds_info.ghist_update_type
+    new_preds_info.ghist_update_type := io.f3_preds_enq.bits.target_info.f3_pred_ghist_update_type
 
     preds_info.write(f3_pred_enq_ptr.value, new_preds_info)
     meta.write(f3_pred_enq_ptr.value, io.f3_preds_enq.bits.fetch_info.meta)
@@ -246,7 +246,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     last_f3_enq_ras_idx := io.f3_preds_enq.bits.preds_info.ras_idx
     last_f3_enq_ras_top := io.f3_preds_enq.bits.preds_info.ras_top
     last_f3_enq_preds_info := new_preds_info
-    last_f3_enq_target     := io.f3_preds_enq.bits.pred_target
+    last_f3_enq_target     := io.f3_preds_enq.bits.target_info.f3_pred_target
 
     // TODO: FTQ bundle 的 ras idx 和 ras top 字段会被 f3 preds 和 predecode 都写入，
     // 是否需要把这俩字段单独分离出来？
@@ -265,13 +265,18 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val s3_bypass         = RegNext((io.s2_ftq_idx + (!do_f3_preds_enq)) === f3_pred_enq_ptr)
   val s3_ghist          = ghist(2).read(io.s2_ftq_idx.value, true.B)
   val s3_mem_preds_info = preds_info.read(io.s2_ftq_idx.value, true.B)
+  // TODO: 梳理一下 pred target 的逻辑，连一下 frontend 那边的线
+  // 然后处理 f3 不马上 fire，导致 pred target 发生变化的问题
   when (do_f3_preds_enq && s3_ftq_idx === f3_pred_enq_ptr) {
     io.s3_preds_info.ghist       := io.f3_preds_enq.bits.fetch_info.ghist
     io.s3_preds_info.ras_idx     := io.f3_preds_enq.bits.preds_info.ras_idx
     io.s3_preds_info.ras_top     := io.f3_preds_enq.bits.preds_info.ras_top
     io.s3_preds_info.pc_debug    := io.f3_preds_enq.bits.fetch_info.pc
     io.s3_preds_info.preds_info  := new_preds_info
-    io.s3_preds_info.pred_target := io.f3_preds_enq.bits.pred_target
+    // 如果预译码阶段和 f3 阶段预测的是同一个 fetch packet，那么预译码阶段实际应该
+    // 重定向 f2 预测
+    io.s3_preds_info.pred_target := io.f3_preds_enq.bits.target_info.f2_pred_target
+    io.s3_preds_info.preds_info.ghist_update_type := io.f3_preds_enq.bits.target_info.f2_pred_ghist_update_type
   } .elsewhen(s3_bypass) {
     io.s3_preds_info.ghist       := last_f3_enq_ghist
     io.s3_preds_info.ras_idx     := last_f3_enq_ras_idx
@@ -541,6 +546,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         p"enq_br_mask=${Binary(io.predecode_enq.bits.br_mask)}, " +
         p"enq_ghist=${Binary(io.predecode_enq.bits.ghist.histories(0))}\n")
     }
+    val bpd_ahead_printf = PlusArg("bpd-ahead-printf", 0, "Print FTQ bpd ahead of predecode", 1)
+    when (do_f3_preds_enq && bpd_ahead_printf(0)) {
+      val distance = distanceBetween(f3_pred_enq_ptr, next_predecode_enq_ptr_debug)
+      printf(p"[${cycleCount} FTQ] f3_pred_enq_ptr=${f3_pred_enq_ptr}, " +
+        p"predecode_enq_ptr=${next_predecode_enq_ptr_debug}, " +
+        p"distance=${distance}\n")
+    }
   }
 
   // Assertion
@@ -608,5 +620,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   when (io.f3_preds_enq.valid) {
     assert (f3_pred_enq_ptr === io.f3_ftq_idx_debug,
       "FTQ: f3_pred_enq_ptr should always equal f3 preds ftq idx")
+    when (io.predecode_enq.valid) {
+      assert (f3_pred_enq_ptr > predecode_enq_ptr,
+        "FTQ: f3_pred enqueue should always be ahead of predecode enqqueue" )
+      assert (isFull(f3_pred_enq_ptr, predecode_enq_ptr) === false.B,
+        "FTQ: f3_pred enqueue should never pass predecode enqueue" )
+    }
   }
+  assert (f3_pred_enq_ptr >= next_predecode_enq_ptr_debug,
+    "FTQ: f3_pred_enq_ptr should always be ahead of predecode_enq_ptr")
 }
