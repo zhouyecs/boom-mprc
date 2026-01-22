@@ -720,7 +720,7 @@ class BranchDecode(implicit p: Parameters) extends BoomModule
   // call/ret 稍微有些出入。RISC-V 手册中允许 rs1 和 rd 都是 x1 或
   // x5 来表达又是 call 又是 ret 的情况，但这种 case 处理起来会有些麻烦
   io.out.is_call := (cs_is_jal || cs_is_jalr) && GetRd(io.inst) === BitPat("b00?01")
-  io.out.is_ret  := cs_is_jalr && GetRs1(io.inst) === BitPat("b00?01") && !io.out.is_call
+  io.out.is_ret  := cs_is_jalr && GetRs1(io.inst) === BitPat("b00?01") && GetRd(io.inst) =/= GetRs1(io.inst)
 
   io.out.target := Mux(cs_is_br, ComputeBranchTarget(io.pc, io.inst, xLen),
                                  ComputeJALTarget(io.pc, io.inst, xLen))
