@@ -66,6 +66,9 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   // btb 将非分支指令或者非指令预测为了分支指令
   val btb_mispredicts = UInt(fetchWidth.W)
 
+  // fetch packet 的来源
+  val ft_tsrc = UInt(BSRC_SZ.W)
+
   // Which bank did this start from?
   val start_bank = UInt(1.W)
 
@@ -174,6 +177,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val redirect_ftq_idx = Output(new FTQPtr())
     // ROB tells us the youngest committed ftq_idx to remove from FTQ.
     val deq = Flipped(Valid(UInt(idx_sz.W)))
+    // 用于 event counter 统计
+    val ft_tsrc = Valid(UInt(BSRC_SZ.W))
 
     // Give PC info to BranchUnit.
     val get_ftq_pc = Vec(2, new GetPCFromFtqIO())
@@ -328,6 +333,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.ras_idx       := io.predecode_enq.bits.ghist.ras_idx
     new_entry.br_mask       := io.predecode_enq.bits.br_mask
     new_entry.btb_mispredicts := io.predecode_enq.bits.btb_mispredicts
+    new_entry.ft_tsrc       := io.predecode_enq.bits.tsrc
     new_entry.start_bank    := bank(io.predecode_enq.bits.pc)
 
     val new_ghist = io.predecode_enq.bits.ghist
@@ -394,6 +400,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   val done_commit_update_debug = RegInit(false.B)
 
+  io.ft_tsrc.valid := false.B
+  io.ft_tsrc.bits  := DontCare
   when (RegNext(do_commit_update)) {
     val cfi_idx = bpd_entry.cfi_idx.bits
 
@@ -414,6 +422,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.meta       := bpd_meta
     io.bpdupdate.bits.cfi_is_call  := bpd_entry.cfi_is_call
     io.bpdupdate.bits.cfi_is_ret   := bpd_entry.cfi_is_ret
+
+    io.ft_tsrc.valid := true.B
+    io.ft_tsrc.bits  := bpd_entry.ft_tsrc
 
     done_commit_update_debug := RegNext(do_commit_update) || done_commit_update_debug
   }

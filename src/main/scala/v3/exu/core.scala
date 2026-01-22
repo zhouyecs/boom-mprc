@@ -473,11 +473,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val com_misp_jalr = Wire(Vec(coreWidth, Bool()))
   val com_misp_ret  = Wire(Vec(coreWidth, Bool()))
 
-  // 统计 commit 指令中前端各级分支预测的贡献
-  val com_is_bsrc1 = Wire(Vec(coreWidth, Bool())) // committed inst from f1 prediction
-  val com_is_bsrc2 = Wire(Vec(coreWidth, Bool())) // committed inst from f2 prediction
-  val com_is_bsrc3 = Wire(Vec(coreWidth, Bool())) // committed inst from f3 prediction
-  val com_is_bsrcc = Wire(Vec(coreWidth, Bool())) // committed inst from backend correction
+  // 统计提交的 fetch packet 造成的流水线气泡数目
+  val com_ft_bsrc1 = io.ifu.ft_tsrc.valid && io.ifu.ft_tsrc.bits === BSRC_1
+  val com_ft_bsrc2 = io.ifu.ft_tsrc.valid && io.ifu.ft_tsrc.bits === BSRC_2
+  val com_ft_bsrc3 = io.ifu.ft_tsrc.valid && io.ifu.ft_tsrc.bits === BSRC_3
+  val com_ft_bsrcc = io.ifu.ft_tsrc.valid && io.ifu.ft_tsrc.bits === BSRC_C
 
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
@@ -498,11 +498,6 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_misp_jalr(w)  := com_is_jalr(w) && uop.debug_fsrc === BSRC_C 
     com_misp_ret(w)   := com_is_ret(w)  && uop.debug_fsrc === BSRC_C 
     // jal 在至多在 f3 阶段就能确定跳转目标
-
-    com_is_bsrc1(w) := valid && (uop.debug_tsrc === BSRC_1)
-    com_is_bsrc2(w) := valid && (uop.debug_tsrc === BSRC_2)
-    com_is_bsrc3(w) := valid && (uop.debug_tsrc === BSRC_3)
-    com_is_bsrcc(w) := valid && (uop.debug_tsrc === BSRC_C)
   }
 
   when (startCounter) {
@@ -527,10 +522,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(14) :=  PopCount(com_misp_jalr.asUInt)   //committed misp jalr number
     event_counters.io.event_signals(15) :=  PopCount(com_misp_ret.asUInt)     //committed misp jalr-ret number
 
-    event_counters.io.event_signals(16) :=  PopCount(com_is_bsrc1.asUInt) // committed inst from f1 prediction
-    event_counters.io.event_signals(17) :=  PopCount(com_is_bsrc2.asUInt) // committed inst from f2 prediction
-    event_counters.io.event_signals(18) :=  PopCount(com_is_bsrc3.asUInt) // committed inst from f3 prediction
-    event_counters.io.event_signals(19) :=  PopCount(com_is_bsrcc.asUInt) // committed inst from backend correction
+    event_counters.io.event_signals(16) :=  com_ft_bsrc1 // committed fetch packet from f1 prediction/no bubble
+    event_counters.io.event_signals(17) :=  com_ft_bsrc2 // committed fetch packet from f2 prediction/one bubble 
+    event_counters.io.event_signals(18) :=  com_ft_bsrc3 // committed fetch packet from f3 prediction/two bubbles
+    event_counters.io.event_signals(19) :=  com_ft_bsrcc // committed fetch packet from backend correction/many bubbles
   }
 
   //-------------------------------------------------------------
