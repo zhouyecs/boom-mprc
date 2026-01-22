@@ -265,8 +265,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val s3_bypass         = RegNext((io.s2_ftq_idx + (!do_f3_preds_enq)) === f3_pred_enq_ptr)
   val s3_ghist          = ghist(2).read(io.s2_ftq_idx.value, true.B)
   val s3_mem_preds_info = preds_info.read(io.s2_ftq_idx.value, true.B)
-  // TODO: 梳理一下 pred target 的逻辑，连一下 frontend 那边的线
-  // 然后处理 f3 不马上 fire，导致 pred target 发生变化的问题
+  // 如果要读的 preds info 在同一周期送过来
   when (do_f3_preds_enq && s3_ftq_idx === f3_pred_enq_ptr) {
     io.s3_preds_info.ghist       := io.f3_preds_enq.bits.fetch_info.ghist
     io.s3_preds_info.ras_idx     := io.f3_preds_enq.bits.preds_info.ras_idx
@@ -277,6 +276,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // 重定向 f2 预测
     io.s3_preds_info.pred_target := io.f3_preds_enq.bits.target_info.f2_pred_target
     io.s3_preds_info.preds_info.ghist_update_type := io.f3_preds_enq.bits.target_info.f2_pred_ghist_update_type
+  // 如果要读的 preds info 是上一个写入的
   } .elsewhen(s3_bypass) {
     io.s3_preds_info.ghist       := last_f3_enq_ghist
     io.s3_preds_info.ras_idx     := last_f3_enq_ras_idx
@@ -284,13 +284,19 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.s3_preds_info.pc_debug    := pcs(s3_ftq_idx.value)
     io.s3_preds_info.preds_info  := last_f3_enq_preds_info
     io.s3_preds_info.pred_target := last_f3_enq_target
+  // 如果要读的 preds info 写入了，并且它之后还有新的 preds info 写入
   } .otherwise {
     io.s3_preds_info.ghist       := s3_ghist
     io.s3_preds_info.ras_idx     := RegNext(ram(io.s2_ftq_idx.value).ras_idx)
     io.s3_preds_info.ras_top     := RegNext(ram(io.s2_ftq_idx.value).ras_top)
     io.s3_preds_info.pc_debug    := pcs(s3_ftq_idx.value)
     io.s3_preds_info.preds_info  := s3_mem_preds_info
-    io.s3_preds_info.pred_target := RegNext(pcs((io.s2_ftq_idx + 1.U).value))
+    // target pc 还需要一个额外的 bypass，因为要获取 target 是在 ftq_idx + 1，
+    // 它可能恰好在 s2 周期才写入
+    val target_bypass = io.s2_ftq_idx + 1.U === f3_pred_enq_ptr && do_f3_preds_enq
+    io.s3_preds_info.pred_target := RegNext(Mux(target_bypass,
+                                    io.f3_preds_enq.bits.fetch_info.pc,
+                                    pcs((io.s2_ftq_idx + 1.U).value)))
   }
 
   // predecode 重定向
@@ -306,8 +312,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val prev_entry = RegInit((0.U).asTypeOf(new FTQBundle))
   val prev_pc    = RegInit(0.U(vaddrBitsExtended.W))
   when (do_predecode_enq) {
-
-    pcs(predecode_enq_ptr.value)           := io.predecode_enq.bits.pc
 
     val new_entry = Wire(new FTQBundle)
 

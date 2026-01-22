@@ -242,7 +242,8 @@ class WithSimBooms(n: Int = 1) extends Config(
               ftq = FtqParameters(nEntries=32),
               nPerfCounters = 6,
               fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
-              inSimulation = true
+              inSimulation = true,
+              enableBranchPrediction = true
             ),
             dcache = Some(
               DCacheParams(rowBits = 64, nSets=64, nWays=4, nMSHRs=2, nTLBWays=8)
