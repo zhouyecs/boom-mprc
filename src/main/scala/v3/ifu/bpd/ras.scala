@@ -42,6 +42,17 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     ras(io.write_idx) := io.write_addr
   }
 
+  val ras_printf = PlusArg("ras-content", 0, "Print All RAS Content", 1)
+
+  if (IN_SIMULATION) {
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+    when (ras_printf(0)) {
+      printf(p"[${cycleCount} RAS] Content:\n")
+      for (i <- 0 until nRasEntries) {
+        printf(p"  Entry $i: addr=0x${Hexadecimal(ras(i))}\n")
+      }
+    }
+  }
 
 }
 
