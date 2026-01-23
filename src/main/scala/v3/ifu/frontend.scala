@@ -1176,7 +1176,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // TODO: 设置为 true 就行了？因为 s3 预译码检测到异常会 flush 的
     s0_valid     := !f3_enq_fire
     s0_ifu_vpc   := s2_vpc
-    s0_ftq_idx   := s2_ftq_idx
+    s0_ftq_idx   := Mux(f3_enq_fire, s2_ftq_idx + 1.U, s2_ftq_idx)
     s0_is_replay := icache.io.resp.valid
     s0_ifu_tsrc  := s2_ifu_tsrc
   }
