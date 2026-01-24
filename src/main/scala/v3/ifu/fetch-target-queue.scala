@@ -644,4 +644,58 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
   assert (f3_pred_enq_ptr >= next_predecode_enq_ptr_debug,
     "FTQ: f3_pred_enq_ptr should always be ahead of predecode_enq_ptr")
+  
+  if (IN_SIMULATION) {
+    // Track which FTQ entries are valid (for assertions only).
+    val ftq_entry_valid = RegInit(VecInit(Seq.fill(num_entries)(false.B)))
+
+    // 1) predecode_enq: allocated entry must be invalid, then becomes valid.
+    when (do_predecode_enq) {
+      assert (!ftq_entry_valid(predecode_enq_ptr.value),
+        "FTQ: predecode enqueue should allocate an invalid entry")
+      ftq_entry_valid(predecode_enq_ptr.value) := true.B
+    }
+
+    // 2) redirect: redirect entry must be valid; clear (redirect.bits, last_enq) on the ring.
+    when (io.redirect.valid) {
+      val redirect_idx = io.redirect.bits
+      val last_enq_idx = next_predecode_enq_ptr_debug.value
+
+      assert (ftq_entry_valid(redirect_idx),
+        "FTQ: redirect should point to a valid FTQ entry")
+
+      for (i <- 0 until num_entries) {
+        val idx = i.U
+        val in_range = Mux(last_enq_idx > redirect_idx,
+          idx > redirect_idx && idx < last_enq_idx,
+          idx > redirect_idx || idx < last_enq_idx)
+        when (in_range) {
+          assert (ftq_entry_valid(i), "FTQ: the entry will be flushed should be valid")
+          ftq_entry_valid(i) := false.B
+        }
+        when (idx === last_enq_idx && do_predecode_enq) {
+          ftq_entry_valid(i) := false.B
+        }
+      }
+    }
+
+    // 3) s3_preds_info: the FTQ entry being read should not have been allocated yet.
+    when (do_f3_preds_enq) {
+      assert (!ftq_entry_valid(f3_pred_enq_ptr.value),
+        "FTQ: s3 preds info should read an unallocated FTQ entry")
+    }
+
+    // 4) commit: entry being committed must be valid, then becomes invalid.
+    when (do_commit_update) {
+      val commit_idx = bpd_commit_ptr.value
+      assert (ftq_entry_valid(commit_idx),
+        "FTQ: commit update should operate on a valid FTQ entry")
+      val commit_target_idx = WrapInc(commit_idx, num_entries)
+      assert (ftq_entry_valid(commit_target_idx),
+        "FTQ: next entry for commit update should be valid to ensure the target is valid")
+      ftq_entry_valid(commit_idx) := false.B
+    }
+  }
+
+  // TODO: 引入 valid 位检查一下 get_pc 相关的 ftq idx 是否正确
 }

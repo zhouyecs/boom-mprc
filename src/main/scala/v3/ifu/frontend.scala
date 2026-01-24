@@ -1307,6 +1307,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       "s2 should not be cleared by both f3 redirect and s2 replay" )
   }
   // 断言 bpd 和 ifu 的相对进度
+  when (bpd.io.resp.f1_pred_valid) {
+    assert (bpd.io.resp.f1_ftq_idx + 1.U === s0_ifu_ftq_idx_reg ||
+            bpd.io.resp.f1_ftq_idx >= s0_ifu_ftq_idx_reg)
+  }
+  when (bpd.io.resp.f2_pred_valid) {
+    assert (bpd.io.resp.f2_ftq_idx + 1.U === s0_ifu_ftq_idx_reg ||
+            bpd.io.resp.f2_ftq_idx + 2.U === s0_ifu_ftq_idx_reg ||
+            bpd.io.resp.f2_ftq_idx >= s0_ifu_ftq_idx_reg)
+  }
+  when (bpd.io.resp.f3_pred_valid) {
+    assert (bpd.io.resp.f3_ftq_idx + 1.U === s0_ifu_ftq_idx_reg ||
+            bpd.io.resp.f3_ftq_idx + 2.U === s0_ifu_ftq_idx_reg ||
+            bpd.io.resp.f3_ftq_idx + 3.U === s0_ifu_ftq_idx_reg ||
+            bpd.io.resp.f3_ftq_idx >= s0_ifu_ftq_idx_reg)
+  }
   when (s1_valid) {
     when (bpd.io.resp.f1_pred_valid) {
       assert (s1_ftq_idx <= bpd.io.resp.f1_ftq_idx,
