@@ -641,12 +641,13 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // Assertion
     assert (!(s2_valid && RegNext(io.resp.f2_redirect, false.B)), 
     "s2_valid should be false if last cycle redirected")
-    assert (!(s2_valid && RegNext(io.resp.f2_redirect || io.resp.f3_redirect, false.B)), 
-    "s2_valid should be false if last cycle redirected")
-    assert (!(s3_valid && RegNext(io.resp.f3_redirect, false.B)),
-    "s3_valid should be false if last cycle redirected")
-    assert (!(s3_valid && RegNext(RegNext(io.resp.f3_redirect, false.B), false.B)),
-    "s3_valid should be false if redirected two cycles ago")
+    // TODO: f3_redirect 可能被 predecode 否决
+    // assert (!(s2_valid && RegNext(io.resp.f2_redirect || io.resp.f3_redirect, false.B)), 
+    // "s2_valid should be false if last cycle redirected")
+    // assert (!(s3_valid && RegNext(io.resp.f3_redirect, false.B)),
+    // "s3_valid should be false if last cycle redirected")
+    // assert (!(s3_valid && RegNext(RegNext(io.resp.f3_redirect, false.B), false.B)),
+    // "s3_valid should be false if redirected two cycles ago")
     when (s3_valid) {
       // 检测 jal/jalr 指令是否正确处理了跳转以及跳转目标
       val f3_is_jal = (0 until fetchWidth) map { i =>

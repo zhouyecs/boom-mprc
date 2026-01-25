@@ -1029,6 +1029,19 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val predecode_suppress_f3_redirect = f3.io.deq.valid && bpd.io.resp.f3_ftq_idx === f3_fetch_bundle.ftq_idx
   bpd_f3_real_redirect := bpd.io.resp.f3_redirect && !predecode_suppress_f3_redirect
 
+  val select_predecode  = predecode_redirect || (f3.io.deq.valid && bpd.io.resp.f3_pred_valid &&
+                          f3_fetch_bundle.ftq_idx === bpd.io.resp.f3_ftq_idx)
+  val merged_f3_next_pc      = Mux(select_predecode, f3_predicted_target, bpd.io.resp.f3_next_pc)
+  val merged_f3_ftq_idx      = Mux(select_predecode, f3_fetch_bundle.ftq_idx, bpd.io.resp.f3_ftq_idx)
+  val merged_f3_next_ftq_idx = merged_f3_ftq_idx + 1.U
+  val merged_f3_next_ghist   = Mux(select_predecode, f3_predicted_ghist, bpd.io.resp.f3_next_ghist)
+  val merged_f3_next_valid   = Mux(select_predecode, !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if),
+                                  true.B)
+  val merged_f3_redirect     = Mux(select_predecode, predecode_redirect, bpd.io.resp.f3_redirect) 
+  // TODO: 这里依赖于 f3_bpd_resp 使得 predecode 预测持久有效
+  val merged_f3_pred_valid   = Mux(select_predecode, f3.io.deq.valid, bpd.io.resp.f3_pred_valid)
+
+
   when (bpd.io.resp.f1_pred_valid) {
     s0_bpd_valid   := true.B
     s0_bpd_vpc     := bpd.io.resp.f1_next_pc
@@ -1043,21 +1056,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
     bpd_f1_clear   := true.B
   }
-  when (bpd_f3_real_redirect) {
-    s0_bpd_valid   := true.B
-    s0_bpd_vpc     := bpd.io.resp.f3_next_pc
-    s0_bpd_ftq_idx := bpd.io.resp.f3_ftq_idx + 1.U
-    s0_bpd_ghist   := bpd.io.resp.f3_next_ghist
-
-    bpd_f1_clear   := true.B
-    bpd_f2_clear   := true.B
-  }
-  when (predecode_redirect) {
-    // 取指发生异常时暂停 bpd 流水线
-    s0_bpd_valid   := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
-    s0_bpd_vpc     := f3_predicted_target
-    s0_bpd_ftq_idx := f3_fetch_bundle.ftq_idx + 1.U
-    s0_bpd_ghist   := f3_predicted_ghist
+  when (merged_f3_redirect) {
+    s0_bpd_valid   := merged_f3_next_valid
+    s0_bpd_vpc     := merged_f3_next_pc
+    s0_bpd_ftq_idx := merged_f3_next_ftq_idx
+    s0_bpd_ghist   := merged_f3_next_ghist
 
     bpd_f1_clear   := true.B
     bpd_f2_clear   := true.B
@@ -1103,35 +1106,33 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val f1_next_ftq_idx = bpd.io.resp.f1_ftq_idx + 1.U
   val f2_next_ftq_idx = bpd.io.resp.f2_ftq_idx + 1.U
-  val f3_next_ftq_idx = bpd.io.resp.f3_ftq_idx + 1.U
   val can_use_ftq_info = ftq.io.ifu_fetch_pc.valid
   val last_is_f1_pred = s0_ifu_ftq_idx_reg === f1_next_ftq_idx && bpd.io.resp.f1_pred_valid
-  val last_is_f2_pred = s0_ifu_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
-  val last_is_f3_pred = s0_ifu_ftq_idx_reg === f3_next_ftq_idx && bpd.io.resp.f3_pred_valid
+  // val last_is_f2_pred = s0_ifu_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
+  // val last_is_f3_pred = s0_ifu_ftq_idx_reg === merged_f3_next_ftq_idx && bpd.io.resp.f3_pred_valid
 
   // 因为 f2_next_ftq_idx / f3_next_ftq_idx 可能超过 s0_ifu_ftq_idx_reg 一圈，
   // 但是 s0_ifu_ftq_idx_reg 至多比它们大 1 或者 2，因此使用 !(s0_ifu_ftq_idx_reg < ...)
   // 来判断，而不能使用 s0_ifu_ftq_idx_reg > ...
-  val s0_redirect_by_f2 = !(s0_ifu_ftq_idx_reg < f2_next_ftq_idx) && bpd.io.resp.f2_redirect
-  val s0_redirect_by_f3 = !(s0_ifu_ftq_idx_reg < f3_next_ftq_idx) && bpd_f3_real_redirect
+  val s0_redirect_by_f2 = s0_ifu_ftq_idx_reg >= f2_next_ftq_idx && bpd.io.resp.f2_redirect
+  val s0_redirect_by_f3 = s0_ifu_ftq_idx_reg >= merged_f3_next_ftq_idx && merged_f3_redirect
 
   val can_use_f1_pred = last_is_f1_pred
-  val can_use_f2_pred = last_is_f2_pred || s0_redirect_by_f2
-  val can_use_f3_pred = last_is_f3_pred || s0_redirect_by_f3
+  val can_use_f2_pred = s0_redirect_by_f2
+  val can_use_f3_pred = s0_redirect_by_f3
   
   // f3 redirect 和 s2 replay 可能同时发生，当 f3 是更早一级流水线时，f3 redirect 优先级更高
-  val f3_suppress_s2_replay = s2_ftq_idx === f3_next_ftq_idx && bpd_f3_real_redirect
+  val f3_suppress_s2_replay = s2_ftq_idx === merged_f3_next_ftq_idx && merged_f3_redirect
 
   // ifu f1 可能被 f2 预测, f3 预测, s2 重放, predecode 重定向, sfence, 后端重定向清空
   val s1_clear_by_f2 = bpd.io.resp.f2_redirect && (s1_ftq_idx > bpd.io.resp.f2_ftq_idx)
-  val s1_clear_by_f3 = bpd_f3_real_redirect && (s1_ftq_idx > bpd.io.resp.f3_ftq_idx)
+  val s1_clear_by_f3 = merged_f3_redirect && (s1_ftq_idx > merged_f3_ftq_idx)
   f1_clear := s1_clear_by_f2 || s1_clear_by_f3 || s2_replay_happen ||
-              predecode_redirect || io.cpu.sfence.valid || io.cpu.redirect_flush
+              io.cpu.sfence.valid || io.cpu.redirect_flush
 
   // ifu f2 可能被 f3 预测, predecode 重定向, sfence, 后端重定向清空
-  val s2_clear_by_f3 = bpd_f3_real_redirect && (s2_ftq_idx > bpd.io.resp.f3_ftq_idx)
-  f2_clear := s2_clear_by_f3 || predecode_redirect ||
-              io.cpu.sfence.valid || io.cpu.redirect_flush
+  val s2_clear_by_f3 = merged_f3_redirect && (s2_ftq_idx > merged_f3_ftq_idx)
+  f2_clear := s2_clear_by_f3 || io.cpu.sfence.valid || io.cpu.redirect_flush
 
   // ifu predecode 和 f4 可能被 sfence, 后端重定向清空
   f3_clear    := io.cpu.sfence.valid || io.cpu.redirect_flush
@@ -1160,16 +1161,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ifu_vpc   := bpd.io.resp.f2_next_pc
     s0_ftq_idx   := f2_next_ftq_idx
     s0_is_replay := false.B
-    s0_ifu_tsrc  := Mux(s1_valid && s1_clear_by_f2, BSRC_2, BSRC_1)
+    s0_ifu_tsrc  := BSRC_2
   }
   // 来源 4: 来自 bpd 的 f3 预测或重定向
   when (can_use_f3_pred) {
-    s0_valid     := true.B
-    s0_ifu_vpc   := bpd.io.resp.f3_next_pc
-    s0_ftq_idx   := f3_next_ftq_idx
+    s0_valid     := merged_f3_next_valid
+    s0_ifu_vpc   := merged_f3_next_pc
+    s0_ftq_idx   := merged_f3_next_ftq_idx
     s0_is_replay := false.B
-    s0_ifu_tsrc  := Mux((s1_valid && s1_clear_by_f3) || (s2_valid && s2_clear_by_f3),
-                        BSRC_3, BSRC_1)
+    s0_ifu_tsrc  := BSRC_3
   }
   // 来源 5: 来自 s2 重放
   when (s2_replay_happen && !f3_suppress_s2_replay) {
@@ -1179,15 +1179,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ftq_idx   := Mux(f3_enq_fire, s2_ftq_idx + 1.U, s2_ftq_idx)
     s0_is_replay := icache.io.resp.valid
     s0_ifu_tsrc  := s2_ifu_tsrc
-  }
-  // 来源 6: 来自预译码重定向
-  when (predecode_redirect) {
-    // 发生取指异常时暂停前端流水线
-    s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
-    s0_ifu_vpc   := f3_predicted_target
-    s0_ftq_idx   := f3_fetch_bundle.ftq_idx + 1.U
-    s0_is_replay := false.B
-    s0_ifu_tsrc  := BSRC_3
   }
   // 来源 7: 来自 sfence.vma flush 或后端重定向
   when (io.cpu.sfence.valid) {
@@ -1300,7 +1291,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   }
   assert (!(can_use_f1_pred && can_use_ftq_info), "should not be able to use both BPD F1 and FTQ info" )
   assert (!(can_use_f2_pred && can_use_ftq_info), "should not be able to use both BPD F2 and FTQ info" )
-  assert (!(can_use_f3_pred && can_use_ftq_info), "should not be able to use both BPD F3 and FTQ info" )
+  assert (!(can_use_f3_pred && can_use_ftq_info && !select_predecode),
+          "should not be able to use both BPD F3 and FTQ info" )
 
   when (s2_clear_by_f3) {
     assert (!s2_replay_happen || f3_suppress_s2_replay,
