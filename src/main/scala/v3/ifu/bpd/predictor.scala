@@ -9,7 +9,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 
 import boom.v3.common._
-import boom.v3.util.{BoomCoreStringPrefix}
+import boom.v3.util.{BoomCoreStringPrefix, WrapInc, WrapDec}
 
 
 
@@ -357,6 +357,16 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 
   // RAS 相关
+  val f3_ras_top_update_valid = WireDefault(false.B)
+  val f3_ras_top_update_idx = Wire(UInt(log2Ceil(nRasEntries).W))
+  val f3_ras_update_valid = WireDefault(false.B)
+  val f3_ras_update_idx = Wire(UInt(log2Ceil(nRasEntries).W))
+  val f3_ras_update_addr = Wire(UInt(vaddrBitsExtended.W))
+
+  f3_ras_top_update_idx := DontCare
+  f3_ras_update_idx := DontCare
+  f3_ras_update_addr := DontCare
+
   // 会不会改为 f3_ras_top_idx 更合适一些？
   val f2_ras_top_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
   val f2_ras_top_idx_write = WireDefault(f2_ras_top_idx)
@@ -368,6 +378,9 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   // 其次是预译码修改
   } .elsewhen (io.predecode_ras_top_update_valid) {
     f2_ras_top_idx_write := io.predecode_ras_top_update_idx
+  // 最后是 f3 预测修改
+  } .elsewhen (f3_ras_top_update_valid) {
+    f2_ras_top_idx_write := f3_ras_top_update_idx
   }
 
   val ras_write_valid = WireDefault(false.B)
@@ -385,8 +398,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     ras_write_valid := true.B
     ras_write_idx   := io.predecode_ras_update_idx
     ras_write_addr  := io.predecode_ras_update_addr
+  } .elsewhen (f3_ras_update_valid) {
+    ras_write_valid := true.B
+    ras_write_idx   := f3_ras_update_idx
+    ras_write_addr  := f3_ras_update_addr
   }
-  // TODO: 加上 f3 对 ras 的修改逻辑
 
   if (nBanks == 1) {
     banked_lhist_providers(0).io.f0_valid := io.f0_req.valid
@@ -640,6 +656,24 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     io.resp.f3_redirect := false.B
     when (s3_valid && f3_do_redirection) {
       io.resp.f3_redirect := true.B
+    }
+
+    // f3 RAS 更新
+    when (s3_valid && f3_do_redirect) {
+      when (f3_is_ret(f3_redirect_idx)) {
+        // ret 指令，pop RAS
+        f3_ras_top_update_valid := true.B
+        f3_ras_top_update_idx := WrapDec(f2_ras_top_idx, nRasEntries)
+      } .elsewhen (f3_is_call(f3_redirect_idx)) {
+        // call 指令，push RAS
+        f3_ras_update_valid := true.B
+        f3_ras_update_idx := WrapInc(f2_ras_top_idx, nRasEntries)
+        f3_ras_update_addr := bankAlign(s3_vpc) + (f3_redirect_idx << 1) + Mux(
+                              f3_preds(f3_redirect_idx).npc_plus2, 2.U, 4.U)
+        // 更新 ras top 指针
+        f3_ras_top_update_valid := true.B
+        f3_ras_top_update_idx := WrapInc(f2_ras_top_idx, nRasEntries)
+      }
     }
 
     // Assertion

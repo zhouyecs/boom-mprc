@@ -828,9 +828,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // 可以同时发生，互不干扰，因此这里没有检查 f3_clear 信号。下一周期 ftq 传来 ras 内容的
   // 修正请求时，f3_fire 必为 false
   bpd.io.predecode_ras_update_valid := false.B
-  bpd.io.predecode_ras_update_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
-    f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
-  bpd.io.predecode_ras_update_idx   := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
+  bpd.io.predecode_ras_update_addr  := DontCare
+  bpd.io.predecode_ras_update_idx   := DontCare
   bpd.io.predecode_ras_top_update_valid := false.B
   bpd.io.predecode_ras_top_update_idx   := DontCare
 
@@ -852,19 +851,37 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_bp_check_happened = RegInit(false.B)
 
   when (f3.io.deq.valid && !f3_bp_check_happened) {
-    when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
-      // 预译码检测到 call 指令时，ras top idx 更新和 ras top 内容更新同时发生 
-      bpd.io.predecode_ras_update_valid := true.B
-      bpd.io.predecode_ras_top_update_valid := true.B
-      bpd.io.predecode_ras_top_update_idx := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
-    } .elsewhen(f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid) {
-      // 预译码检测到 ret 指令时，更新 ras top idx
-      bpd.io.predecode_ras_top_update_valid := true.B 
-      bpd.io.predecode_ras_top_update_idx := WrapDec(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
-    }
-    when (f3_correct_ghist || f3_correct_target || itlb_exception) {
-      predecode_redirect   := true.B
+    predecode_redirect := f3_correct_ghist || f3_correct_target || itlb_exception
+    when(predecode_redirect) {
       f3_fetch_bundle.fsrc := BSRC_3
+    }
+    when (predecode_redirect || (bpd.io.resp.f3_pred_valid &&
+          f3_fetch_bundle.ftq_idx === bpd.io.resp.f3_ftq_idx)) {
+      // 正常来讲需要将 predecode_redirect 和 predecode suppress f3 preds 的情况
+      // 区分一下，但对于后者，没有预测错时，更新也不会造成任何影响？
+      when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
+        // 预译码检测到 call 指令时，ras top idx 更新和 ras top 内容更新同时发生
+        // TODO: 下一个周期再把 f3_bpd_resp.io.deq.bits.preds.ras_top 写回去？
+        bpd.io.predecode_ras_top_update_valid := true.B
+        bpd.io.predecode_ras_top_update_idx := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
+        bpd.io.predecode_ras_update_valid := true.B
+        bpd.io.predecode_ras_update_idx := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
+        bpd.io.predecode_ras_update_addr := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+                                            f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
+      } .elsewhen(f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid) {
+        // 预译码检测到 ret 指令时，更新 ras top idx
+        bpd.io.predecode_ras_top_update_valid := true.B 
+        bpd.io.predecode_ras_top_update_idx := WrapDec(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
+        bpd.io.predecode_ras_update_valid := true.B
+        bpd.io.predecode_ras_update_idx :=f3_bpd_resp.io.deq.bits.preds.ras_idx
+        bpd.io.predecode_ras_update_addr := f3_bpd_resp.io.deq.bits.preds.ras_top  
+      } .otherwise {
+        bpd.io.predecode_ras_top_update_valid := true.B 
+        bpd.io.predecode_ras_top_update_idx := f3_bpd_resp.io.deq.bits.preds.ras_idx      
+        bpd.io.predecode_ras_update_valid := true.B
+        bpd.io.predecode_ras_update_idx :=f3_bpd_resp.io.deq.bits.preds.ras_idx
+        bpd.io.predecode_ras_update_addr := f3_bpd_resp.io.deq.bits.preds.ras_top         
+      }
     }
     f3_bp_check_happened := true.B
   }
