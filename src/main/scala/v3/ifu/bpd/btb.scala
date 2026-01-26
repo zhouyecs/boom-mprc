@@ -45,9 +45,10 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     val is_br = Bool()
     val is_call = Bool()
     val is_ret  = Bool()
+    val npc_plus2 = Bool()
     val tag   = UInt(tagSz.W)
   }
-  val btbMetaSz = tagSz + 3
+  val btbMetaSz = tagSz + 4
 
   class BTBPredictMeta extends Bundle {
     val write_way = UInt(log2Ceil(nWays).W)
@@ -86,6 +87,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   val s1_is_jal = Wire(Vec(bankWidth, Bool()))
   val s1_is_call = Wire(Vec(bankWidth, Bool()))
   val s1_is_ret  = Wire(Vec(bankWidth, Bool()))
+  val s1_npc_plus2 = Wire(Vec(bankWidth, Bool()))
 
   val s1_hit_ohs = VecInit((0 until bankWidth) map { i =>
     VecInit((0 until nWays) map { w =>
@@ -107,7 +109,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     s1_is_jal(w) := !doing_reset && s1_resp(w).valid && !entry_meta.is_br
     s1_is_call(w) := !doing_reset && s1_resp(w).valid && entry_meta.is_call
     s1_is_ret(w)  := !doing_reset && s1_resp(w).valid && entry_meta.is_ret
-
+    s1_npc_plus2(w) := !doing_reset && s1_resp(w).valid && entry_meta.npc_plus2
 
     io.resp.f2(w) := io.resp_in(0).f2(w)
     io.resp.f3(w) := io.resp_in(0).f3(w)
@@ -117,6 +119,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       io.resp.f2(w).is_jal       := RegNext(s1_is_jal(w))
       io.resp.f2(w).is_call      := RegNext(s1_is_call(w))
       io.resp.f2(w).is_ret       := RegNext(s1_is_ret(w))
+      io.resp.f2(w).npc_plus2    := RegNext(s1_npc_plus2(w))
       // s1_is_jal 是 !s1_is_br，所以它表示该指令是否是无条件跳转指令
       // 包括了 jal 指令和 jalr 指令
       when (RegNext(s1_is_jal(w))) {
@@ -129,6 +132,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
       io.resp.f3(w).is_jal       := RegNext(io.resp.f2(w).is_jal)
       io.resp.f3(w).is_call      := RegNext(io.resp.f2(w).is_call)
       io.resp.f3(w).is_ret       := RegNext(io.resp.f2(w).is_ret)
+      io.resp.f3(w).npc_plus2    := RegNext(io.resp.f2(w).npc_plus2)
       when (RegNext(RegNext(s1_is_jal(w)))) {
         io.resp.f3(w).taken      := true.B
       }
@@ -194,6 +198,7 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
     s1_update_wmeta_data(s1_update_meta.write_way)(w).is_br   := s1_update.bits.br_mask(w)
     s1_update_wmeta_data(s1_update_meta.write_way)(w).is_call := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_call
     s1_update_wmeta_data(s1_update_meta.write_way)(w).is_ret  := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && s1_update.bits.cfi_is_ret
+    s1_update_wmeta_data(s1_update_meta.write_way)(w).npc_plus2 := s1_update.bits.cfi_idx.valid && s1_update_cfi_idx === w.U && !s1_update.bits.cfi_npc_plus4
   }
 
   val btb_reset_value = WireDefault(0.U(btbEntrySz.W))

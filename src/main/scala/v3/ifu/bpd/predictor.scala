@@ -28,6 +28,8 @@ class BranchPrediction(implicit p: Parameters) extends BoomBundle()(p)
   val is_call         = Bool()
   // Is this a RET?
   val is_ret          = Bool()
+  // Does the next PC equal PC + 2?
+  val npc_plus2       = Bool()
   // What is the target of his branch/jump? Do we know the target?
   val predicted_pc    = Valid(UInt(vaddrBitsExtended.W))
   // ras 的栈顶值，没有 valid 信号
@@ -138,6 +140,7 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   // Was the cfi a call/ret?
   val cfi_is_call      = Bool()
   val cfi_is_ret       = Bool()
+  val cfi_npc_plus4    = Bool()
 
   val ghist = new GlobalHistory
   val lhist = Vec(nBanks, UInt(localHistoryLength.W))
@@ -173,6 +176,7 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cfi_is_jalr      = Bool()
   val cfi_is_call      = Bool()
   val cfi_is_ret       = Bool()
+  val cfi_npc_plus4    = Bool()
 
   val ghist            = UInt(globalHistoryLength.W)
   val lhist            = UInt(localHistoryLength.W)
@@ -719,6 +723,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(i).io.update.bits.cfi_is_jalr      := io.update.bits.cfi_is_jalr
     banked_predictors(i).io.update.bits.cfi_is_call      := io.update.bits.cfi_is_call
     banked_predictors(i).io.update.bits.cfi_is_ret       := io.update.bits.cfi_is_ret
+    banked_predictors(i).io.update.bits.cfi_npc_plus4    := io.update.bits.cfi_npc_plus4
     banked_predictors(i).io.update.bits.target           := io.update.bits.target
 
     banked_lhist_providers(i).io.update.mispredict := io.update.bits.is_mispredict_update

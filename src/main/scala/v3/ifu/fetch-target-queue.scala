@@ -422,6 +422,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.meta       := bpd_meta
     io.bpdupdate.bits.cfi_is_call  := bpd_entry.cfi_is_call
     io.bpdupdate.bits.cfi_is_ret   := bpd_entry.cfi_is_ret
+    io.bpdupdate.bits.cfi_npc_plus4 := bpd_entry.cfi_npc_plus4
 
     io.ft_tsrc.valid := true.B
     io.ft_tsrc.bits  := bpd_entry.ft_tsrc
