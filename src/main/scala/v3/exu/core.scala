@@ -640,7 +640,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       true.B,
       io.ifu.get_pc(1).pc,
       ftq_entry.cfi_is_call && ftq_entry.cfi_idx.bits === cfi_idx,
-      ftq_entry.cfi_is_ret  && ftq_entry.cfi_idx.bits === cfi_idx)
+      ftq_entry.cfi_is_ret  && ftq_entry.cfi_idx.bits === cfi_idx,
+      ftq_entry.cfi_is_pop_push && ftq_entry.cfi_idx.bits === cfi_idx)
 
 
     io.ifu.redirect_ghist   := Mux(

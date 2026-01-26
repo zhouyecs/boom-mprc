@@ -81,7 +81,7 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
   def update(branches: UInt, cfi_taken: Bool, cfi_is_br: Bool, cfi_idx: UInt,
     cfi_valid: Bool, addr: UInt,
-    cfi_is_call: Bool, cfi_is_ret: Bool): GlobalHistory = {
+    cfi_is_call: Bool, cfi_is_ret: Bool, cfi_is_pop_push: Bool): GlobalHistory = {
     val cfi_idx_fixed = cfi_idx(log2Ceil(fetchWidth)-1,0)
     val cfi_idx_oh = UIntToOH(cfi_idx_fixed)
     val new_history = Wire(new GlobalHistory)
@@ -120,7 +120,9 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
       }
     }
-    new_history.ras_idx := Mux(cfi_valid && cfi_is_call, WrapInc(ras_idx, nRasEntries),
+    // 当 cfi_is_pop_push 为真时，RAS 指针不变 (pop + push = 0 change)
+    // 注意：decode 逻辑中，is_pop_push 时 is_call 也为真，is_ret 为假
+    new_history.ras_idx := Mux(cfi_valid && cfi_is_call && !cfi_is_pop_push, WrapInc(ras_idx, nRasEntries),
                            Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, nRasEntries), ras_idx))
     new_history
   }
@@ -219,6 +221,7 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val cfi_type      = UInt(CFI_SZ.W)
   val cfi_is_call   = Bool()
   val cfi_is_ret    = Bool()
+  val cfi_is_pop_push = Bool()
   val cfi_npc_plus4 = Bool()
 
   val ras_top       = UInt(vaddrBitsExtended.W)
@@ -433,6 +436,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f1_do_redirect,
     s1_vpc,
     false.B,
+    false.B,
     false.B)
 
   when (s1_valid && !s1_tlb_miss) {
@@ -487,6 +491,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f2_redirect_idx,
     f2_do_redirect,
     s2_vpc,
+    false.B,
     false.B,
     false.B)
 
@@ -580,6 +585,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f3_br_mask      = Wire(Vec(fetchWidth, Bool()))
   val f3_call_mask    = Wire(Vec(fetchWidth, Bool()))
   val f3_ret_mask     = Wire(Vec(fetchWidth, Bool()))
+  val f3_pop_push_mask= Wire(Vec(fetchWidth, Bool()))
   val f3_npc_plus4_mask = Wire(Vec(fetchWidth, Bool()))
   val f3_btb_mispredicts = Wire(Vec(fetchWidth, Bool()))
   f3_fetch_bundle.mask := f3_mask.asUInt
@@ -815,6 +821,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       f3_cfi_types(i) := brsigs.cfi_type
       f3_call_mask(i) := brsigs.is_call
       f3_ret_mask(i)  := brsigs.is_ret
+      f3_pop_push_mask(i) := brsigs.is_pop_push
 
       f3_fetch_bundle.bp_debug_if_oh(i) := bpu.io.debug_if
       f3_fetch_bundle.bp_xcpt_if_oh (i) := bpu.io.xcpt_if
@@ -833,6 +840,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_type      := f3_cfi_types(f3_fetch_bundle.cfi_idx.bits)
   f3_fetch_bundle.cfi_is_call   := f3_call_mask(f3_fetch_bundle.cfi_idx.bits)
   f3_fetch_bundle.cfi_is_ret    := f3_ret_mask (f3_fetch_bundle.cfi_idx.bits)
+  f3_fetch_bundle.cfi_is_pop_push := f3_pop_push_mask(f3_fetch_bundle.cfi_idx.bits)
   f3_fetch_bundle.cfi_npc_plus4 := f3_npc_plus4_mask(f3_fetch_bundle.cfi_idx.bits)
 
   f3_fetch_bundle.ghist    := f3.io.deq.bits.ghist
@@ -876,7 +884,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_fetch_bundle.cfi_idx.valid,
     f3_fetch_bundle.pc,
     f3_fetch_bundle.cfi_is_call,
-    f3_fetch_bundle.cfi_is_ret
+    f3_fetch_bundle.cfi_is_ret,
+    f3_fetch_bundle.cfi_is_pop_push
   )
 
   bpd.io.f3_write_valid := false.B

@@ -78,6 +78,7 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   // Was the cfi a call/ret?
   val cfi_is_call      = Bool()
   val cfi_is_ret       = Bool()
+  val cfi_is_pop_push  = Bool()
 
   val ghist = new GlobalHistory
   val lhist = Vec(nBanks, UInt(localHistoryLength.W))
@@ -113,6 +114,7 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cfi_is_jalr      = Bool()
   val cfi_is_call      = Bool()
   val cfi_is_ret       = Bool()
+  val cfi_is_pop_push  = Bool()
 
   val ghist            = UInt(globalHistoryLength.W)
   val lhist            = UInt(localHistoryLength.W)
@@ -411,6 +413,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(i).io.update.bits.cfi_is_jalr      := io.update.bits.cfi_is_jalr
     banked_predictors(i).io.update.bits.cfi_is_call      := io.update.bits.cfi_is_call
     banked_predictors(i).io.update.bits.cfi_is_ret       := io.update.bits.cfi_is_ret
+    banked_predictors(i).io.update.bits.cfi_is_pop_push  := io.update.bits.cfi_is_pop_push
     banked_predictors(i).io.update.bits.target           := io.update.bits.target
 
     banked_lhist_providers(i).io.update.mispredict := io.update.bits.is_mispredict_update

@@ -57,6 +57,8 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   val cfi_is_call   = Bool()
   // This CFI is likely a RET
   val cfi_is_ret    = Bool()
+  // This CFI is likely a POP then PUSH
+  val cfi_is_pop_push = Bool()
   // Is the NPC after the CFI +4 or +2
   val cfi_npc_plus4 = Bool()
   // What was the top of the RAS that this bundle saw?
@@ -190,6 +192,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.cfi_type      := io.enq.bits.cfi_type
     new_entry.cfi_is_call   := io.enq.bits.cfi_is_call
     new_entry.cfi_is_ret    := io.enq.bits.cfi_is_ret
+    new_entry.cfi_is_pop_push := io.enq.bits.cfi_is_pop_push
     new_entry.cfi_npc_plus4 := io.enq.bits.cfi_npc_plus4
     new_entry.ras_top       := io.enq.bits.ras_top
     new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
@@ -318,6 +321,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.meta       := bpd_meta
     io.bpdupdate.bits.cfi_is_call  := bpd_entry.cfi_is_call
     io.bpdupdate.bits.cfi_is_ret   := bpd_entry.cfi_is_ret
+    io.bpdupdate.bits.cfi_is_pop_push := bpd_entry.cfi_is_pop_push
 
     done_commit_update_debug := RegNext(do_commit_update) || done_commit_update_debug
   }
@@ -364,6 +368,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       redirect_new_entry.cfi_taken        := io.brupdate.b2.taken
       redirect_new_entry.cfi_is_call      := redirect_entry.cfi_is_call && redirect_entry.cfi_idx.bits === new_cfi_idx
       redirect_new_entry.cfi_is_ret       := redirect_entry.cfi_is_ret  && redirect_entry.cfi_idx.bits === new_cfi_idx
+      redirect_new_entry.cfi_is_pop_push  := redirect_entry.cfi_is_pop_push && redirect_entry.cfi_idx.bits === new_cfi_idx
       // BOOM 原本的逻辑没有修改 cfi_type 和 br_mask
       // 但我觉得是应该加上的
       redirect_new_entry.cfi_type         := io.brupdate.b2.cfi_type
@@ -425,7 +430,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         prev_entry.cfi_idx.valid,
         prev_pc,
         prev_entry.cfi_is_call,
-        prev_entry.cfi_is_ret
+        prev_entry.cfi_is_ret,
+        prev_entry.cfi_is_pop_push
       )
       when (io.enq.bits.ghist.current_saw_branch_not_taken) {
         ghist_by_prev := io.enq.bits.ghist
@@ -457,7 +463,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         prev_entry.cfi_idx.valid,
         prev_pc,
         prev_entry.cfi_is_call,
-        prev_entry.cfi_is_ret
+        prev_entry.cfi_is_ret,
+        prev_entry.cfi_is_pop_push
       )
       // 按我的理解这俩应该是相等的
       assert (io.enq.bits.ghist === ghist_by_prev,
