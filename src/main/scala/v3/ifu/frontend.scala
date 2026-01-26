@@ -1038,8 +1038,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val merged_f3_next_valid   = Mux(select_predecode, !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if),
                                   true.B)
   val merged_f3_redirect     = Mux(select_predecode, predecode_redirect, bpd.io.resp.f3_redirect) 
-  // TODO: 这里依赖于 f3_bpd_resp 使得 predecode 预测持久有效
-  val merged_f3_pred_valid   = Mux(select_predecode, f3.io.deq.valid, bpd.io.resp.f3_pred_valid)
 
 
   when (bpd.io.resp.f1_pred_valid) {
@@ -1112,8 +1110,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // val last_is_f3_pred = s0_ifu_ftq_idx_reg === merged_f3_next_ftq_idx && bpd.io.resp.f3_pred_valid
 
   // 因为 f2_next_ftq_idx / f3_next_ftq_idx 可能超过 s0_ifu_ftq_idx_reg 一圈，
-  // 但是 s0_ifu_ftq_idx_reg 至多比它们大 1 或者 2，因此使用 !(s0_ifu_ftq_idx_reg < ...)
-  // 来判断，而不能使用 s0_ifu_ftq_idx_reg > ...
+  // 但是 s0_ifu_ftq_idx_reg 至多比它们大 1 或者 2。使用 >= 来判断
   val s0_redirect_by_f2 = s0_ifu_ftq_idx_reg >= f2_next_ftq_idx && bpd.io.resp.f2_redirect
   val s0_redirect_by_f3 = s0_ifu_ftq_idx_reg >= merged_f3_next_ftq_idx && merged_f3_redirect
 
@@ -1124,13 +1121,13 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // f3 redirect 和 s2 replay 可能同时发生，当 f3 是更早一级流水线时，f3 redirect 优先级更高
   val f3_suppress_s2_replay = s2_ftq_idx === merged_f3_next_ftq_idx && merged_f3_redirect
 
-  // ifu f1 可能被 f2 预测, f3 预测, s2 重放, predecode 重定向, sfence, 后端重定向清空
+  // ifu f1 可能被 f2 预测, f3 预测, s2 重放, sfence, 后端重定向清空
   val s1_clear_by_f2 = bpd.io.resp.f2_redirect && (s1_ftq_idx > bpd.io.resp.f2_ftq_idx)
   val s1_clear_by_f3 = merged_f3_redirect && (s1_ftq_idx > merged_f3_ftq_idx)
   f1_clear := s1_clear_by_f2 || s1_clear_by_f3 || s2_replay_happen ||
               io.cpu.sfence.valid || io.cpu.redirect_flush
 
-  // ifu f2 可能被 f3 预测, predecode 重定向, sfence, 后端重定向清空
+  // ifu f2 可能被 f3 预测, sfence, 后端重定向清空
   val s2_clear_by_f3 = merged_f3_redirect && (s2_ftq_idx > merged_f3_ftq_idx)
   f2_clear := s2_clear_by_f3 || io.cpu.sfence.valid || io.cpu.redirect_flush
 
