@@ -401,6 +401,18 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   // For branches we emit the offset for the core to redirect if necessary
   val target_offset = imm_xprlen(20,0).asSInt
   brinfo.jalr_target := DontCare
+
+  val debug_ret_backend = PlusArg("debug-ret-backend", 0, "Print Return Instruction in Backend", 1)
+  val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+  
+  // Calculate uop_pc early so it's available for debugging
+  val uop_pc = if (isJmpUnit) {
+    val block_pc = AlignPCToBoundary(io.get_ftq_pc.pc, icBlockBytes)
+    (block_pc | uop.pc_lob) - Mux(uop.edge_inst, 2.U, 0.U)
+  } else {
+    0.U
+  }
+  
   if (isJmpUnit) {
     def encodeVirtualAddress(a0: UInt, ea: UInt) = if (vaddrBitsExtended == vaddrBits) {
       ea
@@ -417,6 +429,16 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     val jalr_target_xlen = Wire(UInt(xLen.W))
     jalr_target_xlen := (jalr_target_base + target_offset).asUInt
     val jalr_target = (encodeVirtualAddress(jalr_target_xlen, jalr_target_xlen).asSInt & -2.S).asUInt
+
+    if (IN_SIMULATION) {
+      val offset = jalr_target - uop_pc
+      val abs_offset = Mux(offset(vaddrBitsExtended-1), -offset, offset)
+      val is_ret = uop.is_jalr && uop.ldst =/= BitPat("b00?01") && (uop.lrs1 === BitPat("b00?01"))
+      val highest_index = Log2(abs_offset)
+      when (debug_ret_backend(0) && io.req.valid && !killed && is_ret) {
+         printf(p"[${cycleCount} Backend Return]  PC: ${Hexadecimal(uop_pc)}, Target:  ${Hexadecimal(jalr_target)}, offset: ${Hexadecimal(abs_offset)}, highest_index: ${highest_index}\n")
+      }
+    }
 
     brinfo.jalr_target := jalr_target
     val cfi_idx = ((uop.pc_lob ^ Mux(io.get_ftq_pc.entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U)))(log2Ceil(fetchWidth),1)

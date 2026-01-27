@@ -665,17 +665,22 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
             when (rvc_expand_printf(0) && rvc0) {
               printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is half)\n", cycleCount, pc0, inst0(15,0), exp_inst0)
               // printf("rvc (prev bank): %x\n", f3_prev_half)
-              when (brsigs.is_call) {
+              when (brsigs.is_pop_push) {
+                printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
+              } .elsewhen (brsigs.is_call) {
                 printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
               }.elsewhen (brsigs.is_ret) {
                 printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
               }
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc0, inst0)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc0, inst0)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
               printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc0, inst0)
+            } .elsewhen (rvc_expand_printf(0) && !rvc0) {
+              printf("[%d RVCExpand+Predecode] prev bank is half of 32-bit: PC: %x\n", cycleCount, pc0)
             }
-            printf("[%d RVCExpand+Predecode] prev bank is half of 32-bit: PC: %x\n", cycleCount, pc0)
           }
 
           if (b > 0) {
@@ -704,11 +709,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
             when (rvc_expand_printf(0) && rvc1) {
               printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is not half)\n", cycleCount, pc1, inst1(15, 0), exp_inst1)
               // printf("rvc: %x\n", inst1(15, 0))
-              when (brsigs.is_call) {
+              when (brsigs.is_pop_push) {
+                printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
+              } .elsewhen (brsigs.is_call) {
                 printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
               }.elsewhen (brsigs.is_ret) {
                 printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
               }
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc1, inst1)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc1, inst1)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
@@ -741,12 +750,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           when (rvc_expand_printf(0) && rvc) {
             printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x\n", cycleCount, pc, inst(15, 0), exp_inst)
             // printf("rvc: %x\n", inst(15, 0))
-            when (brsigs.is_call) {
+            when (brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
+            } .elsewhen (brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
             }.elsewhen (brsigs.is_ret) {
               printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
             }
-          } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
+          } .elsewhen (rvc_expand_printf(0) && brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc, inst)
+          }.elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc, inst)
           } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
               printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc, inst)
@@ -1106,6 +1119,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         printf(p"[${cycleCount} RAS Pop] idx=${Hexadecimal(f3_fetch_bundle.ghist.ras_idx)} " +
           p"top=${Hexadecimal(f3_fetch_bundle.ras_top)}, pc=${Hexadecimal(ret_pc)}\n")
       }
+    }
+
+    val debug_ret_frontend = PlusArg("debug-ret-frontend", 0, "Print Return Instruction in Frontend", 1)
+    when (debug_ret_frontend(0) && f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid && f3.io.deq.fire) {
+      val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+        f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+      val offset = f3_fetch_bundle.ras_top - ret_pc
+      val abs_offset = Mux(offset(vaddrBitsExtended-1), -offset, offset)
+      val highest_index = Log2(abs_offset)
+      printf(p"[${cycleCount} Frontend Return] PC: ${Hexadecimal(ret_pc)}, RAS Top: ${Hexadecimal(f3_fetch_bundle.ras_top)}, offset: ${Hexadecimal(abs_offset)}, highest_index: ${highest_index}\n")
     }
   }
 
