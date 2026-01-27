@@ -27,11 +27,6 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     c.io.f1_ghist  := io.f1_ghist
     c.io.f1_lhist  := io.f1_lhist
     c.io.f3_fire   := io.f3_fire
-    // For RAS
-    c.io.f2_read_idx := io.f2_read_idx
-    c.io.f3_write_valid := io.f3_write_valid
-    c.io.f3_write_idx := io.f3_write_idx
-    c.io.f3_write_addr := io.f3_write_addr
     if (c.metaSz > 0) {
       metas = (metas << c.metaSz) | c.io.f3_meta(c.metaSz-1,0)
     }

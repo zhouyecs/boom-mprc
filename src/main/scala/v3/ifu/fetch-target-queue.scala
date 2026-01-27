@@ -64,6 +64,8 @@ class FTQBundle(implicit p: Parameters) extends BoomBundle
   // What was the top of the RAS that this bundle saw?
   val ras_top = UInt(vaddrBitsExtended.W)
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
+  // Full RAS metadata for dual-structure RAS recovery
+  val ras_meta = new RasMeta
 
   // Which bank did this start from?
   val start_bank = UInt(1.W)
@@ -149,9 +151,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     val bpdupdate = Output(Valid(new BranchPredictionUpdate))
 
-    val ras_update = Output(Bool())
-    val ras_update_idx = Output(UInt(log2Ceil(nRasEntries).W))
-    val ras_update_pc  = Output(UInt(vaddrBitsExtended.W))
+    // New dual-structure RAS signals
+    val ras_redirect = Output(Valid(new RasRedirect))
+    val ras_commit   = Output(Valid(new RasCommit))
 
   })
   val bpd_ptr    = RegInit(FTQPtr(false.B, 0.U))
@@ -196,6 +198,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     new_entry.cfi_npc_plus4 := io.enq.bits.cfi_npc_plus4
     new_entry.ras_top       := io.enq.bits.ras_top
     new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
+    new_entry.ras_meta      := io.enq.bits.ras_meta
     new_entry.br_mask       := io.enq.bits.br_mask
     new_entry.start_bank    := bank(io.enq.bits.pc)
 
@@ -232,12 +235,19 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // We can update the branch predictors when we know the target of the
   // CFI in this fetch bundle
 
-  val ras_update = WireInit(false.B)
-  val ras_update_pc = WireInit(0.U(vaddrBitsExtended.W))
-  val ras_update_idx = WireInit(0.U(log2Ceil(nRasEntries).W))
-  io.ras_update     := RegNext(ras_update)
-  io.ras_update_pc  := RegNext(ras_update_pc)
-  io.ras_update_idx := RegNext(ras_update_idx)
+  // Dual-structure RAS redirect and commit signals
+  val ras_redirect_valid = WireInit(false.B)
+  val ras_redirect_bundle = Wire(new RasRedirect)
+  ras_redirect_bundle := DontCare
+  io.ras_redirect.valid := RegNext(ras_redirect_valid, init = false.B)
+  io.ras_redirect.bits  := RegNext(ras_redirect_bundle)
+
+  // RAS commit: driven by the commit update path
+  val ras_commit_valid = WireInit(false.B)
+  val ras_commit_bundle = Wire(new RasCommit)
+  ras_commit_bundle := DontCare
+  io.ras_commit.valid := RegNext(ras_commit_valid, init = false.B)
+  io.ras_commit.bits  := RegNext(ras_commit_bundle)
 
   val bpd_update_mispredict = RegInit(false.B)
   val bpd_update_repair = RegInit(false.B)
@@ -245,7 +255,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val bpd_end_idx = Reg(UInt(log2Ceil(ftqSz).W))
   val bpd_repair_pc = Reg(UInt(vaddrBitsExtended.W))
 
-  val bpd_idx = bpd_ptr.value
+  val useLoop = p(BoomLoopKey)
+  val bpd_idx = Wire(UInt(log2Ceil(ftqSz).W))
+  if (useLoop) {
+    bpd_idx := Mux(bpd_update_repair || bpd_update_mispredict, bpd_repair_idx, bpd_ptr.value)
+  } else {
+    bpd_idx := bpd_ptr.value
+  }
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
   val bpd_lhist = if (useLHist) {
@@ -295,18 +311,33 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // bpd_ptr =/= deq_ptr && enq_ptr =/= WrapInc(bpd_ptr, num_entries)
   // 简化为了 bpd_ptr =/= deq_ptr，因为 deq_ptr < enq_ptr 在第一次 commit
   // update 后总是成立，而 bpd_ptr <= deq_ptr
-  val do_commit_update     = (bpd_ptr =/= deq_ptr &&
-                              !io.brupdate.b2.mispredict &&
-                              !io.redirect.valid && !RegNext(io.redirect.valid))
+  val do_commit_update = Wire(Bool())
+  val do_mispredict_update = Wire(Bool())
+  val do_repair_update = Wire(Bool())
+  if (useLoop) {
+    do_commit_update     := (bpd_ptr =/= deq_ptr &&
+                            !io.redirect.valid && !RegNext(io.redirect.valid)) &&
+                            !bpd_update_mispredict && !bpd_update_repair
+    do_mispredict_update := bpd_update_mispredict
+    do_repair_update     := bpd_update_repair
+  } else {
+    do_commit_update     := (bpd_ptr =/= deq_ptr &&
+                            !io.brupdate.b2.mispredict &&
+                            !io.redirect.valid && !RegNext(io.redirect.valid))
+    do_mispredict_update := false.B
+    do_repair_update     := false.B
+  }
 
   val done_commit_update_debug = RegInit(false.B)
 
-  when (RegNext(do_commit_update)) {
+  when (RegNext(do_commit_update || do_repair_update || do_mispredict_update)) {
     val cfi_idx = bpd_entry.cfi_idx.bits
+    val valid_repair = bpd_pc =/= bpd_repair_pc
 
-    io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U)
-    io.bpdupdate.bits.is_mispredict_update := false.B
-    io.bpdupdate.bits.is_repair_update     := false.B
+    io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
+                          !(RegNext(do_repair_update) && !valid_repair)
+    io.bpdupdate.bits.is_mispredict_update := RegNext(do_mispredict_update)
+    io.bpdupdate.bits.is_repair_update     := RegNext(do_repair_update)
     io.bpdupdate.bits.pc      := bpd_pc
     io.bpdupdate.bits.btb_mispredicts := 0.U
     io.bpdupdate.bits.br_mask :=  bpd_entry.br_mask
@@ -324,6 +355,16 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.cfi_is_pop_push := bpd_entry.cfi_is_pop_push
 
     done_commit_update_debug := RegNext(do_commit_update) || done_commit_update_debug
+
+    // RAS commit: update commit stack when a call/ret retires
+    when (RegNext(do_commit_update) && bpd_entry.cfi_idx.valid &&
+          (bpd_entry.cfi_is_call || bpd_entry.cfi_is_ret)) {
+      ras_commit_valid         := true.B
+      ras_commit_bundle.isCall := bpd_entry.cfi_is_call
+      ras_commit_bundle.isRet  := bpd_entry.cfi_is_ret
+      ras_commit_bundle.metaWritePtr := bpd_entry.ras_meta.specWritePtr
+      ras_commit_bundle.metaStackPtr  := bpd_entry.ras_meta.specStackPtr
+    }
   }
 
   when (do_commit_update) {
@@ -375,9 +416,17 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       redirect_new_entry.br_mask          := MaskLower(UIntToOH(new_cfi_idx)) & redirect_entry.br_mask
     }
 
-    ras_update     := true.B
-    ras_update_pc  := redirect_entry.ras_top
-    ras_update_idx := redirect_entry.ras_idx
+    // Dual-structure RAS redirect: send full metadata for recovery
+    ras_redirect_valid := true.B
+    ras_redirect_bundle.meta   := redirect_entry.ras_meta
+    ras_redirect_bundle.isCall := redirect_new_entry.cfi_is_call && redirect_new_entry.cfi_idx.valid
+    ras_redirect_bundle.isRet  := redirect_new_entry.cfi_is_ret && redirect_new_entry.cfi_idx.valid
+    // Compute call return address: aligned_pc + (cfi_idx << 1) + Mux(npc_plus4, 4, 2)
+    val redirect_pc = pcs(redirect_idx)
+    val redirect_aligned_pc = bankAlign(redirect_pc)
+    ras_redirect_bundle.callAddr := redirect_aligned_pc +
+      (redirect_new_entry.cfi_idx.bits << 1) +
+      Mux(redirect_new_entry.cfi_npc_plus4, 4.U, 2.U)
 
   } .elsewhen (RegNext(io.redirect.valid)) {
     prev_entry := RegNext(redirect_new_entry)

@@ -66,6 +66,9 @@ case class BoomCoreParams(
   bpdMaxMetaLength: Int = 120,
   numRasEntries: Int = 32,
   enableRasTopRepair: Boolean = true,
+  rasCommitStackSize: Int = 16,
+  rasSpecQueueSize: Int = 32,
+  rasCounterWidth: Int = 3,
 
   /* more stuff */
   useCompressed: Boolean = true,
@@ -255,6 +258,9 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val nRasEntries = boomParams.numRasEntries max 2
   val useRAS = boomParams.numRasEntries > 0
   val enableRasTopRepair = boomParams.enableRasTopRepair
+  val rasCommitStackSize = boomParams.rasCommitStackSize
+  val rasSpecQueueSize = boomParams.rasSpecQueueSize
+  val rasCounterWidth = boomParams.rasCounterWidth
 
   val useBPD = boomParams.enableBranchPrediction
 

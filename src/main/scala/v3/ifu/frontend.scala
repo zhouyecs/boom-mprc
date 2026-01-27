@@ -225,6 +225,7 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val cfi_npc_plus4 = Bool()
 
   val ras_top       = UInt(vaddrBitsExtended.W)
+  val ras_meta      = new RasMeta
 
   val ftq_idx       = UInt(log2Ceil(ftqSz).W)
   val mask          = UInt(fetchWidth.W) // mark which words are valid instructions
@@ -342,7 +343,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   require(fetchWidth*coreInstBytes == outer.icacheParams.fetchBytes)
 
   val bpd = Module(new BranchPredictor)
-  bpd.io.f3_fire := false.B
+  bpd.io.f3_fire := true.B // 解耦前端 f3 预测不会被阻塞
+
+  // Dual-structure RAS
+  val ras = Module(new BoomRasStack)
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache
@@ -555,17 +559,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
 
-  // RAS takes a cycle to read
-  bpd.io.f2_read_idx := f3.io.enq.bits.ghist.ras_idx
-
 
   // The BPD resp comes in f3
   f3_bpd_resp.io.enq.valid := f3.io.deq.valid && RegNext(f3.io.enq.ready)
   f3_bpd_resp.io.enq.bits  := bpd.io.resp.f3
-  when (f3_bpd_resp.io.enq.fire) {
-    bpd.io.f3_fire := true.B
-  }
-
   f3.io.deq.ready := f4_ready
   f3_bpd_resp.io.deq.ready := f4_ready
 
@@ -625,9 +622,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       bpu.io.mcontext := io.cpu.mcontext
       bpu.io.scontext := io.cpu.scontext
 
-      val (cycleCount, _) = Counter(true.B, Int.MaxValue)
-      val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
-
       val brsigs = Wire(new BranchDecodeSignals)
       if (w == 0) {
         val inst0 = Cat(bank_data(15,0), f3_prev_half)
@@ -662,20 +656,27 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           f3_fetch_bundle.edge_inst(b) := true.B
 
           if (IN_SIMULATION) {
+            val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+            val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
             when (rvc_expand_printf(0) && rvc0) {
               printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is half)\n", cycleCount, pc0, inst0(15,0), exp_inst0)
               // printf("rvc (prev bank): %x\n", f3_prev_half)
-              when (brsigs.is_call) {
+              when (brsigs.is_pop_push) {
+                printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
+              } .elsewhen (brsigs.is_call) {
                 printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
               }.elsewhen (brsigs.is_ret) {
                 printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc0, inst0(15,0))
               }
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc0, inst0)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc0, inst0)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
               printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc0, inst0)
+            } .elsewhen (rvc_expand_printf(0) && !rvc0) {
+              printf("[%d RVCExpand+Predecode] prev bank is half of 32-bit: PC: %x\n", cycleCount, pc0)
             }
-            printf("[%d RVCExpand+Predecode] prev bank is half of 32-bit: PC: %x\n", cycleCount, pc0)
           }
 
           if (b > 0) {
@@ -701,14 +702,20 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           f3_fetch_bundle.edge_inst(b) := false.B
 
           if (IN_SIMULATION) {
+            val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+            val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
             when (rvc_expand_printf(0) && rvc1) {
               printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is not half)\n", cycleCount, pc1, inst1(15, 0), exp_inst1)
               // printf("rvc: %x\n", inst1(15, 0))
-              when (brsigs.is_call) {
+              when (brsigs.is_pop_push) {
+                printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
+              } .elsewhen (brsigs.is_call) {
                 printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
               }.elsewhen (brsigs.is_ret) {
                 printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc1, inst1(15, 0))
               }
+            } .elsewhen (rvc_expand_printf(0) && brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc1, inst1)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc1, inst1)
             } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
@@ -738,15 +745,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         brsigs                       := bpd_decoder.io.out
 
         if (IN_SIMULATION) {
+          val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+          val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
           when (rvc_expand_printf(0) && rvc) {
             printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x\n", cycleCount, pc, inst(15, 0), exp_inst)
             // printf("rvc: %x\n", inst(15, 0))
-            when (brsigs.is_call) {
+            when (brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
+            } .elsewhen (brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
             }.elsewhen (brsigs.is_ret) {
               printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc, inst(15, 0))
             }
-          } .elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
+          } .elsewhen (rvc_expand_printf(0) && brsigs.is_pop_push) {
+              printf("[%d RVCExpand+Predecode] JALR(Pop + Push): PC: %x, inst: %x\n", cycleCount, pc, inst)
+          }.elsewhen (rvc_expand_printf(0) && brsigs.is_call) {
               printf("[%d RVCExpand+Predecode] CALL: PC: %x, inst: %x\n", cycleCount, pc, inst)
           } .elsewhen (rvc_expand_printf(0) && brsigs.is_ret) {
               printf("[%d RVCExpand+Predecode] RET:  PC: %x, inst: %x\n", cycleCount, pc, inst)
@@ -863,13 +876,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.cfi_idx.valid := f3_redirects.reduce(_||_)
   f3_fetch_bundle.cfi_idx.bits  := PriorityEncoder(f3_redirects)
 
-  f3_fetch_bundle.ras_top := f3_bpd_resp.io.deq.bits.preds(0).ras_top
+  f3_fetch_bundle.ras_top := ras.io.spec.popAddr
+  f3_fetch_bundle.ras_meta := ras.io.meta
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
+  val f3_ras_valid = ras.io.spec.popAddr =/= 0.U
   val f3_predicted_target = Mux(f3_redirects.reduce(_||_),
-    Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B,
-      f3_bpd_resp.io.deq.bits.preds(0).ras_top,
+    Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B && f3_ras_valid,
+      ras.io.spec.popAddr,
       f3_targs(PriorityEncoder(f3_redirects))
     ),
     nextFetch(f3_fetch_bundle.pc)
@@ -888,19 +903,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_fetch_bundle.cfi_is_pop_push
   )
 
-  bpd.io.f3_write_valid := false.B
-  bpd.io.f3_write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+  // Drive the new RAS speculative inputs from F3
+  val f3_ras_push_addr = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
-  bpd.io.f3_write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
+  ras.io.spec.fire      := f3.io.deq.valid && f4_ready
+  ras.io.spec.pushValid := f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid &&
+    !ras.io.specNearOverflow && f3.io.deq.valid && f4_ready
+  ras.io.spec.popValid  := f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid &&
+    !ras.io.specNearOverflow && f3.io.deq.valid && f4_ready
+  ras.io.spec.pushAddr  := f3_ras_push_addr
 
 
   val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
   val f3_correct_f2_ghist = s2_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
 
   when (f3.io.deq.valid && f4_ready) {
-    when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
-      bpd.io.f3_write_valid := true.B
-    }
     when (f3_redirects.reduce(_||_)) {
       f3_prev_is_half := false.B
     }
@@ -1023,12 +1040,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.update := bpd_update_arbiter.io.out
   bpd_update_arbiter.io.out.ready := true.B
 
-  // 从 FTQ 来的 RAS 更新具有更高优先级 
-  when (ftq.io.ras_update && enableRasTopRepair.B) {
-    bpd.io.f3_write_valid := true.B
-    bpd.io.f3_write_idx   := ftq.io.ras_update_idx
-    bpd.io.f3_write_addr  := ftq.io.ras_update_pc
-  }
+  // Wire new RAS redirect and commit from FTQ
+  ras.io.redirect.valid    := ftq.io.ras_redirect.valid
+  ras.io.redirect.isCall   := ftq.io.ras_redirect.bits.isCall
+  ras.io.redirect.isRet    := ftq.io.ras_redirect.bits.isRet
+  ras.io.redirect.callAddr := ftq.io.ras_redirect.bits.callAddr
+  ras.io.redirect.meta     := ftq.io.ras_redirect.bits.meta
+
+  ras.io.commit := ftq.io.ras_commit
 
 
   // -------------------------------------------------------
@@ -1092,20 +1111,26 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
     val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
     when (cmd_ras_printf(0)) {
-      when (ftq.io.ras_update) {
-        printf(p"[${cycleCount} RAS Update] idx=${Hexadecimal(ftq.io.ras_update_idx)} " +
-          p"addr=${Hexadecimal(ftq.io.ras_update_pc)}\n")
-      } .elsewhen(bpd.io.f3_write_valid) {
-        val call_pc = bpd.io.f3_write_addr - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
-        printf(p"[${cycleCount} RAS Push] idx=${Hexadecimal(bpd.io.f3_write_idx)} " +
-          p"addr=${Hexadecimal(bpd.io.f3_write_addr)} pc=${Hexadecimal(call_pc)}\n")
+      when (ftq.io.ras_redirect.valid) {
+        printf(p"[${cycleCount} RAS Redirect] isCall=${ftq.io.ras_redirect.bits.isCall} " +
+          p"isRet=${ftq.io.ras_redirect.bits.isRet}\n")
+      }
+      when (ras.io.spec.pushValid) {
+        printf(p"[${cycleCount} RAS Push] addr=${Hexadecimal(ras.io.spec.pushAddr)}\n")
       }
       when (f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid && f3.io.deq.fire) {
-        val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
-          f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
-        printf(p"[${cycleCount} RAS Pop] idx=${Hexadecimal(f3_fetch_bundle.ghist.ras_idx)} " +
-          p"top=${Hexadecimal(f3_fetch_bundle.ras_top)}, pc=${Hexadecimal(ret_pc)}\n")
+        printf(p"[${cycleCount} RAS Pop] top=${Hexadecimal(ras.io.spec.popAddr)}\n")
       }
+    }
+
+    val debug_ret_frontend = PlusArg("debug-ret-frontend", 0, "Print Return Instruction in Frontend", 1)
+    when (debug_ret_frontend(0) && f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid && f3.io.deq.fire) {
+      val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+        f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+      val offset = f3_fetch_bundle.ras_top - ret_pc
+      val abs_offset = Mux(offset(vaddrBitsExtended-1), -offset, offset)
+      val highest_index = Log2(abs_offset)
+      printf(p"[${cycleCount} Frontend Return] PC: ${Hexadecimal(ret_pc)}, RAS Top: ${Hexadecimal(f3_fetch_bundle.ras_top)}, offset: ${Hexadecimal(abs_offset)}, highest_index: ${highest_index}\n")
     }
   }
 
