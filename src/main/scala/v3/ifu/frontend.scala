@@ -950,7 +950,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f4_sfb_idx   = PriorityEncoder(f4_sfbs)
   val f4_sfb_mask  = f4.io.deq.bits.sfb_masks(f4_sfb_idx)
   // If we have a SFB, wait for next fetch to be available in f3
-  val f4_delay     = (
+  val f4_delay = Wire(Bool())
+  f4_delay     := (
     f4.io.deq.bits.sfbs.reduce(_||_) &&
     !f4.io.deq.bits.cfi_idx.valid &&
     !f4.io.enq.valid &&
@@ -1233,6 +1234,18 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   if (IN_SIMULATION) {
     // Add a free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+
+    val f4_with_delay = PlusArg("f4-with-delay", 0, "force f4 to have delay", 32)
+    val delay_counter = RegInit(0.U(32.W))
+    when (f4_with_delay =/= 0.U) {
+      delay_counter := delay_counter + 1.U
+      when (delay_counter === f4_with_delay - 1.U) {
+        delay_counter := 0.U
+      }
+    }
+    when (delay_counter =/= 0.U) {
+      f4_delay := true.B
+    }
 
     val predecode_targte_printf = PlusArg("predecode-target-printf", 0, "print predecode targets", 1)
     when (predecode_targte_printf(0)) {
