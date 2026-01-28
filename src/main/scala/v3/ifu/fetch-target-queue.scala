@@ -266,6 +266,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
 
   // 发送 preds info 到 predecode
+  val s2_next_ftq_idx   = io.s2_ftq_idx + 1.U
+  val target_bypass     = s2_next_ftq_idx === f3_pred_enq_ptr && do_f3_preds_enq
+  dontTouch(target_bypass)
+  dontTouch(s2_next_ftq_idx)
   val s3_ftq_idx        = RegNext(io.s2_ftq_idx)
   val s3_bypass         = RegNext((io.s2_ftq_idx + (!do_f3_preds_enq)) === f3_pred_enq_ptr)
   val s3_ghist          = ghist(2).read(io.s2_ftq_idx.value, true.B)
@@ -298,10 +302,10 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.s3_preds_info.preds_info  := s3_mem_preds_info
     // target pc 还需要一个额外的 bypass，因为要获取 target 是在 ftq_idx + 1，
     // 它可能恰好在 s2 周期才写入
-    val target_bypass = io.s2_ftq_idx + 1.U === f3_pred_enq_ptr && do_f3_preds_enq
+    // val target_bypass = io.s2_ftq_idx + 1.U === f3_pred_enq_ptr && do_f3_preds_enq
     io.s3_preds_info.pred_target := RegNext(Mux(target_bypass,
                                     io.f3_preds_enq.bits.fetch_info.pc,
-                                    pcs((io.s2_ftq_idx + 1.U).value)))
+                                    pcs(s2_next_ftq_idx.value)))
   }
 
   // predecode 重定向
