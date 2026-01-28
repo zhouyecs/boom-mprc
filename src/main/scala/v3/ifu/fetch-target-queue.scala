@@ -508,7 +508,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val idx = io.get_ftq_pc(i).ftq_idx
     val next_idx = WrapInc(idx, num_entries)
     // TODO: remove this
-    val next_is_enq = (next_idx === next_predecode_enq_ptr_debug.value) && io.predecode_enq.fire
+    val next_is_enq = (next_idx === f3_pred_enq_ptr.value) && io.predecode_enq.fire
     val next_pc = Mux(next_is_enq, io.predecode_enq.bits.pc, pcs(next_idx))
     val get_entry = ram(idx)
     val next_entry = ram(next_idx)
@@ -519,7 +519,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
       io.get_ftq_pc(i).ghist   := DontCare
     io.get_ftq_pc(i).pc        := RegNext(pcs(idx))
     io.get_ftq_pc(i).next_pc   := RegNext(next_pc)
-    io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= next_predecode_enq_ptr_debug.value || next_is_enq)
+    io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= f3_pred_enq_ptr.value || next_is_enq)
     
     val com_pc_ptr = Wire(UInt(log2Ceil(ftqSz).W))
     com_pc_ptr := Mux(io.deq.valid, io.deq.bits, deq_ptr.value)
