@@ -597,7 +597,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     }
     val f3_redirect_idx = PriorityEncoder(f3_redirects)
     val f3_targs = f3_preds zip f3_is_ret map { case (p, is_ret) =>
-                    Mux(is_ret, p.ras_top, p.predicted_pc.bits) }
+                    Mux(is_ret && useRAS.B, p.ras_top, p.predicted_pc.bits) }
     val f3_do_redirect = f3_redirects.reduce(_||_) && useBPD.B
     val f3_predicted_target = Mux(f3_do_redirect,
                                   f3_targs(f3_redirect_idx),
