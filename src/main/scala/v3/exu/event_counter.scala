@@ -18,7 +18,7 @@ class SubEventCounterIO(readWidth: Int)(implicit p: Parameters) extends BoomBund
   val reset_counter = Input(Bool())
 }
 
-class SubEventCounter(readWidth: Int)(implicit p: Parameters) extends BoomModule
+class SubEventCounter(readWidth: Int, id: Int)(implicit p: Parameters) extends BoomModule
 {
 	val io = IO(new SubEventCounterIO(readWidth))
 	val reg_counters = io.event_signals.zipWithIndex.map { case (e, i) => freechips.rocketchip.util.WideCounter(64, e, reset = false) }
@@ -40,9 +40,10 @@ class SubEventCounter(readWidth: Int)(implicit p: Parameters) extends BoomModule
     }
   }
 
-  when (RegNext(io.reset_counter)) {
+  when (io.reset_counter) {
     for (w <- 0 until 16) {
-      printf("w: %d, counter: %d\n", w.U, reg_counters(w) )
+      val cnt = reg_counters(w).value + io.event_signals(w)
+      printf("{\"type\": \"event %d\", \"value\": %d}\n", (w + 16 * id).U, cnt)
     }
   }
 
@@ -63,7 +64,7 @@ class EventCounter(readWidth: Int)(implicit p: Parameters) extends BoomModule
   
 	val io = IO(new EventCounterIO(readWidth, 16*subECounterNum))
 
-  val ecounters = for (w <- 0 until subECounterNum) yield { val e = Module(new SubEventCounter(readWidth)); e }
+  val ecounters = for (w <- 0 until subECounterNum) yield { val e = Module(new SubEventCounter(readWidth, w)); e }
 
   //for two cycles delay
 	val reg_read_data = Reg(Vec(readWidth, UInt(64.W)))
