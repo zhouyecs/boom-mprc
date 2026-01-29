@@ -1609,6 +1609,20 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   if (IN_SIMULATION) {
     // Add a free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+
+    val reset_counter_period = PlusArg("reset-event-counters", 0, "Reset event counters every N committed instructions (0 to disable)", 32)
+    val print_count = RegInit(0.U(32.W))
+    val print_count_write = WireDefault(print_count)
+    print_count := print_count_write
+    when (startCounter && reset_counter_period > 0.U) {
+      print_count_write := print_count + PopCount(rob.io.commit.arch_valids.asUInt)
+      when (print_count_write >= reset_counter_period) {
+        print_count := 0.U
+        event_counters.io.reset_counter := true.B
+        printf("**** Event Counters Reset ****\n")
+      }
+    }
+
     val commit_printf = PlusArg("commit-printf", 0, "print predecode targets", 1)
     when (commit_printf(0)) {
     var new_commit_cnt = 0.U
