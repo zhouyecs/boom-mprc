@@ -489,7 +489,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s2_tlb_resp = RegNext(s1_tlb_resp)
   val s2_tlb_miss = RegNext(s1_tlb_miss)
   val s2_is_replay = RegNext(s1_is_replay) && s2_valid
-  val s2_xcpt = s2_valid && (s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay
+  // 当 tlb miss 时 ae.inst 和 pf.inst 为 false
+  val s2_xcpt = s2_valid && (s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst)
   val f3_ready = Wire(Bool())
 
   icache.io.s2_kill := s2_xcpt
@@ -1192,7 +1193,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := !f3_enq_fire
     s0_ifu_vpc   := s2_vpc
     s0_ftq_idx   := Mux(f3_enq_fire, s2_ftq_idx + 1.U, s2_ftq_idx)
-    s0_is_replay := icache.io.resp.valid
+    s0_is_replay := s2_tlb_miss
     s0_ifu_tsrc  := s2_ifu_tsrc
   }
   // 来源 7: 来自 sfence.vma flush 或后端重定向
