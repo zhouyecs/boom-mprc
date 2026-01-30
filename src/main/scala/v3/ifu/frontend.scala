@@ -1101,8 +1101,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   // 当 bpd s0 希望写入的 ftq full 时，暂停 bpd 流水线，使用
   // s0 寄存器暂存 bpd 预测请求
+  val bpd_ahead_limit = WireDefault(false.B) 
   val bpd_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_bpd_ftq_idx)
-  s0_bpd_real_valid := s0_bpd_valid && !bpd_to_ftq_not_ready
+  s0_bpd_real_valid := s0_bpd_valid && !bpd_to_ftq_not_ready && !bpd_ahead_limit
   when (!s0_bpd_real_valid) {
     s0_bpd_valid_reg     := s0_bpd_valid
     s0_bpd_vpc_reg       := s0_bpd_vpc
@@ -1193,7 +1194,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := !f3_enq_fire
     s0_ifu_vpc   := s2_vpc
     s0_ftq_idx   := Mux(f3_enq_fire, s2_ftq_idx + 1.U, s2_ftq_idx)
-    s0_is_replay := s2_tlb_miss
+    s0_is_replay := !s2_tlb_miss
     s0_ifu_tsrc  := s2_ifu_tsrc
   }
   // 来源 7: 来自 sfence.vma flush 或后端重定向
@@ -1246,6 +1247,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     }
     when (delay_counter =/= 0.U) {
       f4_delay := true.B
+    }
+
+    assert (s0_bpd_ftq_idx >= s0_ftq_idx || isFull(s0_bpd_ftq_idx, s0_ftq_idx),
+            "BPD s0 ftq idx should never be behind IFU s0 ftq idx")
+    val bpd_ahead_limit_number = PlusArg("bpd-ahead-limit", 63, "limit bpd ahead of ifu s0", 6)
+    require(log2Ceil(ftqSz) == 5)
+    val bpd_ifu_dist = Wire(UInt((log2Ceil(ftqSz) + 1).W))
+    bpd_ifu_dist := distanceBetween(s0_bpd_ftq_idx, s0_ftq_idx)
+    when (bpd_ahead_limit_number < bpd_ifu_dist) {
+      bpd_ahead_limit := true.B
     }
 
     val predecode_targte_printf = PlusArg("predecode-target-printf", 0, "print predecode targets", 1)
