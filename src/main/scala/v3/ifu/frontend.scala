@@ -1301,23 +1301,57 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     assert (fb_insts_num <= numFetchBufferEntries.U,
             "FetchBuffer instruction count should never exceed fetch buffer size")
 
-    // val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
-    // when (cmd_ras_printf(0)) {
-    //   when (ftq.io.ras_update) {
-    //     printf(p"[${cycleCount} RAS Update] idx=${Hexadecimal(ftq.io.ras_update_idx)} " +
-    //       p"addr=${Hexadecimal(ftq.io.ras_update_pc)}\n")
-    //   } .elsewhen(bpd.io.f3_write_valid) {
-    //     val call_pc = bpd.io.f3_write_addr - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
-    //     printf(p"[${cycleCount} RAS Push] idx=${Hexadecimal(bpd.io.f3_write_idx)} " +
-    //       p"addr=${Hexadecimal(bpd.io.f3_write_addr)} pc=${Hexadecimal(call_pc)}\n")
-    //   }
-    //   when (f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid && f3.io.deq.fire) {
-    //     val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
-    //       f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
-    //     printf(p"[${cycleCount} RAS Pop] idx=${Hexadecimal(f3_fetch_bundle.ghist.ras_idx)} " +
-    //       p"top=${Hexadecimal(f3_fetch_bundle.ras_top)}, pc=${Hexadecimal(ret_pc)}\n")
-    //   }
-    // }
+    val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
+    when (cmd_ras_printf(0)) {
+      when (ftq.io.ras_update) {
+        val ras_update_ftq = RegNext(io.cpu.redirect_ftq_idx)
+        printf(p"[${cycleCount} Backend RAS Update] ftq=${Hexadecimal(ras_update_ftq)} idx=${Hexadecimal(ftq.io.ras_update_idx)} " +
+          p"addr=${Hexadecimal(ftq.io.ras_update_pc)}\n")
+      } .elsewhen(bpd.io.predecode_ras_update_valid) {
+        when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
+          val call_pc = bpd.io.predecode_ras_update_addr - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+          when (predecode_redirect) {
+            printf(p"[${cycleCount} Predecode Update RAS Push] ftq=${Hexadecimal(f3_fetch_bundle.ftq_idx.value)} " +
+              p"idx=${Hexadecimal(bpd.io.predecode_ras_update_idx)} " +
+              p"addr=${Hexadecimal(bpd.io.predecode_ras_update_addr)} pc=${Hexadecimal(call_pc)}\n")
+          } .otherwise {
+            printf(p"[${cycleCount} Predecode RAS Push] ftq=${Hexadecimal(f3_fetch_bundle.ftq_idx.value)} " +
+              p"idx=${Hexadecimal(bpd.io.predecode_ras_update_idx)} " +
+              p"addr=${Hexadecimal(bpd.io.predecode_ras_update_addr)} pc=${Hexadecimal(call_pc)}\n")
+          }
+        } .elsewhen (f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid) {
+          val ret_pc = f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
+            f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U) - Mux(f3_is_rvc(f3_fetch_bundle.cfi_idx.bits), 2.U, 4.U)
+          when (predecode_redirect) {
+            printf(p"[${cycleCount} Predecode Update RAS Pop] ftq=${Hexadecimal(f3_fetch_bundle.ftq_idx.value)} " +
+              p"idx=${Hexadecimal(bpd.io.predecode_ras_update_idx)} " +
+              p"addr=${Hexadecimal(bpd.io.predecode_ras_update_addr)}, pc=${Hexadecimal(ret_pc)}\n")
+          } .otherwise {
+            printf(p"[${cycleCount} Predecode RAS Pop] ftq=${Hexadecimal(f3_fetch_bundle.ftq_idx.value)} " +
+              p"idx=${Hexadecimal(bpd.io.predecode_ras_update_idx)} " +
+              p"addr=${Hexadecimal(bpd.io.predecode_ras_update_addr)} pc=${Hexadecimal(ret_pc)}\n")
+          }
+        } .otherwise {
+          when (predecode_redirect) {
+            printf(p"[${cycleCount} Predecode RAS Update no call ret] ftq=${Hexadecimal(f3_fetch_bundle.ftq_idx.value)} " +
+              p"idx=${Hexadecimal(bpd.io.predecode_ras_update_idx)} " +
+              p"addr=${Hexadecimal(bpd.io.predecode_ras_update_addr)}\n")
+          }// .otherwise {
+           // printf(p"[${cycleCount} Predecode RAS Update] idx=${Hexadecimal(bpd.io.predecode_ras_update_idx)} " +
+           //   p"addr=${Hexadecimal(bpd.io.predecode_ras_update_addr)}\n")
+          // }
+        }
+      } .elsewhen(bpd.io.f3_cfi_is_call_debug) {
+        printf(p"[${cycleCount} F3 BPD RAS Push] ftq=${Hexadecimal(bpd.io.resp.f3_ftq_idx.value)} " +
+          p"idx=${Hexadecimal(bpd.io.f3_ras_update_idx_debug)} " +
+          p"addr=${Hexadecimal(bpd.io.f3_ras_update_addr_debug)} pc=${Hexadecimal(bpd.io.f3_cfi_call_addr_debug)}\n")
+      } .elsewhen(bpd.io.f3_cfi_is_ret_debug) {
+        val top_idx = WrapInc(bpd.io.f3_ras_top_update_idx_debug, nRasEntries)
+        printf(p"[${cycleCount} F3 BPD RAS Pop] ftq=${Hexadecimal(bpd.io.resp.f3_ftq_idx.value)} " +
+          p"idx=${Hexadecimal(top_idx)} " +
+          p"addr=${Hexadecimal(bpd.io.resp.f3_next_pc)} pc=${Hexadecimal(bpd.io.f3_cfi_ret_addr_debug)}\n")
+      }
+    }
   }
 
   // Assertions
@@ -1325,7 +1359,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     assert (f3_bpd_resp.io.deq.fire, "BPD F3 response should fire when F3 fires" )
   }
 
-  when (!s0_ifu_real_valid) {
+  when (!s0_ifu_real_valid && s0_valid) {
     assert(!s0_is_replay, "ifu should not stall replay")
   }
   assert (!(can_use_f1_pred && can_use_ftq_info), "should not be able to use both BPD F1 and FTQ info" )

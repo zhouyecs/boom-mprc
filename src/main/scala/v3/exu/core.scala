@@ -1623,6 +1623,34 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       }
     }
 
+    val cmd_ras_printf = PlusArg("ras-printf", 0, "print RAS updates", 1)
+    when (cmd_ras_printf(0) && brupdate.b2.mispredict && !RegNext(rob.io.flush.valid)) {
+      val mis_uop = brupdate.b2.uop
+      val mis_is_call = (mis_uop.is_jalr || mis_uop.is_jal) && ((mis_uop.ldst === 1.U) || (mis_uop.ldst === 5.U)) // c.jal 在 RV64 中会被译码为 c.addiw
+      val mis_is_ret  = mis_uop.is_jalr && ((mis_uop.lrs1 === 1.U) || (mis_uop.lrs1 === 5.U)) && !mis_is_call
+      printf("**** %d MISPREDICT ftq=%x pc=0x%x target=0x%x is_call=%d is_ret=%d ****\n",
+        cycleCount,
+        mis_uop.ftq_idx,
+        Sext(mis_uop.debug_pc(vaddrBits-1,0), xLen),
+        Sext(io.ifu.redirect_pc(vaddrBits-1,0), xLen),
+        mis_is_call,
+        mis_is_ret)
+    }
+    // 打印出 commit call/ret，方便对照
+    when (cmd_ras_printf(0) && (com_is_call.reduce(_ || _) || com_is_ret.reduce(_ || _))) {
+      for (w <- 0 until coreWidth) {
+        when (com_is_call(w) || com_is_ret(w)) {
+          val uop = rob.io.commit.uops(w)
+            printf("**** %d COMMIT ftq=%x pc=0x%x com_call=%d com_ret=%d ****\n",
+              cycleCount,
+              uop.ftq_idx,
+              Sext(uop.debug_pc(vaddrBits-1,0), xLen),
+              com_is_call(w),
+              com_is_ret(w))
+        }
+      }
+    }
+
     val commit_printf = PlusArg("commit-printf", 0, "print predecode targets", 1)
     when (commit_printf(0)) {
     var new_commit_cnt = 0.U

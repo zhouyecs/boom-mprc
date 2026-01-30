@@ -338,6 +338,17 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // 后端重定向修正 ras top 位置
     val backend_ras_top_update_valid = Input(Bool())
     val backend_ras_top_update_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+
+    // ras debug
+    val f3_cfi_is_call_debug = Output(Bool())
+    val f3_cfi_call_addr_debug = Output(UInt(vaddrBitsExtended.W))
+    val f3_cfi_is_ret_debug = Output(Bool())
+    val f3_cfi_ret_addr_debug = Output(UInt(vaddrBitsExtended.W))
+    val f3_ras_top_update_valid_debug = Output(Bool())
+    val f3_ras_top_update_idx_debug   = Output(UInt(log2Ceil(nRasEntries).W))
+    val f3_ras_update_valid_debug = Output(Bool())
+    val f3_ras_update_idx_debug   = Output(UInt(log2Ceil(nRasEntries).W))
+    val f3_ras_update_addr_debug  = Output(UInt(vaddrBitsExtended.W))
   })
 
   var total_memsize = 0
@@ -366,6 +377,17 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   f3_ras_top_update_idx := DontCare
   f3_ras_update_idx := DontCare
   f3_ras_update_addr := DontCare
+
+  io.f3_ras_top_update_valid_debug := f3_ras_top_update_valid
+  io.f3_ras_top_update_idx_debug   := f3_ras_top_update_idx
+  io.f3_ras_update_valid_debug := f3_ras_update_valid
+  io.f3_ras_update_idx_debug   := f3_ras_update_idx
+  io.f3_ras_update_addr_debug  := f3_ras_update_addr
+  io.f3_cfi_is_call_debug := false.B
+  io.f3_cfi_call_addr_debug := DontCare
+  io.f3_cfi_is_ret_debug := false.B
+  io.f3_cfi_ret_addr_debug := DontCare
+
 
   // 会不会改为 f3_ras_top_idx 更合适一些？
   val f2_ras_top_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
@@ -664,6 +686,9 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
         // ret 指令，pop RAS
         f3_ras_top_update_valid := true.B
         f3_ras_top_update_idx := WrapDec(f2_ras_top_idx, nRasEntries)
+        
+        io.f3_cfi_is_ret_debug := true.B
+        io.f3_cfi_ret_addr_debug := bankAlign(s3_vpc) + (f3_redirect_idx << 1)
       } .elsewhen (f3_is_call(f3_redirect_idx)) {
         // call 指令，push RAS
         f3_ras_update_valid := true.B
@@ -673,6 +698,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
         // 更新 ras top 指针
         f3_ras_top_update_valid := true.B
         f3_ras_top_update_idx := WrapInc(f2_ras_top_idx, nRasEntries)
+
+
+        io.f3_cfi_is_call_debug := true.B
+        io.f3_cfi_call_addr_debug := bankAlign(s3_vpc) + (f3_redirect_idx << 1)
       }
     }
 
