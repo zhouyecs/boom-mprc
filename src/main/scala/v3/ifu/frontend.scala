@@ -1057,6 +1057,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val merged_f3_next_valid   = Mux(select_predecode, !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if),
                                   true.B)
   val merged_f3_redirect     = Mux(select_predecode, predecode_redirect, bpd.io.resp.f3_redirect) 
+  // 当 select_predecode 为 true 时，预译码必为有效
+  val merged_f3_valid        = Mux(select_predecode, true.B, bpd.io.resp.f3_pred_valid)
 
 
   when (bpd.io.resp.f1_pred_valid) {
@@ -1126,8 +1128,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f2_next_ftq_idx = bpd.io.resp.f2_ftq_idx + 1.U
   val can_use_ftq_info = ftq.io.ifu_fetch_pc.valid
   val last_is_f1_pred = s0_ifu_ftq_idx_reg === f1_next_ftq_idx && bpd.io.resp.f1_pred_valid
-  // val last_is_f2_pred = s0_ifu_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
-  // val last_is_f3_pred = s0_ifu_ftq_idx_reg === merged_f3_next_ftq_idx && bpd.io.resp.f3_pred_valid
+  val last_is_f2_pred = s0_ifu_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
+  val last_is_f3_pred = s0_ifu_ftq_idx_reg === merged_f3_next_ftq_idx && merged_f3_valid
 
   // 因为 f2_next_ftq_idx / f3_next_ftq_idx 可能超过 s0_ifu_ftq_idx_reg 一圈，
   // 但是 s0_ifu_ftq_idx_reg 至多比它们大 1 或者 2。使用 >= 来判断
@@ -1135,8 +1137,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_redirect_by_f3 = s0_ifu_ftq_idx_reg >= merged_f3_next_ftq_idx && merged_f3_redirect
 
   val can_use_f1_pred = last_is_f1_pred
-  val can_use_f2_pred = s0_redirect_by_f2
-  val can_use_f3_pred = s0_redirect_by_f3
+  val can_use_f2_pred = s0_redirect_by_f2 || last_is_f2_pred
+  val can_use_f3_pred = s0_redirect_by_f3 || last_is_f3_pred
   
   // f3 redirect 和 s2 replay 可能同时发生，当 f3 是更早一级流水线时，f3 redirect 优先级更高
   val f3_suppress_s2_replay = s2_ftq_idx === merged_f3_next_ftq_idx && merged_f3_redirect
