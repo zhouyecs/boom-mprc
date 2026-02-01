@@ -549,12 +549,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   tlb.io.sfence         := RegNext(io.cpu.sfence)
   tlb.io.kill           := false.B
 
-  trans_queue.io.enq.valid   := !tlb.io.resp.miss && !f1_pf_clear && s1_pf_valid
+  val tlb_force_miss = WireDefault(false.B)
+  
+  trans_queue.io.enq.valid   := !tlb.io.resp.miss && !f1_pf_clear && s1_pf_valid && !tlb_force_miss
   trans_queue.io.enq.bits    := tlb.io.resp
   trans_queue.io.enq_ftq_idx := s1_pf_ftq_idx
 
   // TODO: 增加 s2_ready 的约束
-  val s1_pf_can_go = !tlb.io.resp.miss
+  val s1_pf_can_go = (!tlb.io.resp.miss && !tlb_force_miss) || f1_pf_clear
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
@@ -1299,7 +1301,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   }
   // 只要 s1 能把位置让出来就更新 s1 寄存器，即使此时 s0_pf_real_valid 为 false
   // 避免 s1_pf_valid 总是为 true，重复请求 tlb
-  s0_pf_fire := s1_pf_can_go 
+  s0_pf_fire := !s1_pf_valid || s1_pf_can_go 
 
 
   //////////////////////////////////////
@@ -1548,6 +1550,18 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         printf(p"[${cycleCount} tlb trans dequeue] ftq_idx=${Hexadecimal(s1_ftq_idx.value)} " +
           p"pc=${Hexadecimal(s1_vpc)} deq_ftq_idx=${Hexadecimal(trans_queue.io.deq_ftq_idx_debug.value)}\n")
       }
+    }
+
+    val tlb_force_miss_num = PlusArg("tlb-force-miss-num", 0, "number of forced tlb misses", 32)
+    val tlb_miss_counter = RegInit(0.U(32.W))
+    when (tlb_force_miss_num =/= 0.U) {
+      tlb_miss_counter := tlb_miss_counter + 1.U
+      when (tlb_miss_counter === tlb_force_miss_num - 1.U) {
+        tlb_miss_counter := 0.U
+      }
+    }
+    when (tlb_miss_counter =/= 0.U) {
+      tlb_force_miss := true.B
     }
   }
 
