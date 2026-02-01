@@ -383,7 +383,8 @@ class ITLBLookup(implicit p: Parameters) extends BoomModule()(p)
     assert(io.f3_ftq_idx >= last_ftq_idx || io.f3_ftq_idx + 1.U === last_ftq_idx,
       "ITLBLookup: cannot flush more than one entry at a time")
   }
-  // TODO: 加上 debug vpc 信号，保证 ifu 拿到的 tlb resp 是正确的
+
+  io.deq_ftq_idx_debug := DontCare
 
   if (IN_SIMULATION) {
     val ftq_idx_queue = withReset(reset.asBool || io.flush) {
@@ -392,9 +393,8 @@ class ITLBLookup(implicit p: Parameters) extends BoomModule()(p)
     ftq_idx_queue.io.enq.valid := last_valid && !kill_last
     ftq_idx_queue.io.enq.bits  := last_ftq_idx
     ftq_idx_queue.io.deq.ready := io.deq.ready
-
     io.deq_ftq_idx_debug := Mux(ftq_idx_queue.io.deq.valid, ftq_idx_queue.io.deq.bits, io.enq_ftq_idx)
-
+    
     assert (trans_queue.io.count === ftq_idx_queue.io.count,
       "ITLBLookup: internal queue and ftq idx queue count should match")
   }
