@@ -161,6 +161,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // f3 preds enq
     val f3_preds_enq     = Flipped(Valid(new F3PredsToFTQ()))
     val f3_ftq_idx_debug = Input(new FTQPtr())
+    // 获取 prefetch 的 pc
+    val pf_ftq_idx = Input(new FTQPtr())
+    val pf_pc = Output(Valid(UInt(vaddrBitsExtended.W)))
     // 获取 ifu 取指 pc
     val ifu_fetch_ftq_idx = Input(new FTQPtr()) 
     val ifu_fetch_pc = Valid(UInt(vaddrBitsExtended.W))
@@ -218,6 +221,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val ram      = Reg(Vec(num_entries, new FTQBundle))
   val ghist    = Seq.fill(3) { SyncReadMem(num_entries, new GlobalHistory) }
   val preds_info = SyncReadMem(num_entries, new FTQPredsInfo)
+
+  io.pf_pc.valid := io.pf_ftq_idx < f3_pred_enq_ptr
+  io.pf_pc.bits  := pcs(io.pf_ftq_idx.value)
 
   // 当 fetch idx 和 pred ptr 的 value 相等但 flag 不同时，一定是
   // pred ptr 领先 fetch idx 一圈

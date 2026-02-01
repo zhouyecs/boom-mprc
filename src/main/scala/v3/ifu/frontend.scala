@@ -328,6 +328,78 @@ class BoomFrontendBundle(val outer: BoomFrontend) extends CoreBundle()(outer.p)
   val ptw = new TLBPTWIO()
 }
 
+class ITLBLookup(implicit p: Parameters) extends BoomModule()(p)
+{
+  // Use CoreBundle the same way as RocketCore (new CoreBundle()(p) { ... })
+  // so that the underlying ParameterizedBundle is properly initialized.
+  val io = IO(new CoreBundle()(p) {
+    val enq = Flipped(Decoupled(new TLBResp(log2Ceil(fetchBytes))))
+    val enq_ftq_idx = Input(new FTQPtr)
+    val deq = Decoupled(new TLBResp(log2Ceil(fetchBytes)))
+    val flush = Input(Bool())
+    val bpd_f3_flush = Input(Bool())
+    val f3_ftq_idx = Input(new FTQPtr)
+
+    val deq_ftq_idx_debug = Output(new FTQPtr)
+    val predecode_redirect_debug = Input(Bool())
+  })
+
+  val last_entry = Reg(new TLBResp(log2Ceil(fetchBytes)))
+  val last_ftq_idx = Reg(new FTQPtr)
+  val last_valid = RegInit(false.B)
+
+  val trans_queue = withReset(reset.asBool || io.flush) {
+    Module(new Queue(new TLBResp(log2Ceil(fetchBytes)), ftqSz, flow = true))
+  }
+
+  val last_push_flush = io.bpd_f3_flush && (io.f3_ftq_idx < last_ftq_idx)
+  val kill_last = last_push_flush || io.flush
+
+  // Internal queue always accepts entries; we rely on ftqSz being large
+  // enough and assert this condition.
+  trans_queue.io.enq.valid := last_valid && !kill_last
+  trans_queue.io.enq.bits  := last_entry
+
+  // Dequeue side just mirrors the internal queue.
+  trans_queue.io.deq.ready := io.deq.ready
+  // 维持 flow 特性
+  io.deq.valid             := trans_queue.io.deq.valid || io.enq.valid
+  io.deq.bits              := trans_queue.io.deq.bits
+  when (!trans_queue.io.deq.valid) {
+    io.deq.bits := io.enq.bits
+  }
+
+  // Always ready to accept an enqueue; elements are first stored in
+  // last_entry and committed into trans_queue in the next cycle.
+  io.enq.ready := true.B
+
+  last_entry := io.enq.bits
+  last_ftq_idx := io.enq_ftq_idx
+  // enq fire 的同时且没有直接 flow 出去, 该表项才会进入到 last_entry 中
+  last_valid := io.enq.fire && (!io.deq.fire || trans_queue.io.deq.valid)
+
+  assert(trans_queue.io.enq.ready, "ITLBLookup: internal queue should never be full")
+  when (last_valid && io.bpd_f3_flush && !io.predecode_redirect_debug) {
+    assert(io.f3_ftq_idx >= last_ftq_idx || io.f3_ftq_idx + 1.U === last_ftq_idx,
+      "ITLBLookup: cannot flush more than one entry at a time")
+  }
+  // TODO: 加上 debug vpc 信号，保证 ifu 拿到的 tlb resp 是正确的
+
+  if (IN_SIMULATION) {
+    val ftq_idx_queue = withReset(reset.asBool || io.flush) {
+      Module(new Queue(new FTQPtr, ftqSz, flow = true))
+    }
+    ftq_idx_queue.io.enq.valid := last_valid && !kill_last
+    ftq_idx_queue.io.enq.bits  := last_ftq_idx
+    ftq_idx_queue.io.deq.ready := io.deq.ready
+
+    io.deq_ftq_idx_debug := Mux(ftq_idx_queue.io.deq.valid, ftq_idx_queue.io.deq.bits, io.enq_ftq_idx)
+
+    assert (trans_queue.io.count === ftq_idx_queue.io.count,
+      "ITLBLookup: internal queue and ftq idx queue count should match")
+  }
+}
+
 /**
  * Main Frontend module that connects the icache, TLB, fetch controller,
  * and branch prediction pipeline together.
@@ -393,6 +465,17 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_bpd_ftq_idx = WireInit(s0_bpd_ftq_idx_reg)
   val s0_bpd_ghist   = WireInit(s0_bpd_ghist_reg)
 
+  // prefetch s0 信号声明
+  val s0_pf_valid_reg   = RegInit(false.B)
+  val s0_pf_vpc_reg     = RegInit(0.U(vaddrBitsExtended.W))
+  val s0_pf_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
+  
+  val s0_pf_valid       = WireDefault(s0_pf_valid_reg)
+  val s0_pf_vpc         = WireDefault(s0_pf_vpc_reg)
+  val s0_pf_ftq_idx     = WireDefault(s0_pf_ftq_idx_reg)
+  // 表示 s0 数据能否进入到 s1 寄存器
+  val s0_pf_fire        = WireDefault(false.B)
+
   // ifu s0 信号声明
   val s0_ifu_valid_reg   = RegInit(false.B)
   val s0_ifu_vpc_reg     = RegInit(0.U(vaddrBitsExtended.W))
@@ -410,6 +493,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   // 考虑了 ftq full 后的 s0 valid 信号
   val s0_bpd_real_valid = Wire(Bool())
+  val s0_pf_real_valid  = Wire(Bool())
   val s0_ifu_real_valid = Wire(Bool())
 
   // f3 预测重定向和预译码重定向可能同时发生，如果它们对应同一级流水线
@@ -443,6 +527,36 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f0_req.bits.tsrc    := DontCare
 
   // --------------------------------------------------------
+  // **** Prefetch (F1) ****
+  //      Translate VPC
+  // --------------------------------------------------------
+
+  val trans_queue = Module(new ITLBLookup)
+  val s1_is_sfence = RegNext(s0_is_sfence)
+
+  val s1_pf_vpc       = RegEnable(s0_pf_vpc, s0_pf_fire)
+  val s1_pf_ftq_idx   = RegEnable(s0_pf_ftq_idx, s0_pf_fire)
+  val s1_pf_valid     = RegEnable(s0_pf_real_valid, false.B, s0_pf_fire)
+  val f1_pf_clear     = WireInit(false.B)
+
+  tlb.io.req.valid      := (s1_pf_valid && !f1_pf_clear) || s1_is_sfence
+  tlb.io.req.bits.cmd   := DontCare
+  tlb.io.req.bits.vaddr := s1_pf_vpc
+  tlb.io.req.bits.passthrough := false.B
+  tlb.io.req.bits.size  := log2Ceil(coreInstBytes * fetchWidth).U
+  tlb.io.req.bits.v     := io.ptw.status.v
+  tlb.io.req.bits.prv   := io.ptw.status.prv
+  tlb.io.sfence         := RegNext(io.cpu.sfence)
+  tlb.io.kill           := false.B
+
+  trans_queue.io.enq.valid   := !tlb.io.resp.miss && !f1_pf_clear && s1_pf_valid
+  trans_queue.io.enq.bits    := tlb.io.resp
+  trans_queue.io.enq_ftq_idx := s1_pf_ftq_idx
+
+  // TODO: 增加 s2_ready 的约束
+  val s1_pf_can_go = !tlb.io.resp.miss
+
+  // --------------------------------------------------------
   // **** ICache Access (F1) ****
   //      Translate VPC
   // --------------------------------------------------------
@@ -452,27 +566,20 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_ifu_tsrc  = RegNext(s0_ifu_tsrc)
   val s1_ghist     = RegNext(s0_bpd_ghist)
   val s1_is_replay = RegNext(s0_is_replay)
-  val s1_is_sfence = RegNext(s0_is_sfence)
   val f1_clear     = WireInit(false.B)
   val bpd_f1_clear = WireInit(false.B)
-  tlb.io.req.valid      := (s1_valid && !s1_is_replay && !f1_clear) || s1_is_sfence
-  tlb.io.req.bits.cmd   := DontCare
-  tlb.io.req.bits.vaddr := s1_vpc
-  tlb.io.req.bits.passthrough := false.B
-  tlb.io.req.bits.size  := log2Ceil(coreInstBytes * fetchWidth).U
-  tlb.io.req.bits.v     := io.ptw.status.v
-  tlb.io.req.bits.prv   := io.ptw.status.prv
-  tlb.io.sfence         := RegNext(io.cpu.sfence)
-  tlb.io.kill           := false.B
 
-  val s1_tlb_miss = !s1_is_replay && tlb.io.resp.miss
-  val s1_tlb_resp = Mux(s1_is_replay, RegNext(s0_replay_resp), tlb.io.resp)
-  val s1_ppc  = Mux(s1_is_replay, RegNext(s0_replay_ppc), tlb.io.resp.paddr)
+  // ifu 这边不再访问 tlb，从 trans_queue 中拿翻译结果
+  trans_queue.io.deq.ready := s1_valid && !s1_is_replay && !f1_clear
+  val s1_tlb_miss = !s1_is_replay && !trans_queue.io.deq.valid
+  val s1_tlb_resp = Mux(s1_is_replay, RegNext(s0_replay_resp), trans_queue.io.deq.bits)
+  val s1_ppc  = Mux(s1_is_replay, RegNext(s0_replay_ppc), trans_queue.io.deq.bits.paddr)
 
   icache.io.s1_paddr := s1_ppc
   icache.io.s1_kill  := s1_tlb_miss || f1_clear
 
-  io.cpu.itlb_valid_access := tlb.io.req.valid
+  // TODO: 重新考虑这里的逻辑
+  io.cpu.itlb_valid_access := (s1_valid && !s1_is_replay && !f1_clear) || s1_is_sfence
   io.cpu.itlb_hit := tlb.io.req.valid && !s1_tlb_miss
 
   // --------------------------------------------------------
@@ -1118,14 +1225,90 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   }
 
   //////////////////////////////////////
+  // prefetch s0 逻辑                  //
+  //////////////////////////////////////
+
+  ftq.io.pf_ftq_idx := s0_pf_ftq_idx_reg
+
+  val f1_next_ftq_idx = bpd.io.resp.f1_ftq_idx + 1.U
+  val f2_next_ftq_idx = bpd.io.resp.f2_ftq_idx + 1.U
+
+  trans_queue.io.flush := predecode_redirect || io.cpu.redirect_flush || io.cpu.sfence.valid
+  trans_queue.io.bpd_f3_flush := merged_f3_redirect
+  trans_queue.io.f3_ftq_idx := merged_f3_ftq_idx
+  trans_queue.io.predecode_redirect_debug := predecode_redirect
+
+  val s1_pf_clear_by_f2 = bpd.io.resp.f2_redirect && (s1_pf_ftq_idx > bpd.io.resp.f2_ftq_idx)
+  val s1_pf_clear_by_f3 = merged_f3_redirect && (s1_pf_ftq_idx > merged_f3_ftq_idx)
+  f1_pf_clear := s1_pf_clear_by_f2 || s1_pf_clear_by_f3 || io.cpu.sfence.valid || io.cpu.redirect_flush
+
+  val pf_can_use_ftq_info = ftq.io.pf_pc.valid
+  val pf_last_is_f1_pred = s0_pf_ftq_idx_reg === f1_next_ftq_idx && bpd.io.resp.f1_pred_valid
+  val pf_last_is_f2_pred = s0_pf_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
+  val pf_last_is_f3_pred = s0_pf_ftq_idx_reg === merged_f3_next_ftq_idx && merged_f3_valid
+
+  val s0_pf_redirect_by_f2 = s0_pf_ftq_idx_reg >= f2_next_ftq_idx && bpd.io.resp.f2_redirect
+  val s0_pf_redirect_by_f3 = s0_pf_ftq_idx_reg >= merged_f3_next_ftq_idx && merged_f3_redirect
+
+  val pf_can_use_f1_pred = pf_last_is_f1_pred
+  val pf_can_use_f2_pred = s0_pf_redirect_by_f2 || pf_last_is_f2_pred
+  val pf_can_use_f3_pred = s0_pf_redirect_by_f3 || pf_last_is_f3_pred
+
+  when (pf_can_use_ftq_info) {
+    s0_pf_valid     := true.B
+    s0_pf_vpc       := ftq.io.pf_pc.bits
+    s0_pf_ftq_idx   := s0_pf_ftq_idx_reg
+  }
+  when (pf_can_use_f1_pred) {
+    s0_pf_valid     := true.B
+    s0_pf_vpc       := bpd.io.resp.f1_next_pc
+    s0_pf_ftq_idx   := f1_next_ftq_idx
+  }
+  when (pf_can_use_f2_pred) {
+    s0_pf_valid     := true.B
+    s0_pf_vpc       := bpd.io.resp.f2_next_pc
+    s0_pf_ftq_idx   := f2_next_ftq_idx
+  }
+  when (pf_can_use_f3_pred) {
+    s0_pf_valid     := merged_f3_next_valid
+    s0_pf_vpc       := merged_f3_next_pc
+    s0_pf_ftq_idx   := merged_f3_next_ftq_idx
+  }
+  when (io.cpu.sfence.valid) {
+    s0_pf_valid     := false.B
+    s0_pf_ftq_idx   := s0_pf_ftq_idx_reg
+  } .elsewhen(io.cpu.redirect_flush) {
+    s0_pf_valid     := io.cpu.redirect_val
+    s0_pf_vpc       := io.cpu.redirect_pc
+    s0_pf_ftq_idx   := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_pf_ftq_idx_reg)
+  }
+
+  // 当 pf s0 希望写入的 ftq full 时，暂停 prefetch 流水线，使用
+  // s0 寄存器暂存 pf 请求
+  val pf_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_pf_ftq_idx)
+  // 如果 s1 暂停了，那 s0 也不能发射
+  s0_pf_real_valid := s0_pf_valid && !pf_to_ftq_not_ready && (!s1_pf_valid || s1_pf_can_go)
+  when (!s0_pf_real_valid) {
+    s0_pf_valid_reg     := s0_pf_valid
+    s0_pf_vpc_reg       := s0_pf_vpc
+    s0_pf_ftq_idx_reg   := s0_pf_ftq_idx
+  } .otherwise {
+    // 如果成功发射到 s1，则清空 valid 寄存器
+    s0_pf_valid_reg   := false.B
+    s0_pf_ftq_idx_reg := s0_pf_ftq_idx + 1.U
+  }
+  // 只要 s1 能把位置让出来就更新 s1 寄存器，即使此时 s0_pf_real_valid 为 false
+  // 避免 s1_pf_valid 总是为 true，重复请求 tlb
+  s0_pf_fire := s1_pf_can_go 
+
+
+  //////////////////////////////////////
   // ifu s0 逻辑                       //
   //////////////////////////////////////
   
   // 向 ftq 请求新的 fetch pc
   ftq.io.ifu_fetch_ftq_idx := s0_ifu_ftq_idx_reg
 
-  val f1_next_ftq_idx = bpd.io.resp.f1_ftq_idx + 1.U
-  val f2_next_ftq_idx = bpd.io.resp.f2_ftq_idx + 1.U
   val can_use_ftq_info = ftq.io.ifu_fetch_pc.valid
   val last_is_f1_pred = s0_ifu_ftq_idx_reg === f1_next_ftq_idx && bpd.io.resp.f1_pred_valid
   val last_is_f2_pred = s0_ifu_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
@@ -1354,6 +1537,18 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           p"addr=${Hexadecimal(bpd.io.resp.f3_next_pc)} pc=${Hexadecimal(bpd.io.f3_cfi_ret_addr_debug)}\n")
       }
     }
+
+    val tlb_trans_printf = PlusArg("tlb-trans-printf", 0, "print tlb translations", 1)
+    when (tlb_trans_printf(0)) {
+      when (trans_queue.io.enq.fire) {
+        printf(p"[${cycleCount} tlb trans enqueue] ftq_idx=${Hexadecimal(trans_queue.io.enq_ftq_idx.value)} " +
+          p"pc=${Hexadecimal(s1_pf_vpc)}\n")
+      }
+      when (trans_queue.io.deq.fire) {
+        printf(p"[${cycleCount} tlb trans dequeue] ftq_idx=${Hexadecimal(s1_ftq_idx.value)} " +
+          p"pc=${Hexadecimal(s1_vpc)} deq_ftq_idx=${Hexadecimal(trans_queue.io.deq_ftq_idx_debug.value)}\n")
+      }
+    }
   }
 
   // Assertions
@@ -1447,6 +1642,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       "f3 ftq idx can't go faster than ifu s0 ftq idx" )
     assert (!s2_valid || f3_fetch_bundle.ftq_idx < s2_ftq_idx, 
       "f3 ftq idx must be less than s2 ftq idx" )
+  }
+  if (IN_SIMULATION) {
+    when (trans_queue.io.deq.fire) {
+      assert (trans_queue.io.deq_ftq_idx_debug === s1_ftq_idx,
+        "transition queue dequeue ftq idx should match s1 ftq idx" )
+    }
   }
   // TODO: 断言 bpd 给 ftq 的输入和 ftq 给 predecode 的输入一致 
 }
