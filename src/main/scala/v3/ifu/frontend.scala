@@ -1278,6 +1278,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   }
   when (io.cpu.sfence.valid) {
     s0_pf_valid     := false.B
+    s0_pf_vpc       := io.cpu.sfence.bits.addr
     s0_pf_ftq_idx   := s0_pf_ftq_idx_reg
   } .elsewhen(io.cpu.redirect_flush) {
     s0_pf_valid     := io.cpu.redirect_val
