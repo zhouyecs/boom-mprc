@@ -104,6 +104,7 @@ object GetPropertyByHartId
  * @param outer top level ICache class
  */
 class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
+  with HasBoomCoreParameters
   with HasBoomFrontendParameters
 {
   val enableICacheDelay = tileParams.core.asInstanceOf[BoomCoreParams].enableICacheDelay
@@ -174,14 +175,21 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))
   val s1_bankid = Wire(Bool())
 
+  val s1_tag_only_hit = Wire(Vec(nWays, Bool()))
+  val s1_vb_hit = Wire(Vec(nWays, Bool()))
+
   for (i <- 0 until nWays) {
     val s1_idx = io.s1_paddr(untagBits-1,blockOffBits)
     val s1_tag = io.s1_paddr(tagBits+untagBits-1,untagBits)
-    val s1_vb = vb_array(Cat(i.U, s1_idx))
+    s1_vb_hit(i) := vb_array(Cat(i.U, s1_idx))
     val tag = tag_rdata(i)
-    s1_tag_hit(i) := s1_vb && tag === s1_tag
+    s1_tag_only_hit(i) := tag === s1_tag
+    s1_tag_hit(i) := s1_vb_hit(i) && s1_tag_only_hit(i)
   }
-  assert(PopCount(s1_tag_hit) <= 1.U || !s1_valid)
+
+  dontTouch(s1_tag_only_hit)
+  dontTouch(s1_vb_hit)
+  dontTouch(s1_tag_hit)
 
   val ramDepth = if (refillsToOneBank && nBanks == 2) {
     nSets * refillCycles / 2
@@ -342,6 +350,40 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   when (!refill_valid) { invalidated := false.B }
   when (refill_fire) { refill_valid := true.B }
   when (refill_done) { refill_valid := false.B }
+
+  // Printf
+  if (IN_SIMULATION) {
+    // free-running cycle counter for simulation
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+
+    // plusarg to enable ICache debug prints
+    val icache_printf = PlusArg("icache-printf", 0, "print icache debug info", 1)
+
+    when (icache_printf(0)) {
+      // 1) ICache sends miss request to lower level (TL-A channel)
+      when (tl_out.a.fire) {
+        val req_paddr = (refill_paddr >> blockOffBits) << blockOffBits
+        printf(p"[${cycleCount} ICache Req] paddr=${Hexadecimal(req_paddr)}\n")
+      }
+
+      // 2) Cache line refill completes
+      when (refill_done) {
+        val line_paddr = (refill_paddr >> blockOffBits) << blockOffBits
+        printf(p"[${cycleCount} ICache Refill Done] paddr=${Hexadecimal(line_paddr)} " +
+          p"set=${Hexadecimal(refill_idx)} way=${Hexadecimal(repl_way)}, cancelled=${invalidated}\n")
+      }
+
+      // 3) Tag hit in ICache
+      when (s1_valid && s1_hit && PopCount(s1_tag_hit) > 1.U) {
+        printf(p"[${cycleCount} ICache Hit] paddr=${Hexadecimal(io.s1_paddr)} s1_tag_hit=${Binary(s1_tag_hit.asUInt)}\n")
+      }
+    }
+  }
+
+  assert(PopCount(s1_tag_hit) <= 1.U || !s1_valid || io.s1_kill,
+    "Multiple ICache ways hit in s1")
+  assert(!s1_valid || io.s1_kill || io.s1_paddr(pgIdxBits-1,0) === RegNext(io.req.bits.addr(pgIdxBits-1,0)),
+    "s1_paddr does not match request address")
 
   override def toString: String = BoomCoreStringPrefix(
     "==L1-ICache==",
