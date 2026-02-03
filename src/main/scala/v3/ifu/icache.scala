@@ -97,6 +97,174 @@ object GetPropertyByHartId
   }
 }
 
+// Copied from XiangShan ICacheMissUnit.scala
+class MSHRResp(implicit p: Parameters) extends CoreBundle with HasBoomFrontendParameters {
+  val paddr  :  UInt = UInt(paddrBits.W)
+  val tag:      UInt = UInt(tagBits.W)
+  val vSetIdx:  UInt = UInt(idxBits.W)
+  val way:      UInt = UInt(wayBits.W)
+}
+
+class LookUpMSHR(implicit p: Parameters) extends CoreBundle with HasBoomFrontendParameters {
+  val paddr: UInt                = UInt(paddrBits.W)
+  val hit:   Bool                = Input(Bool())
+}
+
+class ICacheMSHRIO(implicit p: Parameters) extends CoreBundle with HasBoomFrontendParameters {
+  val fencei:    Bool                       = Input(Bool())
+  val flush:     Bool                       = Input(Bool())
+  val invalid:   Bool                       = Input(Bool())
+  val req:       DecoupledIO[UInt]          = Flipped(DecoupledIO(UInt(paddrBits.W)))
+  val acquire:   DecoupledIO[UInt]          = DecoupledIO(UInt(paddrBits.W))
+  val lookUps:   LookUpMSHR                 = Flipped(new LookUpMSHR)
+  val resp:      Valid[MSHRResp]            = ValidIO(new MSHRResp)
+  val victimWay: UInt                       = Input(UInt(wayBits.W))
+
+  val addr_valid_debug: Bool = Output(Bool())
+}
+
+// MSHR 与 flush 的交互
+//   * 在 MSHR 发起 l2 请求之前，发生 flush，是否要 invalid 该 MSHR，在请求 fire 的同一周期呢？
+//   * 在 l2 请求 fire 了之后，发生 flush，是否要 invalid 该写回？
+// BOOM 的行为
+//   * 忽略重定向造成的 flush，接受 fence.i 造成的 flush
+//   * 在 MSHR 发起 l2 请求之前或请求 fire 的同一周期，忽略拉高的 fence.i 信号
+//   * 在 l2 请求 fire 之后的 flush 信号会 invalid 后续写回（即使最后一个写回周期和 fence.i 同时拉高）
+// 新引入的 MSHR 尽可能与 BOOM 保持一致：
+//   * 在 fence.i 拉高时，prefetch MSHR 和 fetch MSHR 都会被 invalid。如果 l2 请求已经 fire 了,
+//     会 invalid 后续写回
+//   * fetch MSHR 不响应重定向造成的 flush
+//   * 如果重定向造成的 flush 在 prefetch MSHR 发起 l2 请求之前或请求 fire 的同一周期, invalid 该 MSHR,
+//     否则忽略该 flush 信号（因为对应的 cache line 大概率已经 invalid 掉了，写回不亏）
+
+// 时序上：
+//   * 预期的时序：s2 周期检查 mshr hit，入 mshr 的同时就可以发起 l2 请求（即 flow 为 true）
+//   * mshr 处于 invalid 状态时才接受新请求（即 pipe 为 false）
+
+// 冒险：在 s1 周期和 s2 周期我们都需要检查 MSHR hit，避免出现向下级 cache 请求已经写回的 cache line
+// s1 周期我们检查 refill_done，看它与 io.s1_paddr 是否匹配，如果匹配则认为 MSHR hit
+// s2 周期我们检查每个 MSHR 的 paddr 与 s2_paddr 是否匹配，如果匹配则认为 MSHR hit。如果 flush 或
+// fence.i 同时拉高呢？这也无所谓，首先 fetch MSHR 不响应 flush，而 prefetch MSHR 遇到 flush 的话，
+// prefetch 流水线应该同步清空。而 fence.i 本身就会 invalidate MSHR（这里的关键在于，误判为 MSHR hit
+// 是安全的，因为 fetch 这边会 replay，重复请求。而误判为 MSHR miss 会导致对同一个 cache line 发起多
+// 个 MSHR 请求，导致 ICache 中包含重复表项，这是危险的）
+
+// TODO: 目前的实现是，当 isFetch 为 true 时，行为与 BOOM 保持一致；当 isFetch 为 false 时，接受 fence.i 和 flush 信号，
+// 但是 flush 也会 invalidate 写回
+class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends BoomModule
+  with HasBoomFrontendParameters
+{
+  val io: ICacheMSHRIO = IO(new ICacheMSHRIO)
+
+  private val valid = RegInit(Bool(), false.B)
+  // this MSHR doesn't respond to fetch and sram
+  private val flush  = RegInit(Bool(), false.B)
+  private val fencei = RegInit(Bool(), false.B)
+  // this MSHR has been issued
+  private val issue = RegInit(Bool(), false.B)
+
+  private val blkPaddr = RegInit(UInt((paddrBits - blockOffBits).W), 0.U)
+  private val way      = RegInit(UInt(wayBits.W), 0.U)
+
+  // look up and return result at the same cycle
+  if (isFetch) {
+    io.lookUps.hit := valid && !fencei && (io.lookUps.paddr(paddrBits-1, blockOffBits) === blkPaddr)
+  } else {
+    io.lookUps.hit := valid && !fencei && (io.lookUps.paddr(paddrBits-1, blockOffBits) === blkPaddr)
+  }
+
+  // invalid when the req hasn't been issued
+  if (isFetch) {
+    when (io.fencei) {
+      when(!issue) {
+        valid := false.B
+      } .otherwise {
+        fencei := true.B
+      }
+    }
+  } else {
+    when(io.fencei || io.flush) {
+      when(!issue) {
+        valid := false.B
+      } .otherwise {
+        fencei := true.B
+        flush  := true.B
+      }
+    }
+  }
+
+
+  // receive request and register
+  if (isFetch) {
+    io.req.ready := !valid && !io.fencei
+  } else {
+    io.req.ready := !valid && !io.flush && !io.fencei
+  }
+  when(io.req.fire) {
+    valid    := true.B
+    flush    := false.B
+    issue    := false.B
+    fencei   := false.B
+    blkPaddr := io.req.bits(paddrBits-1, blockOffBits)
+  }
+
+  // send request to L2
+  if (isFetch) {
+    io.acquire.valid := (valid || io.req.fire) && !issue && !io.fencei
+  } else {
+    io.acquire.valid := (valid || io.req.fire) && !issue && !io.flush && !io.fencei
+  }
+  io.acquire.bits := Cat(Mux(valid, blkPaddr, io.req.bits(paddrBits-1, blockOffBits)), 0.U(blockOffBits.W))
+
+  // get victim way when acquire fire
+  when(io.acquire.fire) {
+    issue := true.B
+    way   := io.victimWay
+  }
+
+  // invalid request when grant finish
+  when(io.invalid) {
+    valid  := false.B
+    issue  := false.B
+    fencei := false.B
+    if (!isFetch) {
+      flush  := false.B
+    }
+  }
+
+  // offer the information other than data for write sram and response fetch
+  if (isFetch) {
+    io.resp.valid       := valid && !fencei
+  } else {
+    io.resp.valid         := valid && (!flush && !fencei)
+  }
+  io.resp.bits.paddr    := Cat(blkPaddr, 0.U(blockOffBits.W))
+  io.resp.bits.tag      := blkPaddr(tagBits+idxBits-1,idxBits)
+  io.resp.bits.vSetIdx  := blkPaddr(idxBits-1, 0)
+  io.resp.bits.way      := way
+
+  require(tagBits + idxBits == blkPaddr.getWidth)
+
+  io.addr_valid_debug := issue
+  if (IN_SIMULATION) {
+    when (io.invalid) {
+      assert (valid, p"ICache invalidating an invalid MSHR (ID = $ID)\n")
+      assert (issue, p"ICache invalidating a non-issued MSHR (ID = $ID)\n")
+    }
+    when (!valid) {
+      assert (!issue, p"ICache MSHR (ID = $ID) is not valid but has been issued\n")
+      assert (!fencei, p"ICache MSHR (ID = $ID) is not valid but has fencei set\n")
+    }
+    when (!issue) {
+      assert (!fencei, p"ICache MSHR (ID = $ID) is not issued but has fencei set\n")
+    }
+  }
+}
+// TODO: 
+//   * 检查 MSHR 写回和流水线读 Tag Array 的冒险，避免为已经 hit 的 cache line 再发起 l2 请求
+//   * 检查 fence.i 会 invalid 所有的 in-flight 读写和 cache line
+// TODO: 校验 prefetch MSHR 的实现, 尤其是重定向的 flush，我觉得 s1 flush，s2 flush 和 MSHR flush
+// 需要分别看待
 
 /**
  * Main ICache module
@@ -134,15 +302,25 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s1_hit = s1_tag_hit.reduce(_||_)
   val s2_valid = RegNext(s1_valid && !io.s1_kill)
   val s2_hit = RegNext(s1_hit)
+  val s2_paddr = RegNext(io.s1_paddr)
 
+  val fetchMSHR = Module(new ICacheMSHR(isFetch = true, ID = 0))
 
-  val invalidated = Reg(Bool())
-  val refill_valid = RegInit(false.B)
+  val s1_MSHR_hit = Wire(Bool())
+  val s2_MSHR_hit = fetchMSHR.io.lookUps.hit
+  val access_hit = s2_hit || s2_MSHR_hit || RegNext(s1_MSHR_hit)  
+
+  fetchMSHR.io.fencei := io.invalidate
+  fetchMSHR.io.flush  := false.B
+  fetchMSHR.io.lookUps.paddr := s2_paddr
+  fetchMSHR.io.req.valid := s2_valid && !access_hit && !io.s2_kill
+  fetchMSHR.io.req.bits := s2_paddr
+
+  val invalidated = !fetchMSHR.io.resp.valid
   val refill_fire = tl_out.a.fire
-  val s2_miss = s2_valid && !s2_hit && !RegNext(refill_valid)
-  val refill_paddr = RegEnable(io.s1_paddr, s1_valid && !(refill_valid || s2_miss))
-  val refill_tag = refill_paddr(tagBits+untagBits-1,untagBits)
-  val refill_idx = refill_paddr(untagBits-1,blockOffBits)
+  val refill_paddr = fetchMSHR.io.resp.bits.paddr
+  val refill_tag = fetchMSHR.io.resp.bits.tag
+  val refill_idx = fetchMSHR.io.resp.bits.vSetIdx
   val refill_one_beat = tl_out.d.fire && edge_out.hasData(tl_out.d.bits)
 
   io.req.ready := !refill_one_beat
@@ -154,7 +332,14 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   tl_out.d.ready := true.B
   require (edge_out.manager.minLatency > 0)
 
-  val repl_way = if (isDM) 0.U else LFSR(16, refill_fire)(log2Ceil(nWays)-1,0)
+  val initial_fire = RegInit(true.B)
+  initial_fire := false.B
+  val victim_way = if (isDM) 0.U else LFSR(16, refill_fire || initial_fire)(log2Ceil(nWays)-1,0)
+  val repl_way = fetchMSHR.io.resp.bits.way
+  fetchMSHR.io.victimWay := victim_way
+  fetchMSHR.io.invalid := refill_done
+  s1_MSHR_hit := refill_done && !invalidated && fetchMSHR.io.resp.bits.paddr(paddrBits-1, blockOffBits) ===
+                  io.s1_paddr(paddrBits-1, blockOffBits)
 
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
   val tag_rdata = tag_array.read(s0_vaddr(untagBits-1, blockOffBits), !refill_done && s0_valid)
@@ -169,7 +354,6 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   when (io.invalidate) {
     vb_array := 0.U
-    invalidated := true.B
   }
 
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))
@@ -336,20 +520,17 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.data := s2_data
   io.resp.valid := s2_valid && s2_hit
 
-  tl_out.a.valid := s2_miss && !refill_valid && !io.s2_kill
+  fetchMSHR.io.acquire.ready := tl_out.a.ready
+  tl_out.a.valid := fetchMSHR.io.acquire.valid
   tl_out.a.bits := edge_out.Get(
     fromSource = 0.U,
-    toAddress = (refill_paddr >> blockOffBits) << blockOffBits,
+    toAddress = fetchMSHR.io.acquire.bits,
     lgSize = lgCacheBlockBytes.U)._2
   tl_out.b.ready := true.B
   tl_out.c.valid := false.B
   tl_out.e.valid := false.B
 
   io.perf.acquire := tl_out.a.fire
-
-  when (!refill_valid) { invalidated := false.B }
-  when (refill_fire) { refill_valid := true.B }
-  when (refill_done) { refill_valid := false.B }
 
   // Printf
   if (IN_SIMULATION) {
@@ -384,11 +565,17 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     "Multiple ICache ways hit in s1")
   assert(!s1_valid || io.s1_kill || io.s1_paddr(pgIdxBits-1,0) === RegNext(io.req.bits.addr(pgIdxBits-1,0)),
     "s1_paddr does not match request address")
+  assert(!refill_one_beat || fetchMSHR.io.addr_valid_debug,
+    "ICache refill without a valid MSHR")
 
   override def toString: String = BoomCoreStringPrefix(
     "==L1-ICache==",
     "Fetch bytes   : " + cacheParams.fetchBytes,
     "Block bytes   : " + (1 << blockOffBits),
+    "vaddr bits    : " + vaddrBits,
+    "vaddr ext bits: " + vaddrBitsExtended,
+    "min pg level  : " + minPgLevels,
+    "pg level      : " + pgLevels,
     "Row bytes     : " + rowBytes,
     "Word bits     : " + wordBits,
     "Sets          : " + nSets,
