@@ -43,7 +43,7 @@ class ICache(
 {
   lazy val module = new ICacheModule(this)
   val masterNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
-    sourceId = IdRange(0, 1 + icacheParams.prefetch.toInt), // 0=refill, 1=hint
+    sourceId = IdRange(0, icacheParams.fetchMSHRNum),
     name = s"Core ${staticIdForMetadataUseOnly} ICache")))))
 
   val size = icacheParams.nSets * icacheParams.nWays * icacheParams.blockBytes
@@ -304,41 +304,69 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s2_hit = RegNext(s1_hit)
   val s2_paddr = RegNext(io.s1_paddr)
 
-  val fetchMSHR = Module(new ICacheMSHR(isFetch = true, ID = 0))
+  val nFetchMSHRs = outer.icacheParams.fetchMSHRNum
+  val fetchMSHRs = Seq.tabulate(nFetchMSHRs) { i =>
+    Module(new ICacheMSHR(isFetch = true, ID = i))
+  }
 
   val s1_MSHR_hit = Wire(Bool())
-  val s2_MSHR_hit = fetchMSHR.io.lookUps.hit
-  val access_hit = s2_hit || s2_MSHR_hit || RegNext(s1_MSHR_hit)  
+  val s2_MSHR_hit_vec = VecInit(fetchMSHRs.map(_.io.lookUps.hit))
+  val s2_MSHR_hit = s2_MSHR_hit_vec.asUInt.orR
+  val access_hit = s2_hit || s2_MSHR_hit || RegNext(s1_MSHR_hit)
 
-  fetchMSHR.io.fencei := io.invalidate
-  fetchMSHR.io.flush  := false.B
-  fetchMSHR.io.lookUps.paddr := s2_paddr
-  fetchMSHR.io.req.valid := s2_valid && !access_hit && !io.s2_kill
-  fetchMSHR.io.req.bits := s2_paddr
+  // Connect common control signals to all fetch MSHRs
+  fetchMSHRs.foreach { m =>
+    m.io.fencei := io.invalidate
+    m.io.flush  := false.B
+    m.io.lookUps.paddr := s2_paddr
+  }
 
-  val invalidated = !fetchMSHR.io.resp.valid
+  // Allocate miss requests into the first available MSHR
+  val need_mshr = s2_valid && !access_hit && !io.s2_kill
+  var alloc_taken = false.B
+  for (i <- 0 until nFetchMSHRs) {
+    val can_alloc = need_mshr && fetchMSHRs(i).io.req.ready && !alloc_taken
+    fetchMSHRs(i).io.req.valid := can_alloc
+    fetchMSHRs(i).io.req.bits  := s2_paddr
+    alloc_taken = alloc_taken || can_alloc
+  }
+
+  val mshr_resp_valids = VecInit(fetchMSHRs.map(_.io.resp.valid))
+  val mshr_resp_paddrs = VecInit(fetchMSHRs.map(_.io.resp.bits.paddr))
+  val mshr_resp_tags   = VecInit(fetchMSHRs.map(_.io.resp.bits.tag))
+  val mshr_resp_idxs   = VecInit(fetchMSHRs.map(_.io.resp.bits.vSetIdx))
+  val mshr_resp_ways   = VecInit(fetchMSHRs.map(_.io.resp.bits.way))
+
   val refill_fire = tl_out.a.fire
-  val refill_paddr = fetchMSHR.io.resp.bits.paddr
-  val refill_tag = fetchMSHR.io.resp.bits.tag
-  val refill_idx = fetchMSHR.io.resp.bits.vSetIdx
   val refill_one_beat = tl_out.d.fire && edge_out.hasData(tl_out.d.bits)
+  val (_, _, d_done, refill_cnt) = edge_out.count(tl_out.d)
+  val refill_done = refill_one_beat && d_done
+
+  val refill_src = tl_out.d.bits.source
+  val refill_src_oh = UIntToOH(refill_src, nFetchMSHRs)
+
+  val refill_resp_valid = Mux1H(refill_src_oh, mshr_resp_valids)
+  val invalidated = !refill_resp_valid
+  val refill_paddr = Mux1H(refill_src_oh, mshr_resp_paddrs)
+  val refill_tag   = Mux1H(refill_src_oh, mshr_resp_tags)
+  val refill_idx   = Mux1H(refill_src_oh, mshr_resp_idxs)
 
   io.req.ready := !refill_one_beat
   //Enable_PerfCounter_Support
   io.icache_valid_access := s2_valid
 
-  val (_, _, d_done, refill_cnt) = edge_out.count(tl_out.d)
-  val refill_done = refill_one_beat && d_done
   tl_out.d.ready := true.B
   require (edge_out.manager.minLatency > 0)
 
   val initial_fire = RegInit(true.B)
   initial_fire := false.B
   val victim_way = if (isDM) 0.U else LFSR(16, refill_fire || initial_fire)(log2Ceil(nWays)-1,0)
-  val repl_way = fetchMSHR.io.resp.bits.way
-  fetchMSHR.io.victimWay := victim_way
-  fetchMSHR.io.invalid := refill_done
-  s1_MSHR_hit := refill_done && !invalidated && fetchMSHR.io.resp.bits.paddr(paddrBits-1, blockOffBits) ===
+  val repl_way = Mux1H(refill_src_oh, mshr_resp_ways)
+  fetchMSHRs.foreach(_.io.victimWay := victim_way)
+  for (i <- 0 until nFetchMSHRs) {
+    fetchMSHRs(i).io.invalid := refill_done && (refill_src === i.U)
+  }
+  s1_MSHR_hit := refill_done && !invalidated && refill_paddr(paddrBits-1, blockOffBits) ===
                   io.s1_paddr(paddrBits-1, blockOffBits)
 
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
@@ -519,12 +547,19 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.replay := DontCare
   io.resp.bits.data := s2_data
   io.resp.valid := s2_valid && s2_hit
+  // TL-A: arbitrate among fetch MSHRs and encode MSHR ID into source field
+  val acq_arb = Module(new RRArbiter(UInt(paddrBits.W), nFetchMSHRs))
+  for (i <- 0 until nFetchMSHRs) {
+    acq_arb.io.in(i) <> fetchMSHRs(i).io.acquire
+  }
 
-  fetchMSHR.io.acquire.ready := tl_out.a.ready
-  tl_out.a.valid := fetchMSHR.io.acquire.valid
+  tl_out.a.valid := acq_arb.io.out.valid
+  acq_arb.io.out.ready := tl_out.a.ready
+
+  val acq_source = acq_arb.io.chosen
   tl_out.a.bits := edge_out.Get(
-    fromSource = 0.U,
-    toAddress = fetchMSHR.io.acquire.bits,
+    fromSource = acq_source,
+    toAddress = acq_arb.io.out.bits,
     lgSize = lgCacheBlockBytes.U)._2
   tl_out.b.ready := true.B
   tl_out.c.valid := false.B
@@ -544,13 +579,13 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
       // 1) ICache sends miss request to lower level (TL-A channel)
       when (tl_out.a.fire) {
         val req_paddr = (refill_paddr >> blockOffBits) << blockOffBits
-        printf(p"[${cycleCount} ICache Req] paddr=${Hexadecimal(req_paddr)}\n")
+        printf(p"[${cycleCount} ICache Req] mshr=${acq_source} paddr=${Hexadecimal(req_paddr)}\n")
       }
 
       // 2) Cache line refill completes
       when (refill_done) {
         val line_paddr = (refill_paddr >> blockOffBits) << blockOffBits
-        printf(p"[${cycleCount} ICache Refill Done] paddr=${Hexadecimal(line_paddr)} " +
+        printf(p"[${cycleCount} ICache Refill Done] mshr=${refill_src} paddr=${Hexadecimal(line_paddr)} " +
           p"set=${Hexadecimal(refill_idx)} way=${Hexadecimal(repl_way)}, cancelled=${invalidated}\n")
       }
 
@@ -565,8 +600,48 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     "Multiple ICache ways hit in s1")
   assert(!s1_valid || io.s1_kill || io.s1_paddr(pgIdxBits-1,0) === RegNext(io.req.bits.addr(pgIdxBits-1,0)),
     "s1_paddr does not match request address")
-  assert(!refill_one_beat || fetchMSHR.io.addr_valid_debug,
+  val mshr_addr_valids = VecInit(fetchMSHRs.map(_.io.addr_valid_debug))
+  val cur_mshr_addr_valid = Mux1H(refill_src_oh, mshr_addr_valids)
+  assert(!refill_one_beat || cur_mshr_addr_valid,
     "ICache refill without a valid MSHR")
+
+  if (IN_SIMULATION) {
+    // Assertions on TL-D source range and non-interleaving between MSHRs.
+    val d_inflight = RegInit(false.B)
+    val d_source_reg = Reg(UInt(tl_out.d.bits.source.getWidth.W))
+    // Track previous resp.valid value for the in-flight line's MSHR so that
+    // we can detect false->true transitions while the line is in flight
+    // (true->false is allowed for fence.i / flush).
+    val d_prev_resp_valid = RegInit(false.B)
+
+    when (refill_one_beat) {
+      // 1) TL-D source must be within valid fetch MSHR ID range.
+      assert(refill_src < nFetchMSHRs.U,
+        "ICache TL-D source out of range of fetch MSHRs")
+
+      // 2) While a line refill is in flight, all data beats must
+      //    come from the same source until refill_done is true.
+      when (!d_inflight) {
+        d_inflight := true.B
+        d_source_reg := refill_src
+        d_prev_resp_valid := refill_resp_valid
+      } .otherwise {
+        assert(refill_src === d_source_reg,
+          "ICache TL-D source interleaving between MSHRs within a single line refill")
+
+        // 3) For the MSHR corresponding to this source, resp.valid must not
+        //    switch from false to true while this line refill is in flight.
+        assert(!(d_prev_resp_valid === false.B && refill_resp_valid === true.B),
+          "ICache MSHR resp.valid changed from false to true during an in-flight line refill")
+
+        d_prev_resp_valid := refill_resp_valid
+      }
+
+      when (refill_done) {
+        d_inflight := false.B
+      }
+    }
+  }
 
   override def toString: String = BoomCoreStringPrefix(
     "==L1-ICache==",
