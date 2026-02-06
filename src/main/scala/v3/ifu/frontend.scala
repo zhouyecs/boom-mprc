@@ -473,8 +473,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_pf_valid       = WireDefault(s0_pf_valid_reg)
   val s0_pf_vpc         = WireDefault(s0_pf_vpc_reg)
   val s0_pf_ftq_idx     = WireDefault(s0_pf_ftq_idx_reg)
-  // 表示 s0 数据能否进入到 s1 寄存器
-  val s0_pf_fire        = WireDefault(false.B)
 
   // ifu s0 信号声明
   val s0_ifu_valid_reg   = RegInit(false.B)
@@ -534,9 +532,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val trans_queue = Module(new ITLBLookup)
   val s1_is_sfence = RegNext(s0_is_sfence)
 
-  val s1_pf_vpc       = RegEnable(s0_pf_vpc, s0_pf_fire)
-  val s1_pf_ftq_idx   = RegEnable(s0_pf_ftq_idx, s0_pf_fire)
-  val s1_pf_valid     = RegEnable(s0_pf_real_valid, false.B, s0_pf_fire)
+  val s1_pf_vpc       = RegNext(s0_pf_vpc)
+  val s1_pf_ftq_idx   = RegNext(s0_pf_ftq_idx)
+  val s1_pf_valid     = RegNext(s0_pf_real_valid, false.B)
   val f1_pf_clear     = WireInit(false.B)
 
   tlb.io.req.valid      := (s1_pf_valid && !f1_pf_clear) || s1_is_sfence
@@ -556,7 +554,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   trans_queue.io.enq_ftq_idx := s1_pf_ftq_idx
 
   // TODO: 增加 s2_ready 的约束
-  val s1_pf_can_go = (!tlb.io.resp.miss && !tlb_force_miss) || f1_pf_clear
+  val s1_pf_can_go = (!tlb.io.resp.miss && !tlb_force_miss)
 
   // --------------------------------------------------------
   // **** ICache Access (F1) ****
@@ -1250,6 +1248,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   trans_queue.io.f3_ftq_idx := merged_f3_ftq_idx
   trans_queue.io.predecode_redirect_debug := predecode_redirect
 
+  val s1_pf_replay = s1_pf_valid && !s1_pf_can_go && !f1_pf_clear
+
   val s1_pf_clear_by_f2 = bpd.io.resp.f2_redirect && (s1_pf_ftq_idx > bpd.io.resp.f2_ftq_idx)
   val s1_pf_clear_by_f3 = merged_f3_redirect && (s1_pf_ftq_idx > merged_f3_ftq_idx)
   f1_pf_clear := s1_pf_clear_by_f2 || s1_pf_clear_by_f3 || io.cpu.sfence.valid || io.cpu.redirect_flush
@@ -1286,6 +1286,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_pf_vpc       := merged_f3_next_pc
     s0_pf_ftq_idx   := merged_f3_next_ftq_idx
   }
+  when (s1_pf_replay) {
+    s0_pf_valid     := true.B
+    s0_pf_vpc       := s1_pf_vpc
+    s0_pf_ftq_idx   := s1_pf_ftq_idx
+  }
   when (io.cpu.sfence.valid) {
     s0_pf_valid     := false.B
     s0_pf_vpc       := io.cpu.sfence.bits.addr
@@ -1299,8 +1304,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // 当 pf s0 希望写入的 ftq full 时，暂停 prefetch 流水线，使用
   // s0 寄存器暂存 pf 请求
   val pf_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_pf_ftq_idx)
-  // 如果 s1 暂停了，那 s0 也不能发射
-  s0_pf_real_valid := s0_pf_valid && !pf_to_ftq_not_ready && (!s1_pf_valid || s1_pf_can_go)
+  s0_pf_real_valid := s0_pf_valid && !pf_to_ftq_not_ready
   when (!s0_pf_real_valid) {
     s0_pf_valid_reg     := s0_pf_valid
     s0_pf_vpc_reg       := s0_pf_vpc
@@ -1310,9 +1314,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_pf_valid_reg   := false.B
     s0_pf_ftq_idx_reg := s0_pf_ftq_idx + 1.U
   }
-  // 只要 s1 能把位置让出来就更新 s1 寄存器，即使此时 s0_pf_real_valid 为 false
-  // 避免 s1_pf_valid 总是为 true，重复请求 tlb
-  s0_pf_fire := !s1_pf_valid || s1_pf_can_go 
 
 
   //////////////////////////////////////
@@ -1672,6 +1673,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     when (trans_queue.io.deq.fire) {
       assert (trans_queue.io.deq_ftq_idx_debug === s1_ftq_idx,
         "transition queue dequeue ftq idx should match s1 ftq idx" )
+    }
+    when (s1_pf_replay) {
+      assert (!s0_pf_redirect_by_f2 || pf_last_is_f2_pred)
+      assert (!s0_pf_redirect_by_f3 || pf_last_is_f3_pred)
     }
   }
   // TODO: 断言 bpd 给 ftq 的输入和 ftq 给 predecode 的输入一致 

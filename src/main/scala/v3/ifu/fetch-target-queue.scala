@@ -664,8 +664,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
         "FTQ: f3_pred enqueue should never pass predecode enqueue" )
     }
   }
-  assert (f3_pred_enq_ptr >= next_predecode_enq_ptr_debug,
-    "FTQ: f3_pred_enq_ptr should always be ahead of predecode_enq_ptr")
+  assert (f3_pred_enq_ptr >= next_predecode_enq_ptr_debug ||
+          isFull(f3_pred_enq_ptr, next_predecode_enq_ptr_debug),
+          "FTQ: f3_pred_enq_ptr should always be ahead of predecode_enq_ptr")
   
   if (IN_SIMULATION) {
     // Track which FTQ entries are valid (for assertions only).
