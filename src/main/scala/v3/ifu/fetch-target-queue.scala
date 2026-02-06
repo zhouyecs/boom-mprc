@@ -172,6 +172,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val s3_preds_info = Output(new FTQToPredecodeInfo())
     // predecode 重定向信号
     val predecode_redirect = Input(Valid(new FTQPtr()))
+    val merged_f3_target = Input(UInt(vaddrBitsExtended.W))
     // predeocde 信息存入 FTQ
     val predecode_enq = Flipped(Valid(new FetchBundle()))
     // 指示当前队尾指针
@@ -193,6 +194,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val debug_fetch_pc = Output(Vec(coreWidth, UInt(vaddrBitsExtended.W)))
 
     val redirect = Input(Valid(UInt(idx_sz.W)))
+    val redirect_target = Input(UInt(vaddrBitsExtended.W))
     // 区分 rob flush 和 mispredict
     val rob_flush = Input(Bool())
     val rob_flush_pc_lob = Input(UInt(log2Ceil(icBlockBytes).W))
@@ -222,9 +224,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val ghist    = Seq.fill(3) { SyncReadMem(num_entries, new GlobalHistory) }
   val preds_info = SyncReadMem(num_entries, new FTQPredsInfo)
 
-  io.pf_pc.valid := io.pf_ftq_idx < f3_pred_enq_ptr
-  io.pf_pc.bits  := pcs(io.pf_ftq_idx.value)
-
   // 当 fetch idx 和 pred ptr 的 value 相等但 flag 不同时，一定是
   // pred ptr 领先 fetch idx 一圈
   io.ifu_fetch_pc.valid := io.ifu_fetch_ftq_idx < f3_pred_enq_ptr
@@ -239,6 +238,14 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val last_f3_enq_target     = Reg(UInt(vaddrBitsExtended.W))
   val new_preds_info         = Wire(new FTQPredsInfo)
   new_preds_info        := DontCare
+  
+  val first_f3_enq_done = RegInit(false.B)
+  when (do_f3_preds_enq) {
+    first_f3_enq_done := true.B
+  }
+  io.pf_pc.valid := io.pf_ftq_idx < f3_pred_enq_ptr || (io.pf_ftq_idx === f3_pred_enq_ptr && first_f3_enq_done)
+  io.pf_pc.bits  := Mux(io.pf_ftq_idx === f3_pred_enq_ptr, last_f3_enq_target, pcs(io.pf_ftq_idx.value))
+
   when (do_f3_preds_enq) {
     new_preds_info.br_taken    := io.f3_preds_enq.bits.preds_info.br_taken
     new_preds_info.jal_target  := io.f3_preds_enq.bits.preds_info.jal_target
@@ -257,7 +264,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     last_f3_enq_ras_idx := io.f3_preds_enq.bits.preds_info.ras_idx
     last_f3_enq_ras_top := io.f3_preds_enq.bits.preds_info.ras_top
     last_f3_enq_preds_info := new_preds_info
-    last_f3_enq_target     := io.f3_preds_enq.bits.target_info.f3_pred_target
+    last_f3_enq_target     := io.merged_f3_target
 
     // TODO: FTQ bundle 的 ras idx 和 ras top 字段会被 f3 preds 和 predecode 都写入，
     // 是否需要把这俩字段单独分离出来？
@@ -317,6 +324,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   // predecode 重定向
   when (io.predecode_redirect.valid) {
     f3_pred_enq_ptr := io.predecode_redirect.bits + 1.U
+    last_f3_enq_target := io.merged_f3_target
   }
 
   val do_predecode_enq = io.predecode_enq.valid
@@ -470,6 +478,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val f3_pred_enq_ptr2 = FTQPtr.inverse(f3_pred_enq_ptr1)
     val proper_f3_pred_enq_ptr = Mux(f3_pred_enq_ptr > f3_pred_enq_ptr1, f3_pred_enq_ptr1, f3_pred_enq_ptr2)
     f3_pred_enq_ptr := proper_f3_pred_enq_ptr + 1.U
+    last_f3_enq_target := io.redirect_target
 
     when (io.rob_flush) {
       val new_cfi_idx = (io.rob_flush_pc_lob ^

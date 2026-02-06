@@ -1128,6 +1128,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   ftq.io.redirect.valid   := io.cpu.redirect_val
   ftq.io.redirect.bits    := io.cpu.redirect_ftq_idx
+  ftq.io.redirect_target  := io.cpu.redirect_pc
   ftq.io.rob_flush        := io.cpu.rob_flush
   ftq.io.rob_flush_pc_lob := io.cpu.rob_flush_pc_lob
   fb.io.clear := false.B
@@ -1169,6 +1170,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // 当 select_predecode 为 true 时，预译码必为有效
   val merged_f3_valid        = Mux(select_predecode, true.B, bpd.io.resp.f3_pred_valid)
 
+  ftq.io.merged_f3_target    := merged_f3_next_pc
 
   when (bpd.io.resp.f1_pred_valid) {
     s0_bpd_valid   := true.B
