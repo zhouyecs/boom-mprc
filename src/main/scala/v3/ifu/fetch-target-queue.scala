@@ -224,11 +224,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   val ghist    = Seq.fill(3) { SyncReadMem(num_entries, new GlobalHistory) }
   val preds_info = SyncReadMem(num_entries, new FTQPredsInfo)
 
-  // 当 fetch idx 和 pred ptr 的 value 相等但 flag 不同时，一定是
-  // pred ptr 领先 fetch idx 一圈
-  io.ifu_fetch_pc.valid := io.ifu_fetch_ftq_idx < f3_pred_enq_ptr
-  io.ifu_fetch_pc.bits  := pcs(io.ifu_fetch_ftq_idx.value)
-
   // 处理 f3 preds enq
   val do_f3_preds_enq        = io.f3_preds_enq.valid
   val last_f3_enq_ghist      = Reg(new GlobalHistory)
@@ -245,6 +240,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
   io.pf_pc.valid := io.pf_ftq_idx < f3_pred_enq_ptr || (io.pf_ftq_idx === f3_pred_enq_ptr && first_f3_enq_done)
   io.pf_pc.bits  := Mux(io.pf_ftq_idx === f3_pred_enq_ptr, last_f3_enq_target, pcs(io.pf_ftq_idx.value))
+
+  // 当 fetch idx 和 pred ptr 的 value 相等但 flag 不同时，一定是
+  // pred ptr 领先 fetch idx 一圈
+  io.ifu_fetch_pc.valid := io.ifu_fetch_ftq_idx < f3_pred_enq_ptr ||
+                          (io.ifu_fetch_ftq_idx === f3_pred_enq_ptr && first_f3_enq_done)
+  io.ifu_fetch_pc.bits  := Mux(io.ifu_fetch_ftq_idx === f3_pred_enq_ptr,
+                          last_f3_enq_target, pcs(io.ifu_fetch_ftq_idx.value))
 
   when (do_f3_preds_enq) {
     new_preds_info.br_taken    := io.f3_preds_enq.bits.preds_info.br_taken
