@@ -459,11 +459,23 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_bpd_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
   val s0_bpd_ghist_reg   = RegInit((0.U).asTypeOf(new GlobalHistory))
 
+  // s0 bpd vpc 的来源（仅用于 debug 打印）
+  val bpdS0SrcRegDebug :: bpdS0SrcF1Debug :: bpdS0SrcF2Debug :: bpdS0SrcPredecodeDebug :: bpdS0SrcF3Debug :: bpdS0SrcSfenceDebug :: bpdS0SrcRedirectDebug :: Nil = Enum(7)
+  val BPD_S0_SRC_REG_DEBUG       = bpdS0SrcRegDebug
+  val BPD_S0_SRC_F1_DEBUG        = bpdS0SrcF1Debug
+  val BPD_S0_SRC_F2_DEBUG        = bpdS0SrcF2Debug
+  val BPD_S0_SRC_PREDECODE_DEBUG = bpdS0SrcPredecodeDebug
+  val BPD_S0_SRC_F3_DEBUG        = bpdS0SrcF3Debug
+  val BPD_S0_SRC_SFENCE_DEBUG    = bpdS0SrcSfenceDebug
+  val BPD_S0_SRC_REDIRECT_DEBUG  = bpdS0SrcRedirectDebug
+  val s0_bpd_tsrc_debug_reg = RegInit(BPD_S0_SRC_REG_DEBUG)
+
   val s0_bpd_valid   = WireInit(s0_bpd_valid_reg)
   val s0_bpd_vpc     = WireInit(s0_bpd_vpc_reg)
   // 表示 s0 周期 bpd 要使用的 ftq idx，始终有效
   val s0_bpd_ftq_idx = WireInit(s0_bpd_ftq_idx_reg)
   val s0_bpd_ghist   = WireInit(s0_bpd_ghist_reg)
+  val s0_bpd_tsrc_debug    = WireInit(s0_bpd_tsrc_debug_reg)
 
   // prefetch s0 信号声明
   val s0_pf_valid_reg   = RegInit(false.B)
@@ -480,10 +492,24 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s0_ifu_ftq_idx_reg = RegInit(FTQPtr(false.B, 0.U))
   val s0_ifu_tsrc_reg    = RegInit(BSRC_C)
 
+  // s0 ifu vpc 的来源（仅用于 debug 打印）
+  val ifuS0SrcRegDebug :: ifuS0SrcFtqDebug :: ifuS0SrcF1Debug :: ifuS0SrcF2Debug :: ifuS0SrcPredecodeDebug :: ifuS0SrcF3Debug :: ifuS0SrcS2ReplayDebug :: ifuS0SrcSfenceDebug :: ifuS0SrcRedirectDebug :: Nil = Enum(9)
+  val IFU_S0_SRC_REG_DEBUG        = ifuS0SrcRegDebug
+  val IFU_S0_SRC_FTQ_DEBUG        = ifuS0SrcFtqDebug
+  val IFU_S0_SRC_F1_DEBUG         = ifuS0SrcF1Debug
+  val IFU_S0_SRC_F2_DEBUG         = ifuS0SrcF2Debug
+  val IFU_S0_SRC_PREDECODE_DEBUG  = ifuS0SrcPredecodeDebug
+  val IFU_S0_SRC_F3_DEBUG         = ifuS0SrcF3Debug
+  val IFU_S0_SRC_S2_REPLAY_DEBUG  = ifuS0SrcS2ReplayDebug
+  val IFU_S0_SRC_SFENCE_DEBUG     = ifuS0SrcSfenceDebug
+  val IFU_S0_SRC_REDIRECT_DEBUG   = ifuS0SrcRedirectDebug
+  val s0_ifu_tsrc_debug_reg = RegInit(IFU_S0_SRC_REG_DEBUG)
+
   val s0_ifu_vpc   = WireInit(s0_ifu_vpc_reg)
   val s0_ftq_idx   = WireInit(s0_ifu_ftq_idx_reg)
   val s0_valid     = WireInit(s0_ifu_valid_reg)
   val s0_ifu_tsrc  = WireInit(s0_ifu_tsrc_reg)
+  val s0_ifu_tsrc_debug = WireInit(s0_ifu_tsrc_debug_reg)
   val s0_is_replay = WireInit(false.B)
   val s0_is_sfence = WireInit(false.B)
   val s0_replay_resp = Wire(new TLBResp(log2Ceil(fetchBytes)))
@@ -1175,12 +1201,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_bpd_vpc     := bpd.io.resp.f1_next_pc
     s0_bpd_ftq_idx := bpd.io.resp.f1_ftq_idx + 1.U
     s0_bpd_ghist   := bpd.io.resp.f1_next_ghist
+    s0_bpd_tsrc_debug    := BPD_S0_SRC_F1_DEBUG
   }
   when (bpd.io.resp.f2_redirect) {
     s0_bpd_valid   := true.B
     s0_bpd_vpc     := bpd.io.resp.f2_next_pc
     s0_bpd_ftq_idx := bpd.io.resp.f2_ftq_idx + 1.U
     s0_bpd_ghist   := bpd.io.resp.f2_next_ghist
+
+    s0_bpd_tsrc_debug    := BPD_S0_SRC_F2_DEBUG
 
     bpd_f1_clear   := true.B
   }
@@ -1190,6 +1219,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_bpd_ftq_idx := merged_f3_next_ftq_idx
     s0_bpd_ghist   := merged_f3_next_ghist
 
+    s0_bpd_tsrc_debug    := Mux(select_predecode,
+      BPD_S0_SRC_PREDECODE_DEBUG,
+      BPD_S0_SRC_F3_DEBUG)
+
     bpd_f1_clear   := true.B
     bpd_f2_clear   := true.B
   }
@@ -1198,6 +1231,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_bpd_valid   := false.B
     s0_bpd_ftq_idx := s0_bpd_ftq_idx_reg
 
+    s0_bpd_tsrc_debug    := BPD_S0_SRC_SFENCE_DEBUG
+
     bpd_f1_clear   := true.B
     bpd_f2_clear   := true.B
   }.elsewhen (io.cpu.redirect_flush) {
@@ -1205,6 +1240,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_bpd_vpc     := io.cpu.redirect_pc
     s0_bpd_ftq_idx := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_bpd_ftq_idx_reg)
     s0_bpd_ghist   := io.cpu.redirect_ghist
+
+    s0_bpd_tsrc_debug    := BPD_S0_SRC_REDIRECT_DEBUG
   
     bpd_f1_clear   := true.B
     bpd_f2_clear   := true.B
@@ -1220,10 +1257,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_bpd_vpc_reg       := s0_bpd_vpc
     s0_bpd_ghist_reg     := s0_bpd_ghist
     s0_bpd_ftq_idx_reg   := s0_bpd_ftq_idx
+    s0_bpd_tsrc_debug_reg      := s0_bpd_tsrc_debug
   } .otherwise {
     // 如果成功发射到 s1，则清空 valid 寄存器
     s0_bpd_valid_reg     := false.B
     s0_bpd_ftq_idx_reg   := s0_bpd_ftq_idx + 1.U
+    s0_bpd_tsrc_debug_reg      := BPD_S0_SRC_REG_DEBUG
   }
 
   //////////////////////////////////////
@@ -1362,6 +1401,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ftq_idx   := s0_ifu_ftq_idx_reg
     s0_is_replay := false.B
     s0_ifu_tsrc  := BSRC_1
+    s0_ifu_tsrc_debug := IFU_S0_SRC_FTQ_DEBUG
   }
   // 来源 2: 来自 bpd 的 f1 预测
   when (can_use_f1_pred) {
@@ -1370,6 +1410,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ftq_idx   := f1_next_ftq_idx
     s0_is_replay := false.B
     s0_ifu_tsrc  := BSRC_1
+    s0_ifu_tsrc_debug := IFU_S0_SRC_F1_DEBUG
   }
   // 来源 3: 来自 bpd 的 f2 预测或重定向
   when (can_use_f2_pred) {
@@ -1378,6 +1419,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ftq_idx   := f2_next_ftq_idx
     s0_is_replay := false.B
     s0_ifu_tsrc  := BSRC_2
+    s0_ifu_tsrc_debug := IFU_S0_SRC_F2_DEBUG
   }
   // 来源 4: 来自 bpd 的 f3 预测或重定向
   when (can_use_f3_pred) {
@@ -1386,6 +1428,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ftq_idx   := merged_f3_next_ftq_idx
     s0_is_replay := false.B
     s0_ifu_tsrc  := BSRC_3
+    s0_ifu_tsrc_debug := Mux(select_predecode,
+      IFU_S0_SRC_PREDECODE_DEBUG,
+      IFU_S0_SRC_F3_DEBUG)
   }
   // 来源 5: 来自 s2 重放
   when (s2_replay_happen && !f3_suppress_s2_replay) {
@@ -1395,6 +1440,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ftq_idx   := Mux(f3_enq_fire, s2_ftq_idx + 1.U, s2_ftq_idx)
     s0_is_replay := !s2_tlb_miss
     s0_ifu_tsrc  := s2_ifu_tsrc
+    s0_ifu_tsrc_debug := IFU_S0_SRC_S2_REPLAY_DEBUG
   }
   // 来源 7: 来自 sfence.vma flush 或后端重定向
   when (io.cpu.sfence.valid) {
@@ -1404,12 +1450,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_is_replay := false.B
 
     s0_is_sfence := true.B
+    s0_ifu_tsrc_debug := IFU_S0_SRC_SFENCE_DEBUG
   }.elsewhen (io.cpu.redirect_flush) {
     s0_valid     := io.cpu.redirect_val
     s0_ifu_vpc   := io.cpu.redirect_pc
     s0_ftq_idx   := Mux(io.cpu.redirect_val, ftq.io.redirect_ftq_idx + 1.U, s0_ifu_ftq_idx_reg)
     s0_is_replay := false.B
     s0_ifu_tsrc  := BSRC_C
+    s0_ifu_tsrc_debug := IFU_S0_SRC_REDIRECT_DEBUG
   }
 
   // 当 ifu s0 希望写入的 ftq full 时，暂停前端流水线，使用
@@ -1421,10 +1469,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ifu_vpc_reg     := s0_ifu_vpc
     s0_ifu_ftq_idx_reg := s0_ftq_idx
     s0_ifu_tsrc_reg    := s0_ifu_tsrc
+    s0_ifu_tsrc_debug_reg := s0_ifu_tsrc_debug
   } .otherwise {
     // 如果成功发射到 s1，则清空 valid 寄存器
     s0_ifu_valid_reg   := false.B
     s0_ifu_ftq_idx_reg := s0_ftq_idx + 1.U
+    s0_ifu_tsrc_debug_reg := IFU_S0_SRC_REG_DEBUG
   }
 
   override def toString: String =
@@ -1456,6 +1506,62 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     bpd_ifu_dist := distanceBetween(s0_bpd_ftq_idx, s0_ftq_idx)
     when (bpd_ahead_limit_number < bpd_ifu_dist) {
       bpd_ahead_limit := true.B
+    }
+
+    val s0_bpd_printf = PlusArg("s0-bpd-printf", 0, "print s0 bpd state", 1)
+    when (s0_bpd_printf(0)) {
+      printf(p"[${cycleCount} S0 BPD] src=")
+      when (s0_bpd_tsrc_debug === BPD_S0_SRC_REG_DEBUG) {
+        printf(p"REG")
+      } .elsewhen (s0_bpd_tsrc_debug === BPD_S0_SRC_F1_DEBUG) {
+        printf(p"F1")
+      } .elsewhen (s0_bpd_tsrc_debug === BPD_S0_SRC_F2_DEBUG) {
+        printf(p"F2")
+      } .elsewhen (s0_bpd_tsrc_debug === BPD_S0_SRC_PREDECODE_DEBUG) {
+        printf(p"PREDECODE")
+      } .elsewhen (s0_bpd_tsrc_debug === BPD_S0_SRC_F3_DEBUG) {
+        printf(p"F3")
+      } .elsewhen (s0_bpd_tsrc_debug === BPD_S0_SRC_SFENCE_DEBUG) {
+        printf(p"SFENCE")
+      } .elsewhen (s0_bpd_tsrc_debug === BPD_S0_SRC_REDIRECT_DEBUG) {
+        printf(p"REDIRECT")
+      } .otherwise {
+        printf(p"UNKNOWN")
+      }
+      printf(p" vpc=${Hexadecimal(s0_bpd_vpc)} " +
+        p"ftq_idx=${Hexadecimal(s0_bpd_ftq_idx.value)} " +
+        p"valid=${s0_bpd_valid} " +
+        p"real_valid=${s0_bpd_real_valid}\n")
+    }
+
+    val s0_ifu_printf = PlusArg("s0-ifu-printf", 0, "print s0 ifu state", 1)
+    when (s0_ifu_printf(0)) {
+      printf(p"[${cycleCount} S0 IFU] src=")
+      when (s0_ifu_tsrc_debug === IFU_S0_SRC_REG_DEBUG) {
+        printf(p"REG")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_FTQ_DEBUG) {
+        printf(p"FTQ")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_F1_DEBUG) {
+        printf(p"F1")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_F2_DEBUG) {
+        printf(p"F2")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_PREDECODE_DEBUG) {
+        printf(p"PREDECODE")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_F3_DEBUG) {
+        printf(p"F3")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_S2_REPLAY_DEBUG) {
+        printf(p"S2_REPLAY")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_SFENCE_DEBUG) {
+        printf(p"SFENCE")
+      } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_REDIRECT_DEBUG) {
+        printf(p"REDIRECT")
+      } .otherwise {
+        printf(p"UNKNOWN")
+      }
+      printf(p" vpc=${Hexadecimal(s0_ifu_vpc)} " +
+        p"ftq_idx=${Hexadecimal(s0_ftq_idx.value)} " +
+        p"valid=${s0_valid} " +
+        p"real_valid=${s0_ifu_real_valid}\n")
     }
 
     val predecode_targte_printf = PlusArg("predecode-target-printf", 0, "print predecode targets", 1)
