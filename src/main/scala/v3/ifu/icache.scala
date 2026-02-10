@@ -43,7 +43,7 @@ class ICache(
 {
   lazy val module = new ICacheModule(this)
   val masterNode = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(
-    sourceId = IdRange(0, icacheParams.fetchMSHRNum),
+    sourceId = IdRange(0, icacheParams.fetchMSHRNum + icacheParams.pfMSHRNum),
     name = s"Core ${staticIdForMetadataUseOnly} ICache")))))
 
   val size = icacheParams.nSets * icacheParams.nWays * icacheParams.blockBytes
@@ -85,6 +85,25 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
 
   //Enable_PerfCounter_Support
   val icache_valid_access = Output(Bool())
+
+  // Prefetch pipeline interface
+  val mshr_flush    = Input(Bool()) // predecode / backend flush
+  val bpd_f3_flush  = Input(Bool())
+  val bpd_f3_ftq_idx = Input(new FTQPtr)
+
+  // s0: prefetch virtual address for tag lookup
+  val s0_pf_valid   = Input(Bool())
+  val s0_pf_vaddr   = Input(UInt(vaddrBitsExtended.W))
+  val s0_pf_blocked = Output(Bool())
+
+  // s1: prefetch physical address from TLB and control
+  val s1_pf_valid      = Input(Bool())
+  val s1_pf_ppc        = Input(UInt(paddrBits.W))
+  val s1_pf_ppc_valid  = Input(Bool())
+  val s1_pf_clear      = Input(Bool())
+  val s1_pf_ftq_idx    = Input(new FTQPtr)
+  // ICache accepted this s1 prefetch this cycle (advanced to internal s2)
+  val s1_pf_can_advance    = Output(Bool())
 }
 
 /**
@@ -116,11 +135,12 @@ class ICacheMSHRIO(implicit p: Parameters) extends CoreBundle with HasBoomFronte
   val invalid:   Bool                       = Input(Bool())
   val req:       DecoupledIO[UInt]          = Flipped(DecoupledIO(UInt(paddrBits.W)))
   val acquire:   DecoupledIO[UInt]          = DecoupledIO(UInt(paddrBits.W))
-  val lookUps:   LookUpMSHR                 = Flipped(new LookUpMSHR)
+  val lookUps:   Vec[LookUpMSHR]            = Flipped(Vec(2, new LookUpMSHR))
   val resp:      Valid[MSHRResp]            = ValidIO(new MSHRResp)
   val victimWay: UInt                       = Input(UInt(wayBits.W))
 
   val addr_valid_debug: Bool = Output(Bool())
+  val mshr_valid_debug: Bool = Output(Bool())
 }
 
 // MSHR 与 flush 的交互
@@ -167,10 +187,12 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
   private val way      = RegInit(UInt(wayBits.W), 0.U)
 
   // look up and return result at the same cycle
-  if (isFetch) {
-    io.lookUps.hit := valid && !fencei && (io.lookUps.paddr(paddrBits-1, blockOffBits) === blkPaddr)
-  } else {
-    io.lookUps.hit := valid && !fencei && (io.lookUps.paddr(paddrBits-1, blockOffBits) === blkPaddr)
+  for (i <- 0 until 2) {
+    if (isFetch) {
+      io.lookUps(i).hit := valid && !fencei && (io.lookUps(i).paddr(paddrBits-1, blockOffBits) === blkPaddr)
+    } else {
+      io.lookUps(i).hit := valid && !fencei && (io.lookUps(i).paddr(paddrBits-1, blockOffBits) === blkPaddr)
+    }
   }
 
   // invalid when the req hasn't been issued
@@ -183,12 +205,16 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
       }
     }
   } else {
-    when(io.fencei || io.flush) {
+    when(io.fencei) {
       when(!issue) {
         valid := false.B
       } .otherwise {
         fencei := true.B
-        flush  := true.B
+      }
+    }
+    when (io.flush) {
+      when (!issue) {
+        valid := false.B
       }
     }
   }
@@ -236,7 +262,7 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
   if (isFetch) {
     io.resp.valid       := valid && !fencei
   } else {
-    io.resp.valid         := valid && (!flush && !fencei)
+    io.resp.valid       := valid && !fencei
   }
   io.resp.bits.paddr    := Cat(blkPaddr, 0.U(blockOffBits.W))
   io.resp.bits.tag      := blkPaddr(tagBits+idxBits-1,idxBits)
@@ -246,6 +272,7 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
   require(tagBits + idxBits == blkPaddr.getWidth)
 
   io.addr_valid_debug := issue
+  io.mshr_valid_debug := valid
   if (IN_SIMULATION) {
     // free-running cycle counter for simulation
     val (cycleCount, _) = Counter(true.B, Int.MaxValue)
@@ -344,21 +371,57 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s2_hit = RegNext(s1_hit)
   val s2_paddr = RegNext(io.s1_paddr)
 
+  // Prefetch pipeline inputs
+  val s0_pf_valid = io.s0_pf_valid
+  val s0_pf_vaddr = io.s0_pf_vaddr
+  val s1_pf_valid = io.s1_pf_valid
+  val s1_pf_ppc   = io.s1_pf_ppc
+  val s1_pf_ppc_valid = io.s1_pf_ppc_valid
+  
+  val s1_pf_fire   = io.s1_pf_can_advance
+  
+  val s1_pf_MSHR_hit  = Wire(Bool())
+  val s1_pf_cache_hit = Wire(Bool())
+  // TODO: 如何 flush s2_pf_valid？
+  val s2_pf_valid        = RegEnable(s1_pf_valid && s1_pf_ppc_valid && !io.s1_pf_clear, false.B, s1_pf_fire)
+  val s2_pf_hit          = RegEnable(s1_pf_MSHR_hit || s1_pf_cache_hit, s1_pf_fire)
+  val s2_pf_ppc          = RegEnable(s1_pf_ppc, s1_pf_fire)
+  val s2_pf_ftq_idx      = RegEnable(io.s1_pf_ftq_idx, s1_pf_fire)
+  val s2_pf_clear        = io.bpd_f3_flush && s2_pf_valid && s2_pf_ftq_idx > io.bpd_f3_ftq_idx
+  when (s2_pf_clear || io.mshr_flush) {
+    s2_pf_valid := false.B
+  }
+
   val nFetchMSHRs = outer.icacheParams.fetchMSHRNum
+  val nPrefetchMSHRs = outer.icacheParams.pfMSHRNum
+
   val fetchMSHRs = Seq.tabulate(nFetchMSHRs) { i =>
     Module(new ICacheMSHR(isFetch = true, ID = i))
   }
+  val pfMSHRs = Seq.tabulate(nPrefetchMSHRs) { i =>
+    Module(new ICacheMSHR(isFetch = false, ID = nFetchMSHRs + i))
+  }
+
+  private val allMSHRs = fetchMSHRs ++ pfMSHRs
+  private val nMSHRs = allMSHRs.length
 
   val s1_MSHR_hit = Wire(Bool())
-  val s2_MSHR_hit_vec = VecInit(fetchMSHRs.map(_.io.lookUps.hit))
+  val s2_MSHR_hit_vec = VecInit(allMSHRs.map(_.io.lookUps(0).hit))
   val s2_MSHR_hit = s2_MSHR_hit_vec.asUInt.orR
   val access_hit = s2_hit || s2_MSHR_hit || RegNext(s1_MSHR_hit)
 
-  // Connect common control signals to all fetch MSHRs
+  // Connect common control signals to all fetch/prefetch MSHRs
   fetchMSHRs.foreach { m =>
     m.io.fencei := io.invalidate
     m.io.flush  := false.B
-    m.io.lookUps.paddr := s2_paddr
+    m.io.lookUps(0).paddr := s2_paddr
+    m.io.lookUps(1).paddr := s2_pf_ppc
+  }
+  pfMSHRs.foreach { m =>
+    m.io.fencei := io.invalidate
+    m.io.flush  := io.mshr_flush
+    m.io.lookUps(0).paddr := s2_paddr
+    m.io.lookUps(1).paddr := s2_pf_ppc
   }
 
   // Allocate miss requests into the first available MSHR
@@ -371,11 +434,11 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     alloc_taken = alloc_taken || can_alloc
   }
 
-  val mshr_resp_valids = VecInit(fetchMSHRs.map(_.io.resp.valid))
-  val mshr_resp_paddrs = VecInit(fetchMSHRs.map(_.io.resp.bits.paddr))
-  val mshr_resp_tags   = VecInit(fetchMSHRs.map(_.io.resp.bits.tag))
-  val mshr_resp_idxs   = VecInit(fetchMSHRs.map(_.io.resp.bits.vSetIdx))
-  val mshr_resp_ways   = VecInit(fetchMSHRs.map(_.io.resp.bits.way))
+  val mshr_resp_valids = VecInit(allMSHRs.map(_.io.resp.valid))
+  val mshr_resp_paddrs = VecInit(allMSHRs.map(_.io.resp.bits.paddr))
+  val mshr_resp_tags   = VecInit(allMSHRs.map(_.io.resp.bits.tag))
+  val mshr_resp_idxs   = VecInit(allMSHRs.map(_.io.resp.bits.vSetIdx))
+  val mshr_resp_ways   = VecInit(allMSHRs.map(_.io.resp.bits.way))
 
   val refill_fire = tl_out.a.fire
   val refill_one_beat = tl_out.d.fire && edge_out.hasData(tl_out.d.bits)
@@ -383,7 +446,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_done = refill_one_beat && d_done
 
   val refill_src = tl_out.d.bits.source
-  val refill_src_oh = UIntToOH(refill_src, nFetchMSHRs)
+  val refill_src_oh = UIntToOH(refill_src, nMSHRs)
 
   val refill_resp_valid = Mux1H(refill_src_oh, mshr_resp_valids)
   val invalidated = !refill_resp_valid
@@ -394,6 +457,8 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.req.ready := !refill_one_beat
   //Enable_PerfCounter_Support
   io.icache_valid_access := s2_valid
+  // Block prefetch s0 when a refill write is occurring to the tag array
+  io.s0_pf_blocked := refill_done
 
   tl_out.d.ready := true.B
   require (edge_out.manager.minLatency > 0)
@@ -402,15 +467,68 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   initial_fire := false.B
   val victim_way = if (isDM) 0.U else LFSR(16, refill_fire || initial_fire)(log2Ceil(nWays)-1,0)
   val repl_way = Mux1H(refill_src_oh, mshr_resp_ways)
-  fetchMSHRs.foreach(_.io.victimWay := victim_way)
+  allMSHRs.foreach(_.io.victimWay := victim_way)
   for (i <- 0 until nFetchMSHRs) {
     fetchMSHRs(i).io.invalid := refill_done && (refill_src === i.U)
+  }
+  for (i <- 0 until nPrefetchMSHRs) {
+    pfMSHRs(i).io.invalid := refill_done && (refill_src === (nFetchMSHRs + i).U)
   }
   s1_MSHR_hit := refill_done && !invalidated && refill_paddr(paddrBits-1, blockOffBits) ===
                   io.s1_paddr(paddrBits-1, blockOffBits)
 
+  // Prefetch s1-level hit: cache hit or in-flight refill to same block.
+  // These s1 results will be registered and used in the s2_pf stage so that
+  // prefetch has the same two-stage pipeline structure as the fetch path.
+  val s1_pf_tag_only_hit = Wire(Vec(nWays, Bool()))
+  val s1_pf_vb_hit = Wire(Vec(nWays, Bool()))
+  val s1_pf_tag_hit_vec = VecInit(Seq.tabulate(nWays) { i => s1_pf_vb_hit(i) && s1_pf_tag_only_hit(i) })
+  s1_pf_cache_hit := s1_pf_tag_hit_vec.asUInt.orR
+  s1_pf_MSHR_hit  := refill_done && !invalidated &&
+                      (refill_paddr(paddrBits-1, blockOffBits) === s1_pf_ppc(paddrBits-1, blockOffBits))
+
+  // Conflict with IFU s2 request to the same block
+  val s2_blkPaddr = s2_paddr(paddrBits-1, blockOffBits)
+  val s2_pf_blkPaddr = s2_pf_ppc(paddrBits-1, blockOffBits)
+
+  // Register s1 prefetch results into s2_pf stage so that prefetch has
+  // the same two-stage pipeline structure as fetch. The s2_pf stage then
+  // decides whether a new prefetch MSHR is needed and drives s1_pf_advance.
+  val s2_pf_cache_hit    = RegNext(s1_pf_cache_hit)
+  val s2_pf_MSHR_hit_vec = VecInit(allMSHRs.map(_.io.lookUps(1).hit))
+  val s2_pf_MSHR_hit     = s2_pf_MSHR_hit_vec.asUInt.orR
+  val s2_pf_access_hit   = s2_pf_MSHR_hit || s2_pf_hit
+  val s2_pf_conflict_with_ifu_s2 = s2_valid && (s2_pf_blkPaddr === s2_blkPaddr)
+
+  // Decide in s2_pf whether prefetch needs a new MSHR entry
+  val need_pf_mshr = s2_pf_valid && !s2_pf_access_hit && !s2_pf_conflict_with_ifu_s2 && !s2_pf_clear
+
+  // Allocate prefetch requests into the first available prefetch MSHR (s2_pf)
+  if (nPrefetchMSHRs > 0) {
+    val pf_ready_vec  = VecInit(pfMSHRs.map(_.io.req.ready)).asUInt
+    val pf_alloc_mask = PriorityEncoderOH(pf_ready_vec)
+
+    for (i <- 0 until nPrefetchMSHRs) {
+      pfMSHRs(i).io.req.valid := need_pf_mshr && pf_alloc_mask(i)
+      pfMSHRs(i).io.req.bits  := s2_pf_ppc
+    }
+  }
+
+  // Signal to frontend whether the prefetch that was in s1 has now been
+  // fully consumed/handled by ICache (either hit/duplicate or MSHR-allocated)
+  val s2_pf_consumed = if (nPrefetchMSHRs > 0) {
+    val pf_ready_vec = VecInit(pfMSHRs.map(_.io.req.ready)).asUInt
+    !need_pf_mshr || pf_ready_vec.orR
+  } else {
+    true.B
+  }
+  io.s1_pf_can_advance := !s2_pf_valid || s2_pf_consumed
+
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
+  // IFU tag read port
   val tag_rdata = tag_array.read(s0_vaddr(untagBits-1, blockOffBits), !refill_done && s0_valid)
+  // Prefetch tag read port (second independent read port), blocked only when refill writes
+  val pf_tag_rdata = tag_array.read(s0_pf_vaddr(untagBits-1, blockOffBits), !refill_done && s0_pf_valid)
   when (refill_done) {
     tag_array.write(refill_idx, VecInit(Seq.fill(nWays)(refill_tag)), Seq.tabulate(nWays)(repl_way === _.U))
   }
@@ -437,11 +555,20 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val tag = tag_rdata(i)
     s1_tag_only_hit(i) := tag === s1_tag
     s1_tag_hit(i) := s1_vb_hit(i) && s1_tag_only_hit(i)
+
+    // Prefetch tag/VB hits (use pf tag read port and pf paddr)
+    val pf_s1_idx = s1_pf_ppc(untagBits-1, blockOffBits)
+    val pf_s1_tag = s1_pf_ppc(tagBits+untagBits-1, untagBits)
+    s1_pf_vb_hit(i) := vb_array(Cat(i.U, pf_s1_idx))
+    val pf_tag = pf_tag_rdata(i)
+    s1_pf_tag_only_hit(i) := pf_tag === pf_s1_tag
   }
 
   dontTouch(s1_tag_only_hit)
   dontTouch(s1_vb_hit)
   dontTouch(s1_tag_hit)
+  dontTouch(s1_pf_tag_only_hit)
+  dontTouch(s1_pf_vb_hit)
 
   val ramDepth = if (refillsToOneBank && nBanks == 2) {
     nSets * refillCycles / 2
@@ -587,19 +714,50 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   io.resp.bits.replay := DontCare
   io.resp.bits.data := s2_data
   io.resp.valid := s2_valid && s2_hit
-  // TL-A: arbitrate among fetch MSHRs and encode MSHR ID into source field
-  val acq_arb = Module(new RRArbiter(UInt(paddrBits.W), nFetchMSHRs))
+
+  // TL-A: arbitrate among fetch and prefetch MSHRs and encode MSHR ID into source field
+  val fetch_acq_arb = Module(new Arbiter(UInt(paddrBits.W), nFetchMSHRs))
   for (i <- 0 until nFetchMSHRs) {
-    acq_arb.io.in(i) <> fetchMSHRs(i).io.acquire
+    fetch_acq_arb.io.in(i) <> fetchMSHRs(i).io.acquire
   }
+  val fetch_acq_valid = fetch_acq_arb.io.out.valid
+  val fetch_acq_bits  = fetch_acq_arb.io.out.bits
+  val fetch_acq_id    = fetch_acq_arb.io.chosen
 
-  tl_out.a.valid := acq_arb.io.out.valid
-  acq_arb.io.out.ready := tl_out.a.ready
+  val nPfPorts = math.max(nPrefetchMSHRs, 1)
+  val pf_acq_arb = Module(new Arbiter(UInt(paddrBits.W), nPfPorts))
+  for (i <- 0 until nPfPorts) {
+    if (i < nPrefetchMSHRs) {
+      pf_acq_arb.io.in(i) <> pfMSHRs(i).io.acquire
+    } else {
+      pf_acq_arb.io.in(i).valid := false.B
+      pf_acq_arb.io.in(i).bits  := 0.U
+    }
+  }
+  val pf_acq_valid_raw = pf_acq_arb.io.out.valid
+  val pf_acq_bits      = pf_acq_arb.io.out.bits
+  val pf_acq_id        = pf_acq_arb.io.chosen
+  val pf_acq_valid     = pf_acq_valid_raw && (nPrefetchMSHRs > 0).B
 
-  val acq_source = acq_arb.io.chosen
+  val choose_fetch = fetch_acq_valid
+  val choose_pf    = !choose_fetch && pf_acq_valid
+  val any_valid    = choose_fetch || choose_pf
+
+  tl_out.a.valid := any_valid
+  fetch_acq_arb.io.out.ready := tl_out.a.ready && choose_fetch
+  pf_acq_arb.io.out.ready    := tl_out.a.ready && choose_pf
+
+  val pf_acq_id_ext = Wire(UInt(log2Ceil(math.max(nMSHRs, 1)).W))
+  pf_acq_id_ext := pf_acq_id
+
+  val acq_addr = Mux(choose_fetch, fetch_acq_bits, pf_acq_bits)
+  val acq_source = Wire(UInt(log2Ceil(math.max(nMSHRs, 1)).W))
+  acq_source := Mux(choose_fetch,
+    fetch_acq_id,
+    (nFetchMSHRs.U + pf_acq_id_ext))
   tl_out.a.bits := edge_out.Get(
     fromSource = acq_source,
-    toAddress = acq_arb.io.out.bits,
+    toAddress = acq_addr,
     lgSize = lgCacheBlockBytes.U)._2
   tl_out.b.ready := true.B
   tl_out.c.valid := false.B
@@ -615,10 +773,50 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     // plusarg to enable ICache debug prints
     val icache_printf = PlusArg("icache-printf", 0, "print icache debug info", 1)
 
+    // Debug vectors for MSHR issue/valid/address
+    val mshr_issue_vec      = VecInit(allMSHRs.map(_.io.addr_valid_debug))
+    val mshr_issue_vec_prev = RegNext(mshr_issue_vec)
+    val mshr_valid_vec      = VecInit(allMSHRs.map(_.io.mshr_valid_debug))
+
+    // Track previous cycle TL-A fire and its corresponding MSHR ID
+    val a_fire_prev     = RegNext(tl_out.a.fire, init = false.B)
+    val acq_source_prev = RegNext(acq_source)
+
+    // 1) When TL-A fires, the chosen MSHR's issue must be false in this cycle
+    when (tl_out.a.fire) {
+      assert(!mshr_issue_vec(acq_source),
+        p"ICache MSHR ${acq_source} issue must be false when TL-A request fires")
+    }
+
+    // 2) On the cycle after TL-A fire, only the chosen MSHR may toggle issue 0->1
+    when (a_fire_prev) {
+      for (i <- 0 until nMSHRs) {
+        val prev_issue = mshr_issue_vec_prev(i)
+        val curr_issue = mshr_issue_vec(i)
+        when (i.U === acq_source_prev) {
+          assert(!prev_issue && curr_issue,
+            "ICache chosen MSHR issue must toggle from false to true after TL-A fire")
+        } .otherwise {
+          assert(!( !prev_issue && curr_issue),
+            "ICache non-chosen MSHR issue must not toggle from false to true after TL-A fire")
+        }
+      }
+    }
+
+    // 3) All valid MSHRs must have unique request addresses
+    for (i <- 0 until nMSHRs) {
+      for (j <- i + 1 until nMSHRs) {
+        when (mshr_valid_vec(i) && mshr_valid_vec(j)) {
+          assert(mshr_resp_paddrs(i) =/= mshr_resp_paddrs(j),
+            "ICache valid MSHRs must not have duplicate request addresses")
+        }
+      }
+    }
+
     when (icache_printf(0)) {
       // 1) ICache sends miss request to lower level (TL-A channel)
       when (tl_out.a.fire) {
-        val req_paddr = (refill_paddr >> blockOffBits) << blockOffBits
+        val req_paddr = (tl_out.a.bits.address >> blockOffBits) << blockOffBits
         printf(p"[${cycleCount} ICache Req] mshr=${acq_source} paddr=${Hexadecimal(req_paddr)}\n")
       }
 
@@ -640,7 +838,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     "Multiple ICache ways hit in s1")
   assert(!s1_valid || io.s1_kill || io.s1_paddr(pgIdxBits-1,0) === RegNext(io.req.bits.addr(pgIdxBits-1,0)),
     "s1_paddr does not match request address")
-  val mshr_addr_valids = VecInit(fetchMSHRs.map(_.io.addr_valid_debug))
+  val mshr_addr_valids = VecInit(allMSHRs.map(_.io.addr_valid_debug))
   val cur_mshr_addr_valid = Mux1H(refill_src_oh, mshr_addr_valids)
   assert(!refill_one_beat || cur_mshr_addr_valid,
     "ICache refill without a valid MSHR")
@@ -655,9 +853,9 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val d_prev_resp_valid = RegInit(false.B)
 
     when (refill_one_beat) {
-      // 1) TL-D source must be within valid fetch MSHR ID range.
-      assert(refill_src < nFetchMSHRs.U,
-        "ICache TL-D source out of range of fetch MSHRs")
+      // 1) TL-D source must be within valid MSHR ID range.
+      assert(refill_src < nMSHRs.U,
+        "ICache TL-D source out of range of MSHRs")
 
       // 2) While a line refill is in flight, all data beats must
       //    come from the same source until refill_done is true.
