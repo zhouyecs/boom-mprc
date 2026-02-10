@@ -567,6 +567,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val f1_pf_clear     = WireInit(false.B)
   val s1_pf_replay    = RegInit(false.B)
   val s1_pf_replay_ppc = Reg(UInt(paddrBits.W))
+  val s1_pf_replay_exp = Reg(Bool())
 
   tlb.io.req.valid      := (s1_pf_valid && !f1_pf_clear && !s1_pf_replay) || s1_is_sfence
   tlb.io.req.bits.cmd   := DontCare
@@ -581,6 +582,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val tlb_force_miss = WireDefault(false.B)
   val s1_pf_tlb_ok   = (!tlb.io.resp.miss && !tlb_force_miss)
   val s1_pf_ppc_valid = s1_pf_replay || s1_pf_tlb_ok
+  val s1_pf_ppc_exp  = Mux(s1_pf_replay, s1_pf_replay_exp, tlb.io.resp.ae.inst || tlb.io.resp.pf.inst)
   
   trans_queue.io.enq.valid   := s1_pf_tlb_ok && !f1_pf_clear && s1_pf_valid && !s1_pf_replay
   trans_queue.io.enq.bits    := tlb.io.resp
@@ -593,6 +595,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   icache.io.s1_pf_valid     := s1_pf_valid
   icache.io.s1_pf_ppc       := Mux(s1_pf_replay, s1_pf_replay_ppc, tlb.io.resp.paddr)
   icache.io.s1_pf_ppc_valid := s1_pf_ppc_valid
+  icache.io.s1_pf_ppc_exp   := s1_pf_ppc_exp
   icache.io.s1_pf_clear     := f1_pf_clear
   icache.io.s1_pf_ftq_idx   := s1_pf_ftq_idx
 
@@ -1314,6 +1317,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   when (s1_pf_should_replay && s1_pf_ppc_valid) {
     s1_pf_replay := true.B
     s1_pf_replay_ppc := icache.io.s1_pf_ppc
+    s1_pf_replay_exp := icache.io.s1_pf_ppc_exp
   } .elsewhen(s1_pf_valid && icache.io.s1_pf_can_advance) { // s1 pf fire 到 s2 时重置 s1_pf_replay
     s1_pf_replay := false.B
   }
