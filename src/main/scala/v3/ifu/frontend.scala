@@ -1276,6 +1276,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   } .elsewhen(io.cpu.redirect_flush) {
     sfence_reg := false.B
   }
+  val predecode_flush_reg = RegInit(false.B)
+  when (predecode_redirect) {
+    predecode_flush_reg := f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if
+  } .elsewhen(io.cpu.redirect_flush) {
+    predecode_flush_reg := false.B
+  }
 
   ftq.io.pf_ftq_idx := s0_pf_ftq_idx_reg
 
@@ -1293,7 +1299,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_pf_clear_by_f3 = merged_f3_redirect && (s1_pf_ftq_idx > merged_f3_ftq_idx)
   f1_pf_clear := s1_pf_clear_by_f2 || s1_pf_clear_by_f3 || io.cpu.sfence.valid || io.cpu.redirect_flush
 
-  val pf_can_use_ftq_info = ftq.io.pf_pc.valid && !sfence_reg
+  val pf_can_use_ftq_info = ftq.io.pf_pc.valid && !sfence_reg && !predecode_flush_reg
   val pf_last_is_f1_pred = s0_pf_ftq_idx_reg === f1_next_ftq_idx && bpd.io.resp.f1_pred_valid
   val pf_last_is_f2_pred = s0_pf_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
   val pf_last_is_f3_pred = s0_pf_ftq_idx_reg === merged_f3_next_ftq_idx && merged_f3_valid
@@ -1362,7 +1368,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // 向 ftq 请求新的 fetch pc
   ftq.io.ifu_fetch_ftq_idx := s0_ifu_ftq_idx_reg
 
-  val can_use_ftq_info = ftq.io.ifu_fetch_pc.valid && !sfence_reg
+  val can_use_ftq_info = ftq.io.ifu_fetch_pc.valid && !sfence_reg && !predecode_flush_reg
   val last_is_f1_pred = s0_ifu_ftq_idx_reg === f1_next_ftq_idx && bpd.io.resp.f1_pred_valid
   val last_is_f2_pred = s0_ifu_ftq_idx_reg === f2_next_ftq_idx && bpd.io.resp.f2_pred_valid
   val last_is_f3_pred = s0_ifu_ftq_idx_reg === merged_f3_next_ftq_idx && merged_f3_valid
