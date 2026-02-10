@@ -247,6 +247,46 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
 
   io.addr_valid_debug := issue
   if (IN_SIMULATION) {
+    // free-running cycle counter for simulation
+    val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+
+    // plusarg to enable MSHR debug prints
+    val mshr_printf = PlusArg("mshr-printf", 0, "print icache mshr debug info", 1)
+
+    when (mshr_printf(0)) {
+      // 1) New request accepted into this MSHR
+      when (io.req.fire) {
+        val req_paddr = Cat(io.req.bits(paddrBits-1, blockOffBits), 0.U(blockOffBits.W))
+        printf(p"[${cycleCount} ICacheMSHR Req] id=${ID} paddr=${Hexadecimal(req_paddr)}\n")
+      }
+
+      // 2) TL request (acquire) fired to lower level cache
+      when (io.acquire.fire) {
+        val acq_paddr = io.acquire.bits
+        printf(p"[${cycleCount} ICacheMSHR Acquire] id=${ID} paddr=${Hexadecimal(acq_paddr)}\n")
+      }
+
+      // 3) Prefetch MSHR invalidated by flush before being issued
+      if (!isFetch) {
+        when (io.flush && valid && !issue) {
+          val line_paddr = Cat(blkPaddr, 0.U(blockOffBits.W))
+          printf(p"[${cycleCount} ICacheMSHR Flush] id=${ID} paddr=${Hexadecimal(line_paddr)}\n")
+        }
+      }
+
+      // 4) fence.i observed by this MSHR (may cancel writeback if already issued)
+      when (io.fencei) {
+        val line_paddr = Cat(blkPaddr, 0.U(blockOffBits.W))
+        printf(p"[${cycleCount} ICacheMSHR FenceI] id=${ID} paddr=${Hexadecimal(line_paddr)} issued=${issue}\n")
+      }
+
+      // 5) MSHR invalidated after grant/line refill completes
+      when (io.invalid) {
+        val line_paddr = Cat(blkPaddr, 0.U(blockOffBits.W))
+        printf(p"[${cycleCount} ICacheMSHR Invalidate] id=${ID} paddr=${Hexadecimal(line_paddr)} cancelled=${fencei}\n")
+      }
+    }
+
     when (io.invalid) {
       assert (valid, p"ICache invalidating an invalid MSHR (ID = $ID)\n")
       assert (issue, p"ICache invalidating a non-issued MSHR (ID = $ID)\n")
