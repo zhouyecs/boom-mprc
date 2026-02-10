@@ -1294,10 +1294,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     sfence_reg := false.B
   }
   val predecode_flush_reg = RegInit(false.B)
-  when (predecode_redirect) {
-    predecode_flush_reg := f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if
-  } .elsewhen(io.cpu.redirect_flush) {
+  when(io.cpu.redirect_flush) {
     predecode_flush_reg := false.B
+  } .elsewhen (predecode_redirect) {
+    predecode_flush_reg := f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if
   }
 
   ftq.io.pf_ftq_idx := s0_pf_ftq_idx_reg
