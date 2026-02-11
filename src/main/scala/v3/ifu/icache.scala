@@ -379,7 +379,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s1_pf_ppc   = io.s1_pf_ppc
   val s1_pf_ppc_valid = io.s1_pf_ppc_valid
   
-  val s1_pf_fire   = io.s1_pf_can_advance
+  val s1_pf_fire  = Wire(Bool())
   
   val s1_pf_MSHR_hit  = Wire(Bool())
   val s1_pf_cache_hit = Wire(Bool())
@@ -524,7 +524,13 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   } else {
     true.B
   }
-  io.s1_pf_can_advance := !s2_pf_valid || s2_pf_consumed
+
+  s1_pf_fire   := !s2_pf_valid || s2_pf_consumed
+  if (fullMSHRSkip) {
+    io.s1_pf_can_advance := true.B
+  } else {
+    io.s1_pf_can_advance := s1_pf_fire
+  }
 
   val tag_array = SyncReadMem(nSets, Vec(nWays, UInt(tagBits.W)))
   // IFU tag read port

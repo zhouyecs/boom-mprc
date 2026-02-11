@@ -99,6 +99,9 @@ case class BoomCoreParams(
   scontextWidth: Int = 0,
   trace: Boolean = false,
 
+  // FDIP
+  fullMSHRSkip: Boolean = false,
+
   /* debug stuff */
   enableCommitLogPrintf: Boolean = false,
   enableBranchPrintf: Boolean = false,
@@ -306,6 +309,11 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
 
   val corePAddrBits = paddrBits
   val corePgIdxBits = pgIdxBits
+
+  //************************************
+  // FDIP
+
+  val fullMSHRSkip = boomParams.fullMSHRSkip
 
   //Enable_PerfCounter_Support
   val subECounterNum = 4
