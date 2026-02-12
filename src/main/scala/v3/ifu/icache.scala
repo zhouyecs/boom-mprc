@@ -732,19 +732,50 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val fetch_acq_bits  = fetch_acq_arb.io.out.bits
   val fetch_acq_id    = fetch_acq_arb.io.chosen
 
-  val nPfPorts = math.max(nPrefetchMSHRs, 1)
-  val pf_acq_arb = Module(new Arbiter(UInt(paddrBits.W), nPfPorts))
-  for (i <- 0 until nPfPorts) {
-    if (i < nPrefetchMSHRs) {
-      pf_acq_arb.io.in(i) <> pfMSHRs(i).io.acquire
-    } else {
-      pf_acq_arb.io.in(i).valid := false.B
-      pf_acq_arb.io.in(i).bits  := 0.U
-    }
+  // --- FIFO-based prefetch acquire scheduling (replaces Arbiter) ---
+  // A flow-capable Queue records the order in which prefetch MSHRs are allocated.
+  // The head of the Queue selects which prefetch MSHR's acquire signals to present.
+  // Dequeue when the selected acquire fires, or when the head entry is stale
+  // (MSHR was cancelled by flush/fencei before being issued).
+
+  val pfIdxWidth = if (nPrefetchMSHRs > 1) log2Ceil(nPrefetchMSHRs) else 1
+
+  // Enqueue interface: which prefetch MSHR was just allocated this cycle?
+  val pfFifoEnq = Wire(Decoupled(UInt(pfIdxWidth.W)))
+  if (nPrefetchMSHRs > 0) {
+    val pf_fire_vec = VecInit(pfMSHRs.map(_.io.req.fire))
+    pfFifoEnq.valid := pf_fire_vec.asUInt.orR
+    pfFifoEnq.bits  := PriorityEncoder(pf_fire_vec)  // at most one fires per cycle
+  } else {
+    pfFifoEnq.valid := false.B
+    pfFifoEnq.bits  := 0.U
   }
-  val pf_acq_valid_raw = pf_acq_arb.io.out.valid
-  val pf_acq_bits      = pf_acq_arb.io.out.bits
-  val pf_acq_id        = pf_acq_arb.io.chosen
+
+  // Flow Queue: when empty and enqueue fires, data is immediately visible at
+  // dequeue in the same cycle.  Flushed on fence.i (all MSHRs invalidated)
+  // and mshr_flush (all un-issued prefetch MSHRs invalidated; issued ones
+  // have already been dequeued when their acquire fired).
+  val pfFifoDeq = Queue(pfFifoEnq, math.max(nPrefetchMSHRs, 1), flow = true,
+                         flush = Some(io.invalidate || io.mshr_flush))
+
+  val pf_effective_idx = pfFifoDeq.bits
+
+  // Mux the selected prefetch MSHR's acquire signals
+  val pf_acq_valid_vec = VecInit(
+    if (nPrefetchMSHRs > 0) pfMSHRs.map(_.io.acquire.valid)
+    else Seq(false.B)
+  )
+  val pf_acq_bits_vec = VecInit(
+    if (nPrefetchMSHRs > 0) pfMSHRs.map(_.io.acquire.bits)
+    else Seq(0.U(paddrBits.W))
+  )
+  val pf_acq_valid_raw = if (nPrefetchMSHRs > 0) {
+    pf_acq_valid_vec(pf_effective_idx)
+  } else {
+    false.B
+  }
+  val pf_acq_bits      = pf_acq_bits_vec(pf_effective_idx)
+  val pf_acq_id        = pf_effective_idx
   val pf_acq_valid     = pf_acq_valid_raw && (nPrefetchMSHRs > 0).B
 
   val choose_fetch = fetch_acq_valid
@@ -753,7 +784,18 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   tl_out.a.valid := any_valid
   fetch_acq_arb.io.out.ready := tl_out.a.ready && choose_fetch
-  pf_acq_arb.io.out.ready    := tl_out.a.ready && choose_pf
+
+  // Drive ready back to the selected prefetch MSHR
+  if (nPrefetchMSHRs > 0) {
+    for (i <- 0 until nPrefetchMSHRs) {
+      pfMSHRs(i).io.acquire.ready := tl_out.a.ready && choose_pf && pf_effective_idx === i.U
+    }
+  }
+
+  // Dequeue from Queue: on acquire fire (TL-A accepts the prefetch request)
+  // Stale entries (MSHR cancelled by flush/fencei) cannot occur without a
+  // simultaneous Queue flush, so no explicit stale-drain logic is needed.
+  pfFifoDeq.ready := tl_out.a.ready && choose_pf
 
   val pf_acq_id_ext = Wire(UInt(log2Ceil(math.max(nMSHRs, 1)).W))
   pf_acq_id_ext := pf_acq_id
@@ -818,6 +860,15 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
           assert(mshr_resp_paddrs(i) =/= mshr_resp_paddrs(j),
             "ICache valid MSHRs must not have duplicate request addresses")
         }
+      }
+    }
+
+    // Prefetch FIFO / MSHR consistency: if the selected prefetch MSHR has
+    // acquire.valid = true, then there must be a corresponding FIFO entry.
+    if (nPrefetchMSHRs > 0) {
+      when (pf_acq_valid_vec(pf_effective_idx)) {
+        assert(pfFifoDeq.valid,
+          "ICache prefetch FIFO deq.valid must be true when selected MSHR acquire.valid is true")
       }
     }
 
