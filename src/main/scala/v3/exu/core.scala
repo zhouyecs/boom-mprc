@@ -479,6 +479,22 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val com_ft_bsrc3 = io.ifu.ft_tsrc.valid && io.ifu.ft_tsrc.bits === BSRC_3
   val com_ft_bsrcc = io.ifu.ft_tsrc.valid && io.ifu.ft_tsrc.bits === BSRC_C
 
+  // ROB flushes caused by MINI_EXCEPTION_MEM_ORDERING
+  val rob_mem_ordering_flush = rob.io.mem_ordering_flush
+
+  // Decode valid pattern statistics
+  val dec_all_false = !dec_valids.reduce(_||_)
+  val dec_all_true  = dec_valids.reduce(_&&_)
+
+  // Fetch buffer enqueue statistics from frontend
+  val fb_enq_cnt  = io.ifu.fb_enq_cnt
+  val fb_enq_fire = io.ifu.fb_enq_valid
+
+  // Frontend s2 replay statistics from frontend
+  val s2_replay_total    = io.ifu.s2_replay_total
+  val s2_replay_itlb_miss = io.ifu.s2_replay_itlb_miss
+  val s2_replay_ic_miss   = io.ifu.s2_replay_ic_miss
+
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
@@ -526,6 +542,42 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(17) :=  com_ft_bsrc2 // committed fetch packet from f2 prediction/one bubble 
     event_counters.io.event_signals(18) :=  com_ft_bsrc3 // committed fetch packet from f3 prediction/two bubbles
     event_counters.io.event_signals(19) :=  com_ft_bsrcc // committed fetch packet from backend correction/many bubbles
+
+    // 39: ROB flushes caused by MINI_EXCEPTION_MEM_ORDERING
+    event_counters.io.event_signals(39) := Mux(rob_mem_ordering_flush, 1.U, 0.U)
+
+    // Decode valid pattern profiling
+    // 40: all dec_valids are false
+    // 41: all dec_valids are true
+    // 42: mixed dec_valids (neither all false nor all true)
+    event_counters.io.event_signals(40) := Mux(dec_all_false, 1.U, 0.U)
+    event_counters.io.event_signals(41) := Mux(dec_all_true, 1.U, 0.U)
+    event_counters.io.event_signals(42) := Mux(!dec_all_false && !dec_all_true, 1.U, 0.U)
+
+    // Fetch buffer enqueue profiling
+    // 20: no enqueue this cycle
+    // 21: enqueue with 0 instructions
+    // 22: enqueue with 1 instruction
+    // 23: enqueue with 2 instructions
+    // 24: enqueue with 3 instructions
+    // 25: enqueue with 4 instructions
+    event_counters.io.event_signals(20) := Mux(!fb_enq_fire, 1.U, 0.U)
+    event_counters.io.event_signals(21) := Mux(fb_enq_fire && fb_enq_cnt === 0.U, 1.U, 0.U)
+    event_counters.io.event_signals(22) := Mux(fb_enq_fire && fb_enq_cnt === 1.U, 1.U, 0.U)
+    event_counters.io.event_signals(23) := Mux(fb_enq_fire && fb_enq_cnt === 2.U, 1.U, 0.U)
+    event_counters.io.event_signals(24) := Mux(fb_enq_fire && fb_enq_cnt === 3.U, 1.U, 0.U)
+    event_counters.io.event_signals(25) := Mux(fb_enq_fire && fb_enq_cnt === 4.U, 1.U, 0.U)
+
+    // Frontend s2 replay statistics
+    // 26: all s2 replays
+    // 27: s2 replays due to itlb miss
+    // 28: s2 replays due to icache miss with itlb hit
+    event_counters.io.event_signals(26) := Mux(s2_replay_total, 1.U, 0.U)
+    event_counters.io.event_signals(27) := Mux(s2_replay_itlb_miss, 1.U, 0.U)
+    event_counters.io.event_signals(28) := Mux(s2_replay_ic_miss, 1.U, 0.U)
+
+    // 29: dcache miss (LSU acquire)
+    event_counters.io.event_signals(29) := Mux(io.lsu.perf.acquire, 1.U, 0.U)
   }
 
   //-------------------------------------------------------------

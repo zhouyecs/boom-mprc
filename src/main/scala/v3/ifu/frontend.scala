@@ -300,6 +300,15 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val itlb_hit = Input(Bool())
   val icache_valid_access = Input(Bool())
   val icache_hit = Input(Bool())
+
+  // Frontend s2 replay statistics
+  val s2_replay_total   = Input(Bool())
+  val s2_replay_itlb_miss = Input(Bool())
+  val s2_replay_ic_miss   = Input(Bool())
+
+  // Fetch buffer enqueue monitor (for perf counters)
+  val fb_enq_valid      = Input(Bool())
+  val fb_enq_cnt        = Input(UInt(log2Ceil(fetchWidth+1).W))
 }
 
 /**
@@ -650,6 +659,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
     s2_replay_happen := true.B
   } 
+  // Drive s2 replay perf signals
+  io.cpu.s2_replay_total    := s2_replay_happen
+  io.cpu.s2_replay_itlb_miss := s2_replay_happen && s2_tlb_miss
+  io.cpu.s2_replay_ic_miss   := s2_replay_happen && !s2_tlb_miss && !icache.io.resp.valid
   s0_replay_resp := s2_tlb_resp
   s0_replay_ppc  := s2_ppc
 
@@ -1127,6 +1140,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     Mux(f4_sfb_valid, f4_sfb_mask(fetchWidth-1,0), 0.U(fetchWidth.W)) |
     f4.io.deq.bits.shadowed_mask.asUInt
   ).asBools
+
+  // Export fetch buffer enqueue info for event counters
+  val fb_enq_fire = fb.io.enq.fire
+  val fb_enq_cnt  = PopCount(fb.io.enq.bits.mask)
+  io.cpu.fb_enq_valid := fb_enq_fire
+  io.cpu.fb_enq_cnt   := fb_enq_cnt
 
 
   ftq.io.predecode_enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay

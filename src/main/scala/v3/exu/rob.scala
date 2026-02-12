@@ -101,6 +101,9 @@ class RobIo(
   // to send to the frontend for redirection.
   val flush = Valid(new CommitExceptionSignals)
 
+  // True when a MINI_EXCEPTION_MEM_ORDERING causes a ROB flush
+  val mem_ordering_flush = Output(Bool())
+
   // Stall Decode as appropriate
   val empty = Output(Bool())
   val ready = Output(Bool()) // ROB is busy unrolling rename state...
@@ -561,9 +564,13 @@ class Rob(
   // Note: exception must be the first valid instruction in the commit bundle.
   exception_thrown := will_throw_exception
   val is_mini_exception = io.com_xcpt.bits.cause.isOneOf(MINI_EXCEPTION_MEM_ORDERING, MINI_EXCEPTION_CSR_REPLAY)
+  val is_mem_ordering_exception = (r_xcpt_uop.exc_cause === MINI_EXCEPTION_MEM_ORDERING)
   io.com_xcpt.valid := exception_thrown && !is_mini_exception
   io.com_xcpt.bits := DontCare
   io.com_xcpt.bits.cause := r_xcpt_uop.exc_cause
+
+  // Expose ROB flushes caused specifically by MINI_EXCEPTION_MEM_ORDERING
+  io.mem_ordering_flush := exception_thrown && is_mem_ordering_exception
 
   io.com_xcpt.bits.badvaddr := Sext(r_xcpt_badvaddr, xLen)
   val insn_sys_pc2epc =
