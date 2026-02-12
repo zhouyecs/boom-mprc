@@ -1599,6 +1599,28 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.rob_flush_bubble       := rob_flush_bubble
   io.cpu.mispred_flush_bubble   := mispred_flush_bubble
 
+  val bpd_ifu_dist = Wire(UInt((log2Ceil(ftqSz) + 1).W))
+  bpd_ifu_dist := distanceBetween(s0_bpd_ftq_idx, s0_ftq_idx)
+
+  // Export BPD-ahead-of-IFU distance bucket for perf counters (0-6)
+  val dist_bucket = Wire(UInt(3.W))
+  when (bpd_ifu_dist <= 1.U) {
+    dist_bucket := 0.U
+  } .elsewhen (bpd_ifu_dist <= 3.U) {
+    dist_bucket := 1.U
+  } .elsewhen (bpd_ifu_dist <= 5.U) {
+    dist_bucket := 2.U
+  } .elsewhen (bpd_ifu_dist <= 8.U) {
+    dist_bucket := 3.U
+  } .elsewhen (bpd_ifu_dist <= 12.U) {
+    dist_bucket := 4.U
+  } .elsewhen (bpd_ifu_dist <= 16.U) {
+    dist_bucket := 5.U
+  } .otherwise {
+    dist_bucket := 6.U
+  }
+  io.cpu.bpd_ifu_dist_bucket := dist_bucket
+
   override def toString: String =
     (BoomCoreStringPrefix("====Overall Frontend Params====") + "\n"
     + icache.toString + bpd.toString)
@@ -1624,30 +1646,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
             "BPD s0 ftq idx should never be behind IFU s0 ftq idx")
     val bpd_ahead_limit_number = PlusArg("bpd-ahead-limit", 63, "limit bpd ahead of ifu s0", 6)
     require(log2Ceil(ftqSz) == 5)
-    val bpd_ifu_dist = Wire(UInt((log2Ceil(ftqSz) + 1).W))
-    bpd_ifu_dist := distanceBetween(s0_bpd_ftq_idx, s0_ftq_idx)
+
     when (bpd_ahead_limit_number < bpd_ifu_dist) {
       bpd_ahead_limit := true.B
     }
-
-    // Export BPD-ahead-of-IFU distance bucket for perf counters (0-6)
-    val dist_bucket = Wire(UInt(3.W))
-    when (bpd_ifu_dist <= 1.U) {
-      dist_bucket := 0.U
-    } .elsewhen (bpd_ifu_dist <= 3.U) {
-      dist_bucket := 1.U
-    } .elsewhen (bpd_ifu_dist <= 5.U) {
-      dist_bucket := 2.U
-    } .elsewhen (bpd_ifu_dist <= 8.U) {
-      dist_bucket := 3.U
-    } .elsewhen (bpd_ifu_dist <= 12.U) {
-      dist_bucket := 4.U
-    } .elsewhen (bpd_ifu_dist <= 16.U) {
-      dist_bucket := 5.U
-    } .otherwise {
-      dist_bucket := 6.U
-    }
-    io.cpu.bpd_ifu_dist_bucket := dist_bucket
 
     val s0_bpd_printf = PlusArg("s0-bpd-printf", 0, "print s0 bpd state", 1)
     when (s0_bpd_printf(0)) {
