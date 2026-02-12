@@ -1927,6 +1927,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       assert (s0_pf_real_valid || icache.io.s0_pf_blocked,
         "pf can't replay only when icache s0 pf  is blocked" )
     }
+
+    assert (s0_ifu_ftq_idx_reg >= s0_ftq_idx)
   }
   // TODO: 断言 bpd 给 ftq 的输入和 ftq 给 predecode 的输入一致 
 }
