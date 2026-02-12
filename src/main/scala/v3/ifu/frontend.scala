@@ -309,6 +309,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // Fetch buffer enqueue monitor (for perf counters)
   val fb_enq_valid      = Input(Bool())
   val fb_enq_cnt        = Input(UInt(log2Ceil(fetchWidth+1).W))
+
+  // BPD-ahead-of-IFU distance bucket (7 ranges)
+  val bpd_ifu_dist_bucket = Input(UInt(3.W))
 }
 
 /**
@@ -1562,6 +1565,25 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     when (bpd_ahead_limit_number < bpd_ifu_dist) {
       bpd_ahead_limit := true.B
     }
+
+    // Export BPD-ahead-of-IFU distance bucket for perf counters (0-6)
+    val dist_bucket = Wire(UInt(3.W))
+    when (bpd_ifu_dist <= 1.U) {
+      dist_bucket := 0.U
+    } .elsewhen (bpd_ifu_dist <= 3.U) {
+      dist_bucket := 1.U
+    } .elsewhen (bpd_ifu_dist <= 5.U) {
+      dist_bucket := 2.U
+    } .elsewhen (bpd_ifu_dist <= 8.U) {
+      dist_bucket := 3.U
+    } .elsewhen (bpd_ifu_dist <= 12.U) {
+      dist_bucket := 4.U
+    } .elsewhen (bpd_ifu_dist <= 16.U) {
+      dist_bucket := 5.U
+    } .otherwise {
+      dist_bucket := 6.U
+    }
+    io.cpu.bpd_ifu_dist_bucket := dist_bucket
 
     val s0_bpd_printf = PlusArg("s0-bpd-printf", 0, "print s0 bpd state", 1)
     when (s0_bpd_printf(0)) {

@@ -495,6 +495,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val s2_replay_itlb_miss = io.ifu.s2_replay_itlb_miss
   val s2_replay_ic_miss   = io.ifu.s2_replay_ic_miss
 
+  // BPD-ahead-of-IFU distance bucket from frontend (0-6)
+  val bpd_ifu_dist_bucket = io.ifu.bpd_ifu_dist_bucket
+
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
@@ -578,6 +581,22 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
     // 29: dcache miss (LSU acquire)
     event_counters.io.event_signals(29) := Mux(io.lsu.perf.acquire, 1.U, 0.U)
+
+    // 30-36: BPD-ahead-of-IFU FTQ pointer distance buckets
+    // 30: distance 0-1
+    // 31: distance 2-3
+    // 32: distance 4-5
+    // 33: distance 6-8
+    // 34: distance 9-12
+    // 35: distance 13-16
+    // 36: distance >16
+    event_counters.io.event_signals(30) := Mux(bpd_ifu_dist_bucket === 0.U, 1.U, 0.U)
+    event_counters.io.event_signals(31) := Mux(bpd_ifu_dist_bucket === 1.U, 1.U, 0.U)
+    event_counters.io.event_signals(32) := Mux(bpd_ifu_dist_bucket === 2.U, 1.U, 0.U)
+    event_counters.io.event_signals(33) := Mux(bpd_ifu_dist_bucket === 3.U, 1.U, 0.U)
+    event_counters.io.event_signals(34) := Mux(bpd_ifu_dist_bucket === 4.U, 1.U, 0.U)
+    event_counters.io.event_signals(35) := Mux(bpd_ifu_dist_bucket === 5.U, 1.U, 0.U)
+    event_counters.io.event_signals(36) := Mux(bpd_ifu_dist_bucket === 6.U, 1.U, 0.U)
   }
 
   //-------------------------------------------------------------
