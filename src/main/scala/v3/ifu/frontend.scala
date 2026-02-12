@@ -318,6 +318,16 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   //  - s0_ifu_ftq_backpress: s0_valid && ifu_to_ftq_not_ready
   val s0_ifu_real_not_valid = Input(Bool())
   val s0_ifu_ftq_backpress  = Input(Bool())
+
+  // Frontend bubble statistics by clear source
+  // Bubble count is based on distanceBetween(s0_ifu_ftq_idx_reg, s0_ftq_idx)
+  //  - f2_clear_bubble/f3_clear_bubble/predecode_clear_bubble: low 4 bits
+  //  - rob_flush_bubble/mispred_flush_bubble: full 6-bit bubble value (0-32)
+  val f2_clear_bubble        = Input(UInt(4.W))
+  val f3_clear_bubble        = Input(UInt(4.W))
+  val predecode_clear_bubble = Input(UInt(4.W))
+  val rob_flush_bubble       = Input(UInt((log2Ceil(ftqSz)+1).W))
+  val mispred_flush_bubble   = Input(UInt((log2Ceil(ftqSz)+1).W))
 }
 
 /**
@@ -1543,6 +1553,51 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_ifu_ftq_idx_reg := s0_ftq_idx + 1.U
     s0_ifu_tsrc_debug_reg := IFU_S0_SRC_REG_DEBUG
   }
+
+  // --------------------------------------------------------
+  // **** Frontend bubble statistics by clear source ****
+  // Bubble count is measured as the FTQ pointer distance between
+  // the last S0 IFU FTQ index and the current S0 FTQ index.
+  // This corresponds to the number of frontend bubbles created
+  // by different clear/redirect sources.
+
+  // distanceBetween returns a value in range [0, ftqSz]
+  val s0_bubble = Wire(UInt((log2Ceil(ftqSz)+1).W))
+  s0_bubble := distanceBetween(s0_ifu_ftq_idx_reg, s0_ftq_idx)
+
+  // Default bubble contributions per source
+  val f2_clear_bubble        = WireDefault(0.U(4.W))
+  val f3_clear_bubble        = WireDefault(0.U(4.W))
+  val predecode_clear_bubble = WireDefault(0.U(4.W))
+  val rob_flush_bubble       = WireDefault(0.U((log2Ceil(ftqSz)+1).W))
+  val mispred_flush_bubble   = WireDefault(0.U((log2Ceil(ftqSz)+1).W))
+
+  when (s0_ifu_real_valid) {
+    when (s0_ifu_tsrc_debug === IFU_S0_SRC_F2_DEBUG) {
+      // Bubbles created by F2 clear
+      f2_clear_bubble := s0_bubble(3,0)
+    } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_F3_DEBUG) {
+      // Bubbles created by F3 clear
+      f3_clear_bubble := s0_bubble(3,0)
+    } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_PREDECODE_DEBUG) {
+      // Bubbles created by predecode clear
+      predecode_clear_bubble := s0_bubble(3,0)
+    } .elsewhen (s0_ifu_tsrc_debug === IFU_S0_SRC_REDIRECT_DEBUG) {
+      // Backend-originated flushes (ROB flush vs branch mispredict)
+      when (io.cpu.rob_flush) {
+        rob_flush_bubble := s0_bubble
+      } .otherwise {
+        mispred_flush_bubble := s0_bubble
+      }
+    }
+  }
+
+  // Export bubble statistics to core for event counters
+  io.cpu.f2_clear_bubble        := f2_clear_bubble
+  io.cpu.f3_clear_bubble        := f3_clear_bubble
+  io.cpu.predecode_clear_bubble := predecode_clear_bubble
+  io.cpu.rob_flush_bubble       := rob_flush_bubble
+  io.cpu.mispred_flush_bubble   := mispred_flush_bubble
 
   override def toString: String =
     (BoomCoreStringPrefix("====Overall Frontend Params====") + "\n"

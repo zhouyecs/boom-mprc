@@ -486,6 +486,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val dec_all_false = !dec_valids.reduce(_||_)
   val dec_all_true  = dec_valids.reduce(_&&_)
 
+  // Frontend bubble statistics from frontend
+  val f2_clear_bubble        = io.ifu.f2_clear_bubble
+  val f3_clear_bubble        = io.ifu.f3_clear_bubble
+  val predecode_clear_bubble = io.ifu.predecode_clear_bubble
+  val rob_flush_bubble       = io.ifu.rob_flush_bubble
+  val mispred_flush_bubble   = io.ifu.mispred_flush_bubble
+
   // Fetch buffer enqueue statistics from frontend
   val fb_enq_cnt  = io.ifu.fb_enq_cnt
   val fb_enq_fire = io.ifu.fb_enq_valid
@@ -607,6 +614,28 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // 38: s0_valid && ifu_to_ftq_not_ready
     event_counters.io.event_signals(37) := Mux(s0_ifu_real_not_valid, 1.U, 0.U)
     event_counters.io.event_signals(38) := Mux(s0_ifu_ftq_backpress, 1.U, 0.U)
+
+    // 43-49: frontend bubble statistics by clear source
+    // 43: bubbles from F2 clear (low 4 bits)
+    // 44: bubbles from F3 clear (low 4 bits)
+    // 45: bubbles from predecode clear (low 4 bits)
+    // 46: backend ROB flush bubbles (low 4 bits)
+    // 47: backend ROB flush bubbles (high 2 bits)
+    // 48: backend mispredict flush bubbles (low 4 bits)
+    // 49: backend mispredict flush bubbles (high 2 bits)
+    event_counters.io.event_signals(43) := f2_clear_bubble
+    event_counters.io.event_signals(44) := f3_clear_bubble
+    event_counters.io.event_signals(45) := predecode_clear_bubble
+
+    val rob_bubble_low  = rob_flush_bubble(3,0)
+    val rob_bubble_high = rob_flush_bubble(5,4)
+    event_counters.io.event_signals(46) := rob_bubble_low
+    event_counters.io.event_signals(47) := rob_bubble_high
+
+    val mispred_bubble_low  = mispred_flush_bubble(3,0)
+    val mispred_bubble_high = mispred_flush_bubble(5,4)
+    event_counters.io.event_signals(48) := mispred_bubble_low
+    event_counters.io.event_signals(49) := mispred_bubble_high
   }
 
   //-------------------------------------------------------------
