@@ -312,6 +312,12 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
 
   // BPD-ahead-of-IFU distance bucket (7 ranges)
   val bpd_ifu_dist_bucket = Input(UInt(3.W))
+
+  // Frontend s0 stall statistics
+  //  - s0_ifu_real_not_valid: s0_ifu_real_valid is false
+  //  - s0_ifu_ftq_backpress: s0_valid && ifu_to_ftq_not_ready
+  val s0_ifu_real_not_valid = Input(Bool())
+  val s0_ifu_ftq_backpress  = Input(Bool())
 }
 
 /**
@@ -1522,6 +1528,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // s0 寄存器暂存 fetch 请求
   val ifu_to_ftq_not_ready = isFull(ftq.io.bpd_commit_ptr, s0_ftq_idx)
   s0_ifu_real_valid := s0_valid && !ifu_to_ftq_not_ready
+  // Export s0 stall conditions for perf counters
+  io.cpu.s0_ifu_real_not_valid := !s0_ifu_real_valid
+  io.cpu.s0_ifu_ftq_backpress  := s0_valid && ifu_to_ftq_not_ready
   when (!s0_ifu_real_valid) {
     s0_ifu_valid_reg   := s0_valid
     s0_ifu_vpc_reg     := s0_ifu_vpc

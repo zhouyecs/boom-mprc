@@ -498,6 +498,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // BPD-ahead-of-IFU distance bucket from frontend (0-6)
   val bpd_ifu_dist_bucket = io.ifu.bpd_ifu_dist_bucket
 
+  // Frontend s0 stall statistics from frontend
+  val s0_ifu_real_not_valid = io.ifu.s0_ifu_real_not_valid
+  val s0_ifu_ftq_backpress  = io.ifu.s0_ifu_ftq_backpress
+
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
@@ -597,6 +601,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(34) := Mux(bpd_ifu_dist_bucket === 4.U, 1.U, 0.U)
     event_counters.io.event_signals(35) := Mux(bpd_ifu_dist_bucket === 5.U, 1.U, 0.U)
     event_counters.io.event_signals(36) := Mux(bpd_ifu_dist_bucket === 6.U, 1.U, 0.U)
+
+    // 37-38: frontend s0 stall statistics
+    // 37: s0_ifu_real_valid is false
+    // 38: s0_valid && ifu_to_ftq_not_ready
+    event_counters.io.event_signals(37) := Mux(s0_ifu_real_not_valid, 1.U, 0.U)
+    event_counters.io.event_signals(38) := Mux(s0_ifu_ftq_backpress, 1.U, 0.U)
   }
 
   //-------------------------------------------------------------
