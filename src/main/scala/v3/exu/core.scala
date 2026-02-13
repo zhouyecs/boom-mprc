@@ -505,6 +505,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   // BPD-ahead-of-IFU distance bucket from frontend (0-6)
   val bpd_ifu_dist_bucket = io.ifu.bpd_ifu_dist_bucket
 
+  // Prefetch refill distance bucket from frontend
+  val pf_refill_dist_bucket = io.ifu.pf_refill_dist_bucket
+
   // Frontend s0 stall statistics from frontend
   val s0_ifu_real_not_valid = io.ifu.s0_ifu_real_not_valid
   val s0_ifu_ftq_backpress  = io.ifu.s0_ifu_ftq_backpress
@@ -636,6 +639,23 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val mispred_bubble_high = mispred_flush_bubble(5,4)
     event_counters.io.event_signals(48) := mispred_bubble_low
     event_counters.io.event_signals(49) := mispred_bubble_high
+
+    // 50-56: Prefetch-ahead-of-IFU distance buckets at prefetch refill completion
+    // Only counted when a prefetch MSHR completes writeback and is not cancelled by fencei
+    // 50: distance 0-1
+    // 51: distance 2-3
+    // 52: distance 4-5
+    // 53: distance 6-8
+    // 54: distance 9-12
+    // 55: distance 13-16
+    // 56: distance >16
+    event_counters.io.event_signals(50) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 0.U, 1.U, 0.U)
+    event_counters.io.event_signals(51) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 1.U, 1.U, 0.U)
+    event_counters.io.event_signals(52) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 2.U, 1.U, 0.U)
+    event_counters.io.event_signals(53) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 3.U, 1.U, 0.U)
+    event_counters.io.event_signals(54) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 4.U, 1.U, 0.U)
+    event_counters.io.event_signals(55) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 5.U, 1.U, 0.U)
+    event_counters.io.event_signals(56) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 6.U, 1.U, 0.U)
   }
 
   //-------------------------------------------------------------

@@ -313,6 +313,11 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // BPD-ahead-of-IFU distance bucket (7 ranges)
   val bpd_ifu_dist_bucket = Input(UInt(3.W))
 
+  // Prefetch refill distance bucket: valid when a prefetch MSHR completes
+  // writeback and not cancelled by fencei, carrying the distance bucket
+  // recorded at the time prefetch was issued
+  val pf_refill_dist_bucket = Flipped(Valid(UInt(3.W)))
+
   // Frontend s0 stall statistics
   //  - s0_ifu_real_not_valid: s0_ifu_real_valid is false
   //  - s0_ifu_ftq_backpress: s0_valid && ifu_to_ftq_not_ready
@@ -558,6 +563,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.icache_valid_access := icache.io.icache_valid_access
   io.cpu.icache_hit := icache.io.resp.valid
 
+  // Forward prefetch refill distance bucket from ICache to core
+  io.cpu.pf_refill_dist_bucket := icache.io.pf_refill_dist_bucket
+
   when (RegNext(reset.asBool) && !reset.asBool) {
     s0_valid   := true.B
     s0_ifu_vpc := io_reset_vector
@@ -573,7 +581,28 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Prefetch s0: tag lookup request
   icache.io.s0_pf_valid   := s0_pf_real_valid
   icache.io.s0_pf_vaddr   := s0_pf_vpc
-  
+
+  // Compute prefetch-ahead-of-IFU distance and bucket in s0
+  val pf_ifu_dist = Wire(UInt((log2Ceil(ftqSz) + 1).W))
+  pf_ifu_dist := distanceBetween(s0_pf_ftq_idx, s0_ftq_idx)
+  val pf_dist_bucket = Wire(UInt(3.W))
+  when (pf_ifu_dist <= 1.U) {
+    pf_dist_bucket := 0.U
+  } .elsewhen (pf_ifu_dist <= 3.U) {
+    pf_dist_bucket := 1.U
+  } .elsewhen (pf_ifu_dist <= 5.U) {
+    pf_dist_bucket := 2.U
+  } .elsewhen (pf_ifu_dist <= 8.U) {
+    pf_dist_bucket := 3.U
+  } .elsewhen (pf_ifu_dist <= 12.U) {
+    pf_dist_bucket := 4.U
+  } .elsewhen (pf_ifu_dist <= 16.U) {
+    pf_dist_bucket := 5.U
+  } .otherwise {
+    pf_dist_bucket := 6.U
+  }
+  icache.io.s0_pf_dist_bucket := pf_dist_bucket
+
 
   bpd.io.f0_req.valid      := s0_bpd_real_valid
   bpd.io.f0_req.bits.pc    := s0_bpd_vpc

@@ -95,6 +95,7 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   val s0_pf_valid   = Input(Bool())
   val s0_pf_vaddr   = Input(UInt(vaddrBitsExtended.W))
   val s0_pf_blocked = Output(Bool())
+  val s0_pf_dist_bucket = Input(UInt(3.W))
 
   // s1: prefetch physical address from TLB and control
   val s1_pf_valid      = Input(Bool())
@@ -105,6 +106,10 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   val s1_pf_ftq_idx    = Input(new FTQPtr)
   // ICache accepted this s1 prefetch this cycle (advanced to internal s2)
   val s1_pf_can_advance    = Output(Bool())
+
+  // Prefetch refill distance bucket: valid when a prefetch MSHR completes writeback
+  // and the writeback is not cancelled by fencei
+  val pf_refill_dist_bucket = Valid(UInt(3.W))
 }
 
 /**
@@ -123,6 +128,7 @@ class MSHRResp(implicit p: Parameters) extends CoreBundle with HasBoomFrontendPa
   val tag:      UInt = UInt(tagBits.W)
   val vSetIdx:  UInt = UInt(idxBits.W)
   val way:      UInt = UInt(wayBits.W)
+  val distBucket: UInt = UInt(3.W)
 }
 
 class LookUpMSHR(implicit p: Parameters) extends CoreBundle with HasBoomFrontendParameters {
@@ -135,6 +141,7 @@ class ICacheMSHRIO(implicit p: Parameters) extends CoreBundle with HasBoomFronte
   val flush:     Bool                       = Input(Bool())
   val invalid:   Bool                       = Input(Bool())
   val req:       DecoupledIO[UInt]          = Flipped(DecoupledIO(UInt(paddrBits.W)))
+  val reqDistBucket: UInt                   = Input(UInt(3.W))
   val acquire:   DecoupledIO[UInt]          = DecoupledIO(UInt(paddrBits.W))
   val lookUps:   Vec[LookUpMSHR]            = Flipped(Vec(2, new LookUpMSHR))
   val resp:      Valid[MSHRResp]            = ValidIO(new MSHRResp)
@@ -186,6 +193,7 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
 
   private val blkPaddr = RegInit(UInt((paddrBits - blockOffBits).W), 0.U)
   private val way      = RegInit(UInt(wayBits.W), 0.U)
+  private val distBucket = RegInit(UInt(3.W), 0.U)
 
   // look up and return result at the same cycle
   for (i <- 0 until 2) {
@@ -233,6 +241,7 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
     issue    := false.B
     fencei   := false.B
     blkPaddr := io.req.bits(paddrBits-1, blockOffBits)
+    distBucket := io.reqDistBucket
   }
 
   // send request to L2
@@ -269,6 +278,7 @@ class ICacheMSHR(isFetch: Boolean, ID: Int)(implicit p: Parameters) extends Boom
   io.resp.bits.tag      := blkPaddr(tagBits+idxBits-1,idxBits)
   io.resp.bits.vSetIdx  := blkPaddr(idxBits-1, 0)
   io.resp.bits.way      := way
+  io.resp.bits.distBucket := distBucket
 
   require(tagBits + idxBits == blkPaddr.getWidth)
 
@@ -380,6 +390,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s1_pf_ppc_valid = io.s1_pf_ppc_valid
   
   val s1_pf_fire  = Wire(Bool())
+
+  // Pipeline prefetch distance bucket: s0 -> s1 -> s2_pf
+  val s1_pf_dist_bucket = RegNext(io.s0_pf_dist_bucket)
+  val s2_pf_dist_bucket = RegEnable(s1_pf_dist_bucket, s1_pf_fire)
   
   val s1_pf_MSHR_hit  = Wire(Bool())
   val s1_pf_cache_hit = Wire(Bool())
@@ -418,12 +432,14 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     m.io.flush  := false.B
     m.io.lookUps(0).paddr := s2_paddr
     m.io.lookUps(1).paddr := s2_pf_ppc
+    m.io.reqDistBucket := 0.U
   }
   pfMSHRs.foreach { m =>
     m.io.fencei := io.invalidate
     m.io.flush  := io.mshr_flush
     m.io.lookUps(0).paddr := s2_paddr
     m.io.lookUps(1).paddr := s2_pf_ppc
+    m.io.reqDistBucket := s2_pf_dist_bucket
   }
 
   // Allocate miss requests into the first available MSHR
@@ -441,6 +457,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val mshr_resp_tags   = VecInit(allMSHRs.map(_.io.resp.bits.tag))
   val mshr_resp_idxs   = VecInit(allMSHRs.map(_.io.resp.bits.vSetIdx))
   val mshr_resp_ways   = VecInit(allMSHRs.map(_.io.resp.bits.way))
+  val mshr_resp_dist_buckets = VecInit(allMSHRs.map(_.io.resp.bits.distBucket))
 
   val refill_fire = tl_out.a.fire
   val refill_one_beat = tl_out.d.fire && edge_out.hasData(tl_out.d.bits)
@@ -455,6 +472,13 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val refill_paddr = Mux1H(refill_src_oh, mshr_resp_paddrs)
   val refill_tag   = Mux1H(refill_src_oh, mshr_resp_tags)
   val refill_idx   = Mux1H(refill_src_oh, mshr_resp_idxs)
+  val refill_dist_bucket = Mux1H(refill_src_oh, mshr_resp_dist_buckets)
+
+  // Output prefetch refill distance bucket: valid when a prefetch MSHR
+  // completes writeback and its resp is not cancelled by fencei
+  val is_pf_refill = refill_src >= nFetchMSHRs.U
+  io.pf_refill_dist_bucket.valid := refill_done && !invalidated && is_pf_refill
+  io.pf_refill_dist_bucket.bits  := refill_dist_bucket
 
   io.req.ready := !refill_one_beat
   //Enable_PerfCounter_Support
