@@ -777,13 +777,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     io.ifu.redirect_ghist.current_saw_branch_not_taken := use_same_ghist
     // 在 decoupled frontend 里，ghist 是从 f3 preds 写入到 ftq，它的 ras idx
     // 不一定准确
-    when (ftq_entry.cfi_is_call && ftq_entry.cfi_idx.bits === cfi_idx) {
+    val redirect_cfi_is_call = ftq_entry.cfi_is_call && ftq_entry.cfi_idx.bits === cfi_idx
+    when (redirect_cfi_is_call) {
       io.ifu.redirect_ghist.ras_idx := WrapInc(ftq_entry.ras_idx, nRasEntries)
     } .elsewhen( ftq_entry.cfi_is_ret && ftq_entry.cfi_idx.bits === cfi_idx) {
       io.ifu.redirect_ghist.ras_idx := WrapDec(ftq_entry.ras_idx, nRasEntries)
     } .otherwise {
       io.ifu.redirect_ghist.ras_idx := ftq_entry.ras_idx
     }
+    io.ifu.redirect_is_call   := redirect_cfi_is_call
+    io.ifu.redirect_call_addr := npc
   } .elsewhen (rob.io.flush_frontend || brupdate.b1.mispredict_mask =/= 0.U) {
     io.ifu.redirect_flush   := true.B
   }

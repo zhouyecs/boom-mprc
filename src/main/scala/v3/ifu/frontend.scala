@@ -284,6 +284,11 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val redirect_pc      = Output(UInt()) // Where do we redirect to?
   val redirect_ftq_idx = Output(UInt()) // Which ftq entry should we reset to?
   val redirect_ghist   = Output(new GlobalHistory) // What are we setting as the global history?
+
+  // Backend call mispredict: if the mispredicted CFI is a call, the core sends
+  // the correct return address so the frontend can push it onto the RAS.
+  val redirect_is_call  = Output(Bool())
+  val redirect_call_addr = Output(UInt(vaddrBitsExtended.W))
   
   // 额外的 flush 信号，使得 FTQ 可以区分 rob flush 和 mispredict
   val rob_flush = Output(Bool()) // Flush coming from the ROB
@@ -1051,6 +1056,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.backend_ras_top_update_valid := false.B
   bpd.io.backend_ras_top_update_idx := DontCare
 
+  // Deferred predecode call RAS restoration: after a predecode redirect with a call,
+  // on the next cycle we restore the old ras_top value at the original ras_idx.
+  // (The pointer was already bumped in the first cycle, so only content needs restoring.)
+  val predecode_call_ras_restore_valid = RegInit(false.B)
+  val predecode_call_ras_restore_idx   = Reg(UInt(log2Ceil(nRasEntries).W))
+  val predecode_call_ras_restore_addr  = Reg(UInt(vaddrBitsExtended.W))
+  predecode_call_ras_restore_valid := false.B
+  when (predecode_call_ras_restore_valid) {
+    bpd.io.predecode_ras_update_valid := true.B
+    bpd.io.predecode_ras_update_idx   := predecode_call_ras_restore_idx
+    bpd.io.predecode_ras_update_addr  := predecode_call_ras_restore_addr
+  }
+
+
+
   val f3_ghist_all_zero = f3_fetch_bundle.ghist === (0.U).asTypeOf(new GlobalHistory)
   val shift_zero_or_no_shift_f3 = f3_pred_ghist_update_type(1) === 0.U &&
                                   f3_bpd_resp.io.deq.bits.ghist_update_type(1) === 0.U
@@ -1073,13 +1093,17 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       // 区分一下，但对于后者，没有预测错时，更新也不会造成任何影响？
       when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
         // 预译码检测到 call 指令时，ras top idx 更新和 ras top 内容更新同时发生
-        // TODO: 下一个周期再把 f3_bpd_resp.io.deq.bits.preds.ras_top 写回去？
+        // 本周期：将新的 call 返回地址写入 ras_idx+1，并将 ras top 指针移到 ras_idx+1
         bpd.io.predecode_ras_top_update_valid := true.B
         bpd.io.predecode_ras_top_update_idx := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
         bpd.io.predecode_ras_update_valid := true.B
         bpd.io.predecode_ras_update_idx := WrapInc(f3_bpd_resp.io.deq.bits.preds.ras_idx, nRasEntries)
         bpd.io.predecode_ras_update_addr := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
                                             f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
+        // 下一周期：恢复原来 ras_idx 位置的 ras_top 值（可能被投机执行覆盖）
+        predecode_call_ras_restore_valid := true.B
+        predecode_call_ras_restore_idx   := f3_bpd_resp.io.deq.bits.preds.ras_idx
+        predecode_call_ras_restore_addr  := f3_bpd_resp.io.deq.bits.preds.ras_top
       } .elsewhen(f3_fetch_bundle.cfi_is_ret && f3_fetch_bundle.cfi_idx.valid) {
         // 预译码检测到 ret 指令时，更新 ras top idx
         bpd.io.predecode_ras_top_update_valid := true.B 
@@ -1253,6 +1277,14 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // 后端重定向更新 ras top 指针的内容
     bpd.io.backend_ras_top_update_valid := true.B
     bpd.io.backend_ras_top_update_idx  := io.cpu.redirect_ghist.ras_idx
+
+    // 如果预测错误的 CFI 是 call 指令，在同一周期将 call 的返回地址写入 RAS
+    // 这不与 FTQ 的 ras_update 冲突，因为 FTQ 的 ras_update 在下一周期才拉高
+    when (io.cpu.redirect_is_call) {
+      bpd.io.backend_ras_update_valid := true.B
+      bpd.io.backend_ras_update_idx   := io.cpu.redirect_ghist.ras_idx
+      bpd.io.backend_ras_update_addr  := io.cpu.redirect_call_addr
+    }
   }
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
