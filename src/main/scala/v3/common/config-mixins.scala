@@ -23,6 +23,17 @@ import boom.v3.lsu._
 // BOOM Config Fragments
 // ---------------------
 
+class DCacheConfigs(nSet: Int, nWay: Int, nTLB: Int) extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(dcache = Some(tp.tileParams.dcache.get.copy(
+      nSets = nSet,
+      nWays = nWay,
+      nTLBWays = nTLB
+    ))))
+    case other => other
+  }
+})
+
 class PfMSHRNumber(n: Int) extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(icache = Some(tp.tileParams.icache.get.copy(
