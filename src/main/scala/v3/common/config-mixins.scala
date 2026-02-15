@@ -34,6 +34,10 @@ class DCacheConfigs(nSet: Int, nWay: Int, nTLB: Int) extends Config((site, here,
   }
 })
 
+class BTBConfig(nSet: Int = 128, nWay: Int = 2, offsetSz: Int = 13, extendedNSets: Int = 128) extends Config((site, here, up) => {
+  case BoomBTBKey => BoomBTBParams(nSets = nSet, nWays = nWay, offsetSz = offsetSz, extendedNSets = extendedNSets)
+})
+
 class PfMSHRNumber(n: Int) extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(icache = Some(tp.tileParams.icache.get.copy(
@@ -603,7 +607,7 @@ class WithTAGEBPD extends Config((site, here, up) => {
       localHistoryNSets = 0,
       branchPredictor = ((resp_in: BranchPredictionBankResponse, p: Parameters) => {
         val tage = Module(new TageBranchPredictorBank()(p))
-        val btb = Module(new BTBBranchPredictorBank()(p))
+        val btb = Module(new BTBBranchPredictorBank(p(BoomBTBKey))(p))
         val bim = Module(new BIMBranchPredictorBank()(p))
         val ubtb = Module(new FAMicroBTBBranchPredictorBank()(p))
         val ras = Module(new RASBranchPredictorBank()(p))
