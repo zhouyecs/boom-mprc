@@ -323,6 +323,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // recorded at the time prefetch was issued
   val pf_refill_dist_bucket = Flipped(Valid(UInt(3.W)))
 
+  // Prefetch accuracy: true when a prefetch-filled line is first accessed by IFU
+  val pf_hit_success = Input(Bool())
+
   // Frontend s0 stall statistics
   //  - s0_ifu_real_not_valid: s0_ifu_real_valid is false
   //  - s0_ifu_ftq_backpress: s0_valid && ifu_to_ftq_not_ready
@@ -571,6 +574,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Forward prefetch refill distance bucket from ICache to core
   io.cpu.pf_refill_dist_bucket := icache.io.pf_refill_dist_bucket
 
+  // Forward prefetch accuracy signal from ICache to core
+  io.cpu.pf_hit_success := icache.io.pf_hit_success
+
   when (RegNext(reset.asBool) && !reset.asBool) {
     s0_valid   := true.B
     s0_ifu_vpc := io_reset_vector
@@ -752,6 +758,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.tsrc := s2_ifu_tsrc
 
   f3_enq_fire := f3.io.enq.fire
+  icache.io.f3_enq_fire := f3_enq_fire
 
   // The BPD resp comes in f3
   f3_bpd_resp.io.enq.valid := f3.io.deq.valid && RegNext(f3.io.enq.ready)

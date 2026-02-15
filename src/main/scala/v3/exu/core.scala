@@ -658,6 +658,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(56) := Mux(pf_refill_dist_bucket.valid && pf_refill_dist_bucket.bits === 6.U, 1.U, 0.U)
 
     event_counters.io.event_signals(57) := Mux(io.lsu.perf.tlbMiss, 1.U, 0.U) // dtlb miss
+
+    // 58: successful prefetch count (prefetch-filled line first accessed by IFU)
+    event_counters.io.event_signals(58) := Mux(io.ifu.pf_hit_success, 1.U, 0.U)
   }
 
   //-------------------------------------------------------------

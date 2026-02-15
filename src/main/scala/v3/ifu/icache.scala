@@ -110,6 +110,11 @@ class ICacheBundle(val outer: ICache) extends BoomBundle()(outer.p)
   // Prefetch refill distance bucket: valid when a prefetch MSHR completes writeback
   // and the writeback is not cancelled by fencei
   val pf_refill_dist_bucket = Valid(UInt(3.W))
+
+  // From frontend: s2 pipeline successfully enters f3 (not flushed)
+  val f3_enq_fire = Input(Bool())
+  // Prefetch accuracy: true when a prefetch-filled line is first accessed by IFU
+  val pf_hit_success = Output(Bool())
 }
 
 /**
@@ -574,6 +579,20 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     vb_array := 0.U
   }
 
+  // Prefetch accuracy tracking arrays
+  // pf_array: marks lines filled by prefetch MSHRs
+  // visit_array: marks lines that have been successfully accessed by IFU (entered f3)
+  val pf_array    = RegInit(0.U((nSets*nWays).W))
+  val visit_array = RegInit(0.U((nSets*nWays).W))
+
+  // Update pf_array on refill completion
+  when (refill_done && !invalidated) {
+    pf_array := pf_array.bitSet(Cat(repl_way, refill_idx), is_pf_refill)
+  }
+  when (io.invalidate) {
+    pf_array := 0.U
+  }
+
   val s2_dout   = Wire(Vec(nWays, UInt(wordBits.W)))
   val s1_bankid = Wire(Bool())
 
@@ -727,6 +746,25 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s2_hit_way = OHToUInt(s2_tag_hit)
   val s2_bankid = RegNext(s1_bankid)
   val s2_way_mux = Mux1H(s2_tag_hit, s2_dout)
+
+  // Prefetch accuracy: compute s2 line address and check pf/visit arrays
+  val s2_idx = s2_paddr(untagBits-1, blockOffBits)
+  val s2_line_addr = Cat(s2_hit_way, s2_idx)
+
+  // Successful prefetch: first IFU access (entered f3) to a prefetch-filled line
+  val s2_pf_hit_prefetched = io.f3_enq_fire && s2_hit &&
+    pf_array(s2_line_addr) && !visit_array(s2_line_addr)
+  io.pf_hit_success := s2_pf_hit_prefetched
+
+  // Update visit_array: set on successful f3 entry, clear on refill replacement
+  val visit_set_mask = Mux(io.f3_enq_fire && s2_hit,
+    1.U((nSets*nWays).W) << s2_line_addr, 0.U((nSets*nWays).W))
+  val visit_clr_mask = Mux(refill_done,
+    1.U((nSets*nWays).W) << Cat(repl_way, refill_idx), 0.U((nSets*nWays).W))
+  visit_array := (visit_array | visit_set_mask) & ~visit_clr_mask
+  when (io.invalidate) {
+    visit_array := 0.U
+  }
 
   val s2_unbanked_data = s2_way_mux
   val sz = s2_way_mux.getWidth
