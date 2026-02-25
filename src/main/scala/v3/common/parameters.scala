@@ -101,6 +101,7 @@ case class BoomCoreParams(
 
   // FDIP
   fullMSHRSkip: Boolean = false,
+  limitPfDist: Int = 0,
 
   // When true, restore ghist on refetch/next ROB flush instead of resetting to zero
   enableFlushGHistRestore: Boolean = false,
@@ -317,6 +318,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   // FDIP
 
   val fullMSHRSkip = boomParams.fullMSHRSkip
+  val limitPfDist = boomParams.limitPfDist
 
   val enableFlushGHistRestore = boomParams.enableFlushGHistRestore
 

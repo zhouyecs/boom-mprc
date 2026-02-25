@@ -596,6 +596,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Compute prefetch-ahead-of-IFU distance and bucket in s0
   val pf_ifu_dist = Wire(UInt((log2Ceil(ftqSz) + 1).W))
   pf_ifu_dist := distanceBetween(s0_pf_ftq_idx, s0_ftq_idx)
+  val pf_ahead_ifu = s0_pf_ftq_idx > s0_ftq_idx
+  val s1_pf_ifu_dist = RegNext(pf_ifu_dist)
+  val s1_pf_ahead_ifu = RegNext(pf_ahead_ifu)
   val pf_dist_bucket = Wire(UInt(3.W))
   when (pf_ifu_dist <= 1.U) {
     pf_dist_bucket := 0.U
@@ -657,10 +660,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   trans_queue.io.enq_ftq_idx := s1_pf_ftq_idx
 
   // s1_pf_can_go 表示 s1 不再需要保留：被 clear 或者 TLB 命中且 ICache 接收到了这一条 pf 请求
-  val s1_pf_can_go = s1_pf_ppc_valid && icache.io.s1_pf_can_advance
+  val s1_pf_dist_exceeded = (limitPfDist > 0).B && s1_pf_ahead_ifu && (s1_pf_ifu_dist > limitPfDist.U)
+  val s1_pf_can_advance = icache.io.s1_pf_can_advance && !s1_pf_dist_exceeded
+  val s1_pf_can_go = s1_pf_ppc_valid && s1_pf_can_advance
 
   // Drive prefetch-related inputs to ICache s1 stage
-  icache.io.s1_pf_valid     := s1_pf_valid
+  icache.io.s1_pf_valid     := s1_pf_valid && !s1_pf_dist_exceeded
   icache.io.s1_pf_ppc       := Mux(s1_pf_replay, s1_pf_replay_ppc, tlb.io.resp.paddr)
   icache.io.s1_pf_ppc_valid := s1_pf_ppc_valid
   icache.io.s1_pf_ppc_exp   := s1_pf_ppc_exp
@@ -1424,7 +1429,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s1_pf_replay := true.B
     s1_pf_replay_ppc := icache.io.s1_pf_ppc
     s1_pf_replay_exp := icache.io.s1_pf_ppc_exp
-  } .elsewhen(s1_pf_valid && icache.io.s1_pf_can_advance) { // s1 pf fire 到 s2 时重置 s1_pf_replay
+  } .elsewhen(s1_pf_valid && s1_pf_can_advance) { // s1 pf fire 到 s2 时重置 s1_pf_replay
     s1_pf_replay := false.B
   }
   when (f1_pf_clear) {
