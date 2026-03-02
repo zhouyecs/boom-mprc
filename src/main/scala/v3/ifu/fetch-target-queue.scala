@@ -377,7 +377,13 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
     ras_update     := true.B
     ras_update_pc  := redirect_entry.ras_top
-    ras_update_idx := redirect_entry.ras_idx
+
+    val is_call = redirect_new_entry.cfi_idx.valid && redirect_new_entry.cfi_is_call && !redirect_new_entry.cfi_is_pop_push
+    val is_ret  = redirect_new_entry.cfi_idx.valid && redirect_new_entry.cfi_is_ret && !redirect_new_entry.cfi_is_pop_push
+
+    ras_update_idx := Mux(is_call, WrapInc(redirect_entry.ras_idx, nRasEntries),
+                      Mux(is_ret,  WrapDec(redirect_entry.ras_idx, nRasEntries),
+                                   redirect_entry.ras_idx))
 
   } .elsewhen (RegNext(io.redirect.valid)) {
     prev_entry := RegNext(redirect_new_entry)
