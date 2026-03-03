@@ -307,6 +307,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U)
     io.bpdupdate.bits.is_mispredict_update := false.B
     io.bpdupdate.bits.is_repair_update     := false.B
+    io.bpdupdate.bits.is_rob_flush         := false.B
     io.bpdupdate.bits.pc      := bpd_pc
     io.bpdupdate.bits.btb_mispredicts := 0.U
     io.bpdupdate.bits.br_mask :=  bpd_entry.br_mask
@@ -322,6 +323,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     io.bpdupdate.bits.cfi_is_call  := bpd_entry.cfi_is_call
     io.bpdupdate.bits.cfi_is_ret   := bpd_entry.cfi_is_ret
     io.bpdupdate.bits.cfi_is_pop_push := bpd_entry.cfi_is_pop_push
+    io.bpdupdate.bits.cfi_is_rvc       := !bpd_entry.cfi_npc_plus4
 
     done_commit_update_debug := RegNext(do_commit_update) || done_commit_update_debug
   }

@@ -905,6 +905,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.f3_write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
   bpd.io.f3_write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
+  bpd.io.f3_is_ret      := f3_fetch_bundle.cfi_is_ret
+  bpd.io.f3_ras_top     := f3_fetch_bundle.ras_top
 
 
   val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
@@ -950,6 +952,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f4_btb_corrections.io.enq.bits  := DontCare
   f4_btb_corrections.io.enq.bits.is_mispredict_update := false.B
   f4_btb_corrections.io.enq.bits.is_repair_update     := false.B
+  f4_btb_corrections.io.enq.bits.is_rob_flush         := false.B
+  f4_btb_corrections.io.enq.bits.cfi_is_rvc           := false.B
   f4_btb_corrections.io.enq.bits.btb_mispredicts      := f3_btb_mispredicts.asUInt
   f4_btb_corrections.io.enq.bits.pc                   := f3_fetch_bundle.pc
   f4_btb_corrections.io.enq.bits.ghist                := f3_fetch_bundle.ghist
@@ -1028,11 +1032,19 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ftq.io.enq.valid          := f4.io.deq.valid && fb.io.enq.ready && !f4_delay
   ftq.io.enq.bits           := f4.io.deq.bits
 
-  val bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 2))
+  val bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 3))
   bpd_update_arbiter.io.in(0).valid := ftq.io.bpdupdate.valid
   bpd_update_arbiter.io.in(0).bits  := ftq.io.bpdupdate.bits
   assert(bpd_update_arbiter.io.in(0).ready)
   bpd_update_arbiter.io.in(1) <> f4_btb_corrections.io.deq
+
+  val rob_flush_update = Wire(new BranchPredictionUpdate)
+  rob_flush_update := (0.U).asTypeOf(new BranchPredictionUpdate)
+  rob_flush_update.is_rob_flush := io.cpu.rob_flush && io.cpu.redirect_val
+  rob_flush_update.ghist.ras_idx := io.cpu.redirect_ghist.ras_idx
+  bpd_update_arbiter.io.in(2).valid := rob_flush_update.is_rob_flush
+  bpd_update_arbiter.io.in(2).bits := rob_flush_update
+
   bpd.io.update := bpd_update_arbiter.io.out
   bpd_update_arbiter.io.out.ready := true.B
 
@@ -1059,6 +1071,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   ftq.io.rob_flush_pc_lob := io.cpu.rob_flush_pc_lob
   fb.io.clear := false.B
 
+  val s0_ghist_saras = WireInit(io.cpu.redirect_ghist)
+  when (io.cpu.rob_flush) {
+    s0_ghist_saras.ras_idx := bpd.io.tos_counter
+  }
   when (io.cpu.sfence.valid) {
     fb.io.clear := true.B
     f4_clear    := true.B
@@ -1082,7 +1098,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
     s0_valid     := io.cpu.redirect_val
     s0_vpc       := io.cpu.redirect_pc
-    s0_ghist     := io.cpu.redirect_ghist
+    s0_ghist     := s0_ghist_saras
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B
 

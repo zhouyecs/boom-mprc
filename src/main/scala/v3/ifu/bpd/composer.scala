@@ -16,6 +16,7 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
 
   val (components, resp) = getBPDComponents(io.resp_in(0), p)
   io.resp := resp
+  io.tos_counter := 0.U
 
 
   var metas = 0.U(1.W)
@@ -32,6 +33,11 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     c.io.f3_write_valid := io.f3_write_valid
     c.io.f3_write_idx := io.f3_write_idx
     c.io.f3_write_addr := io.f3_write_addr
+    c.io.f3_is_ret      := io.f3_is_ret
+    c.io.f3_ras_top     := io.f3_ras_top
+    if (c.isInstanceOf[RASBranchPredictorBank]) {
+      io.tos_counter := c.io.tos_counter
+    }
     if (c.metaSz > 0) {
       metas = (metas << c.metaSz) | c.io.f3_meta(c.metaSz-1,0)
     }

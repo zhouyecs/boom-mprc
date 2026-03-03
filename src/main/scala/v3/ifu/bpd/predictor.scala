@@ -55,9 +55,10 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   // Global predictors only care about non-speculative updates
   val is_mispredict_update = Bool()
   val is_repair_update = Bool()
+  val is_rob_flush = Bool()
   val btb_mispredicts = UInt(fetchWidth.W)
   def is_btb_mispredict_update = btb_mispredicts =/= 0.U
-  def is_commit_update = !(is_mispredict_update || is_repair_update || is_btb_mispredict_update)
+  def is_commit_update = !(is_mispredict_update || is_repair_update || is_btb_mispredict_update || is_rob_flush)
 
   val pc            = UInt(vaddrBitsExtended.W)
   // Mask of instructions which are branches.
@@ -79,6 +80,7 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cfi_is_call      = Bool()
   val cfi_is_ret       = Bool()
   val cfi_is_pop_push  = Bool()
+  val cfi_is_rvc       = Bool()
 
   val ghist = new GlobalHistory
   val lhist = Vec(nBanks, UInt(localHistoryLength.W))
@@ -96,11 +98,12 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
 {
   val is_mispredict_update     = Bool()
   val is_repair_update         = Bool()
+  val is_rob_flush             = Bool()
 
   val btb_mispredicts  = UInt(bankWidth.W)
   def is_btb_mispredict_update = btb_mispredicts =/= 0.U
 
-  def is_commit_update = !(is_mispredict_update || is_repair_update || is_btb_mispredict_update)
+  def is_commit_update = !(is_mispredict_update || is_repair_update || is_btb_mispredict_update || is_rob_flush)
 
   val pc               = UInt(vaddrBitsExtended.W)
 
@@ -115,8 +118,10 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cfi_is_call      = Bool()
   val cfi_is_ret       = Bool()
   val cfi_is_pop_push  = Bool()
+  val cfi_is_rvc       = Bool()
 
   val ghist            = UInt(globalHistoryLength.W)
+  val ras_idx          = UInt(log2Ceil(nRasEntries).W)
   val lhist            = UInt(localHistoryLength.W)
 
   val target           = UInt(vaddrBitsExtended.W)
@@ -171,8 +176,14 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val f3_write_valid = Input(Bool())
     val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
     val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
+
+    val f3_is_ret      = Input(Bool())
+    val f3_ras_top     = Input(UInt(vaddrBitsExtended.W))
+
+    val tos_counter    = Output(UInt(log2Ceil(nRasEntries).W))
   })
   io.resp := io.resp_in(0)
+  io.tos_counter := 0.U
 
   io.f3_meta := 0.U
 
@@ -232,6 +243,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val f3_write_valid = Input(Bool())
     val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
     val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
+
+    val f3_is_ret      = Input(Bool())
+    val f3_ras_top     = Input(UInt(vaddrBitsExtended.W))
+
+    val tos_counter    = Output(UInt(log2Ceil(nRasEntries).W))
   })
 
   var total_memsize = 0
@@ -268,8 +284,12 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(0).io.f3_write_valid := io.f3_write_valid
     banked_predictors(0).io.f3_write_idx := io.f3_write_idx
     banked_predictors(0).io.f3_write_addr := io.f3_write_addr
+    banked_predictors(0).io.f3_is_ret      := io.f3_is_ret
+    banked_predictors(0).io.f3_ras_top     := io.f3_ras_top
+    io.tos_counter := banked_predictors(0).io.tos_counter
   } else {
     require(nBanks == 2)
+    io.tos_counter := banked_predictors(0).io.tos_counter
 
     banked_predictors(0).io.resp_in(0)           := (0.U).asTypeOf(new BranchPredictionBankResponse)
     banked_predictors(1).io.resp_in(0)           := (0.U).asTypeOf(new BranchPredictionBankResponse)
@@ -402,6 +422,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   for (i <- 0 until nBanks) {
     banked_predictors(i).io.update.bits.is_mispredict_update := io.update.bits.is_mispredict_update
     banked_predictors(i).io.update.bits.is_repair_update     := io.update.bits.is_repair_update
+    banked_predictors(i).io.update.bits.is_rob_flush         := io.update.bits.is_rob_flush
 
     banked_predictors(i).io.update.bits.meta             := io.update.bits.meta(i)
     banked_predictors(i).io.update.bits.lhist            := io.update.bits.lhist(i)
@@ -414,6 +435,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(i).io.update.bits.cfi_is_call      := io.update.bits.cfi_is_call
     banked_predictors(i).io.update.bits.cfi_is_ret       := io.update.bits.cfi_is_ret
     banked_predictors(i).io.update.bits.cfi_is_pop_push  := io.update.bits.cfi_is_pop_push
+    banked_predictors(i).io.update.bits.cfi_is_rvc       := io.update.bits.cfi_is_rvc
+    banked_predictors(i).io.update.bits.ras_idx          := io.update.bits.ghist.ras_idx
     banked_predictors(i).io.update.bits.target           := io.update.bits.target
 
     banked_lhist_providers(i).io.update.mispredict := io.update.bits.is_mispredict_update
