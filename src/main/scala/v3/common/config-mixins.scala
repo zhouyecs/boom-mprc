@@ -52,6 +52,10 @@ class TAGEConfig(params: BoomTageParams = BoomTageParams()) extends Config((site
   case BoomTageKey => params
 })
 
+class UseLoopConfig(useLoop: Boolean) extends Config((site, here, up) => {
+  case BoomLoopKey => useLoop
+})
+
 class PfMSHRNumber(n: Int) extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(icache = Some(tp.tileParams.icache.get.copy(
@@ -633,7 +637,7 @@ class WithTAGEBPD extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
       // tage 56, fau btb 8, bim 8, btb 1, meta size 共 73
-      bpdMaxMetaLength = 80,
+      bpdMaxMetaLength = if (site(BoomLoopKey)) 120 else 80,
       globalHistoryLength = 64,
       localHistoryLength = 1,
       localHistoryNSets = 0,
@@ -650,9 +654,17 @@ class WithTAGEBPD extends Config((site, here, up) => {
         bim.io.resp_in(0)   := ubtb.io.resp
         btb.io.resp_in(0)   := bim.io.resp
         tage.io.resp_in(0)  := btb.io.resp
-        ras.io.resp_in(0)   := tage.io.resp
-
-        (preds, ras.io.resp)
+        if (p(BoomLoopKey)) {
+          val loop = Module(new LoopBranchPredictorBank()(p))
+          val preds_with_loop = preds.appended(loop)
+          loop.io := DontCare
+          loop.io.resp_in(0)  := tage.io.resp
+          ras.io.resp_in(0)   := loop.io.resp
+          (preds_with_loop, ras.io.resp)
+        } else {
+          ras.io.resp_in(0)   := tage.io.resp
+          (preds, ras.io.resp)
+        }
       })
     )))
     case other => other

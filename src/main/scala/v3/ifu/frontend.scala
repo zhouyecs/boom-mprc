@@ -458,7 +458,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   require(fetchWidth*coreInstBytes == outer.icacheParams.fetchBytes)
 
   val bpd = Module(new BranchPredictor)
-  bpd.io.f3_fire := false.B
+  bpd.io.f3_fire := true.B // 解耦前端 f3 预测不会被阻塞
 
   val ftq = Module(new FetchTargetQueue)
   ftq.io.f3_preds_enq.valid            := bpd.io.resp.f3_pred_valid
@@ -780,10 +780,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_bpd_resp.io.enq.bits.fsrc := ftq.io.s3_preds_info.preds_info.fsrc
   f3_bpd_resp.io.enq.bits.tsrc := ftq.io.s3_preds_info.preds_info.tsrc
   f3_bpd_resp.io.enq.bits.target := ftq.io.s3_preds_info.pred_target
-
-  when (f3_bpd_resp.io.enq.fire) {
-    bpd.io.f3_fire := true.B
-  }
 
   f3.io.deq.ready := f4_ready
   f3_bpd_resp.io.deq.ready := f4_ready

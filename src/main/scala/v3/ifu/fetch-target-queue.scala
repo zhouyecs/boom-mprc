@@ -391,7 +391,19 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   io.ras_update_pc  := RegNext(ras_update_pc)
   io.ras_update_idx := RegNext(ras_update_idx)
 
-  val bpd_idx = bpd_commit_ptr.value
+  val bpd_update_mispredict = RegInit(false.B)
+  val bpd_update_repair = RegInit(false.B)
+  val bpd_repair_idx = Reg(UInt(log2Ceil(ftqSz).W))
+  val bpd_end_idx = Reg(UInt(log2Ceil(ftqSz).W))
+  val bpd_repair_pc = Reg(UInt(vaddrBitsExtended.W))
+
+  val useLoop = p(BoomLoopKey)
+  val bpd_idx = Wire(UInt(log2Ceil(ftqSz).W))
+  if (useLoop) {
+    bpd_idx := Mux(bpd_update_repair || bpd_update_mispredict, bpd_repair_idx, bpd_commit_ptr.value)
+  } else {
+    bpd_idx := bpd_commit_ptr.value
+  }
   val bpd_entry = RegNext(ram(bpd_idx))
   val bpd_ghist = ghist(0).read(bpd_idx, true.B)
 
@@ -410,24 +422,61 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   val bpd_target = RegNext(readout_target)
 
+  when (io.redirect.valid) {
+    bpd_update_mispredict := false.B
+    bpd_update_repair     := false.B
+  } .elsewhen (RegNext(io.brupdate.b2.mispredict)) {
+    bpd_update_mispredict := true.B
+    bpd_repair_idx        := RegNext(io.brupdate.b2.uop.ftq_idx)
+    bpd_end_idx           := RegNext(f3_pred_enq_ptr.value)
+  } .elsewhen (bpd_update_mispredict) {
+    bpd_update_mispredict := false.B
+    bpd_update_repair     := true.B
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+  } .elsewhen (bpd_update_repair && RegNext(bpd_update_mispredict)) {
+    bpd_repair_pc         := bpd_pc
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+  } .elsewhen (bpd_update_repair) {
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+    when (WrapInc(bpd_repair_idx, num_entries) === bpd_end_idx ||
+      bpd_pc === bpd_repair_pc)  {
+      bpd_update_repair := false.B
+    }
+
+  }
+
   // 这里的判断中将原来的
   // bpd_ptr =/= deq_ptr && enq_ptr =/= WrapInc(bpd_ptr, num_entries)
   // 简化为了 bpd_ptr =/= deq_ptr，因为 deq_ptr < enq_ptr 在第一次 commit
   // update 后总是成立，而 bpd_ptr <= deq_ptr
-  val do_commit_update     = (bpd_commit_ptr =/= deq_ptr &&
-                              !io.brupdate.b2.mispredict &&
-                              !io.redirect.valid && !RegNext(io.redirect.valid))
+  val do_commit_update = Wire(Bool())
+  val do_mispredict_update = Wire(Bool())
+  val do_repair_update = Wire(Bool())
+  if (useLoop) {
+    do_commit_update     := (bpd_commit_ptr =/= deq_ptr &&
+                            !io.redirect.valid && !RegNext(io.redirect.valid)) &&
+                            !bpd_update_mispredict && !bpd_update_repair
+    do_mispredict_update := bpd_update_mispredict
+    do_repair_update     := bpd_update_repair
+  } else {
+    do_commit_update     := (bpd_commit_ptr =/= deq_ptr &&
+                            !io.redirect.valid && !RegNext(io.redirect.valid))
+    do_mispredict_update := false.B
+    do_repair_update     := false.B
+  }
 
   val done_commit_update_debug = RegInit(false.B)
 
   io.ft_tsrc.valid := false.B
   io.ft_tsrc.bits  := DontCare
-  when (RegNext(do_commit_update)) {
+  when (RegNext(do_commit_update || do_repair_update || do_mispredict_update)) {
     val cfi_idx = bpd_entry.cfi_idx.bits
+    val valid_repair = bpd_pc =/= bpd_repair_pc
 
-    io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U)
-    io.bpdupdate.bits.is_mispredict_update := false.B
-    io.bpdupdate.bits.is_repair_update     := false.B
+    io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
+                          !(RegNext(do_repair_update) && !valid_repair)
+    io.bpdupdate.bits.is_mispredict_update := RegNext(do_mispredict_update)
+    io.bpdupdate.bits.is_repair_update     := RegNext(do_repair_update)
     io.bpdupdate.bits.pc      := bpd_pc
     io.bpdupdate.bits.btb_mispredicts := bpd_entry.btb_mispredicts
     io.bpdupdate.bits.br_mask :=  bpd_entry.br_mask
