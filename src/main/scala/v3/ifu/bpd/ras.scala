@@ -83,7 +83,10 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
 class RASBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p: Parameters) extends BranchPredictorBank()(p)
 {
   require(nBanks == 1, "RAS predictor bank only supports single bank.")
-  val mems = Seq(("RASBranchPredictorBank", nRasEntries, vaddrBitsExtended))
+  val mems = Seq(
+    ("RAS_PRED", nRasEntries, vaddrBitsExtended),
+    ("RAS_WRB",  nRasEntries, vaddrBitsExtended)
+  )
 
   val ras = Module(new BoomRAS())
 
