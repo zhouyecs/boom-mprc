@@ -324,8 +324,12 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val cfi_idx = bpd_entry.cfi_idx.bits
     val valid_repair = bpd_pc =/= bpd_repair_pc
 
+    // During repair updates, next_bpd_idx may point to bpd_end_idx (old enq_ptr),
+    // a slot that was never enqueued. Its pcs value could be 0 (uninitialized Reg).
+    // Suppress the update when target is invalid to avoid training BPD with garbage.
     io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
-                          !(RegNext(do_repair_update) && !valid_repair)
+                          !(RegNext(do_repair_update) && !valid_repair) &&
+                          bpd_target =/= 0.U
     io.bpdupdate.bits.is_mispredict_update := RegNext(do_mispredict_update)
     io.bpdupdate.bits.is_repair_update     := RegNext(do_repair_update)
     io.bpdupdate.bits.pc      := bpd_pc
