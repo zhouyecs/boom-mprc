@@ -261,18 +261,20 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
   val bpd_meta  = meta.read(bpd_idx, true.B) // TODO fix these SRAMs
   val bpd_pc    = RegNext(pcs(bpd_idx))
-  // TODO: 不怎么写不知道为啥 verilator 那边模拟的时候显示
-  // 当 bpd_ptr == 31 时做 commit update 会有问题，波形图
-  // 显示输出的 bpd_target 为 0，不知道是不是 verilator 的 bug？
+  // Mirror the get_ftq_pc forwarding logic: when next_bpd_idx points to the
+  // slot currently being enqueued, forward the enqueue PC; otherwise the read
+  // returns stale/zero data (the slot hasn't been written yet this round).
   val next_bpd_idx = Wire(UInt(log2Ceil(ftqSz).W))
   next_bpd_idx := WrapInc(bpd_idx, num_entries)
   dontTouch(next_bpd_idx)
 
+  val next_is_enq = (next_bpd_idx === enq_ptr.value) && do_enq
   val readout_target = Wire(UInt(vaddrBitsExtended.W))
-  readout_target := pcs(next_bpd_idx)
+  readout_target := Mux(next_is_enq, io.enq.bits.pc, pcs(next_bpd_idx))
   dontTouch(readout_target)
 
   val bpd_target = RegNext(readout_target)
+  val bpd_target_valid = RegNext(next_bpd_idx =/= enq_ptr.value || next_is_enq)
 
   when (io.redirect.valid) {
     bpd_update_mispredict := false.B
@@ -325,7 +327,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val valid_repair = bpd_pc =/= bpd_repair_pc
 
     io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
-                          !(RegNext(do_repair_update) && !valid_repair)
+                          !(RegNext(do_repair_update) && !valid_repair) &&
+                          bpd_target_valid
     io.bpdupdate.bits.is_mispredict_update := RegNext(do_mispredict_update)
     io.bpdupdate.bits.is_repair_update     := RegNext(do_repair_update)
     io.bpdupdate.bits.is_rob_flush         := false.B
