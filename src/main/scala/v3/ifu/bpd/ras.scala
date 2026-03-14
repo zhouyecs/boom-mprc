@@ -55,11 +55,10 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     RegNext(ras(io.read_idx)))
 
   // Aligning Queue (AQ): 16 entries as per paper recommendation
-  val aq_size = 16
-  val aq_addr = Reg(Vec(aq_size, UInt(vaddrBitsExtended.W)))
-  val aq_idx  = Reg(Vec(aq_size, UInt(log2Ceil(nRasEntries).W)))
-  val aq_head = RegInit(0.U(log2Ceil(aq_size).W))
-  val aq_tail = RegInit(0.U(log2Ceil(aq_size).W))
+  val aq_addr = Reg(Vec(nAqEntries, UInt(vaddrBitsExtended.W)))
+  val aq_idx  = Reg(Vec(nAqEntries, UInt(log2Ceil(nRasEntries).W)))
+  val aq_head = RegInit(0.U(log2Ceil(nAqEntries).W))
+  val aq_tail = RegInit(0.U(log2Ceil(nAqEntries).W))
 
   // TOS Counter (the committed Top-of-Stack state)
   val tos_counter = RegInit(0.U(log2Ceil(nRasEntries).W))
@@ -74,14 +73,14 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
   when (io.spec_pop_valid) {
     aq_addr(aq_tail) := io.spec_pop_addr
     aq_idx(aq_tail)  := io.spec_pop_idx
-    aq_tail          := WrapInc(aq_tail, aq_size)
+    aq_tail          := WrapInc(aq_tail, nAqEntries)
   }
 
   // Retirement: move AQ head and update TOS Counter
   when (io.commit_valid) {
     tos_counter := io.commit_ras_idx
     when (io.commit_is_ret) {
-      aq_head     := WrapInc(aq_head, aq_size)
+      aq_head     := WrapInc(aq_head, nAqEntries)
     }
   }
 
@@ -90,7 +89,7 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     // Write back AQ entries from latest (tail-1) down to earliest (head).
     // Chisel's last-assignment-wins ensures the EARLIEST pop (at aq_head) 
     // is the final value in the RAS for a given index.
-    for (step <- 0 until aq_size) {
+    for (step <- 0 until nAqEntries) {
        val idx = (aq_tail - 1.U - step.U)
        val is_valid = Mux(aq_tail > aq_head,
          idx >= aq_head && idx < aq_tail,
@@ -115,10 +114,9 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
 class RASBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p: Parameters) extends BranchPredictorBank()(p)
 {
   require(nBanks == 1, "RAS predictor bank only supports single bank.")
-  val aq_size = 16
   val mems = Seq(
     ("RAS_TABLE", nRasEntries, vaddrBitsExtended),
-    ("AQ_TABLE",  aq_size,     vaddrBitsExtended + log2Ceil(nRasEntries))
+    ("AQ_TABLE",  nAqEntries,  vaddrBitsExtended + log2Ceil(nRasEntries))
   )
 
   val ras = Module(new BoomRAS())

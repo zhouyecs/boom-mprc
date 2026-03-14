@@ -65,6 +65,7 @@ case class BoomCoreParams(
   localHistoryNSets: Int = 128,
   bpdMaxMetaLength: Int = 120,
   numRasEntries: Int = 32,
+  numAqEntries: Int = 32,
   enableRasTopRepair: Boolean = true,
 
   /* more stuff */
@@ -253,6 +254,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   }
 
   val nRasEntries = boomParams.numRasEntries max 2
+  val nAqEntries = boomParams.numAqEntries max 2
   val useRAS = boomParams.numRasEntries > 0
   val enableRasTopRepair = boomParams.enableRasTopRepair
 
