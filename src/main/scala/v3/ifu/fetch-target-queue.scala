@@ -261,9 +261,6 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
   val bpd_meta  = meta.read(bpd_idx, true.B) // TODO fix these SRAMs
   val bpd_pc    = RegNext(pcs(bpd_idx))
-  // TODO: 不怎么写不知道为啥 verilator 那边模拟的时候显示
-  // 当 bpd_ptr == 31 时做 commit update 会有问题，波形图
-  // 显示输出的 bpd_target 为 0，不知道是不是 verilator 的 bug？
   val next_bpd_idx = Wire(UInt(log2Ceil(ftqSz).W))
   next_bpd_idx := WrapInc(bpd_idx, num_entries)
   dontTouch(next_bpd_idx)
@@ -297,21 +294,23 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   }
 
-  // 这里的判断中将原来的
-  // bpd_ptr =/= deq_ptr && enq_ptr =/= WrapInc(bpd_ptr, num_entries)
-  // 简化为了 bpd_ptr =/= deq_ptr，因为 deq_ptr < enq_ptr 在第一次 commit
-  // update 后总是成立，而 bpd_ptr <= deq_ptr
+  // bpd_target reads pcs(WrapInc(bpd_ptr)), so we must ensure that slot
+  // has been enqueued.  The second conjunct prevents bpd_ptr from advancing
+  // when the next entry hasn't been written yet (e.g. after a flush that
+  // moves enq_ptr back).
   val do_commit_update = Wire(Bool())
   val do_mispredict_update = Wire(Bool())
   val do_repair_update = Wire(Bool())
   if (useLoop) {
     do_commit_update     := (bpd_ptr =/= deq_ptr &&
+                            enq_ptr =/= (bpd_ptr + 1.U) &&
                             !io.redirect.valid && !RegNext(io.redirect.valid)) &&
                             !bpd_update_mispredict && !bpd_update_repair
     do_mispredict_update := bpd_update_mispredict
     do_repair_update     := bpd_update_repair
   } else {
     do_commit_update     := (bpd_ptr =/= deq_ptr &&
+                            enq_ptr =/= (bpd_ptr + 1.U) &&
                             !io.brupdate.b2.mispredict &&
                             !io.redirect.valid && !RegNext(io.redirect.valid))
     do_mispredict_update := false.B
@@ -325,7 +324,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val valid_repair = bpd_pc =/= bpd_repair_pc
 
     io.bpdupdate.valid := (bpd_entry.cfi_idx.valid || bpd_entry.br_mask =/= 0.U) &&
-                          !(RegNext(do_repair_update) && !valid_repair)
+                          !(RegNext(do_repair_update) && !valid_repair) &&
+                          bpd_target =/= 0.U
     io.bpdupdate.bits.is_mispredict_update := RegNext(do_mispredict_update)
     io.bpdupdate.bits.is_repair_update     := RegNext(do_repair_update)
     io.bpdupdate.bits.pc      := bpd_pc
