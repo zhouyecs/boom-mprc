@@ -401,9 +401,6 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
   // For branches we emit the offset for the core to redirect if necessary
   val target_offset = imm_xprlen(20,0).asSInt
   brinfo.jalr_target := DontCare
-
-  val debug_ret_backend = PlusArg("debug-ret-backend", 0, "Print Return Instruction in Backend", 1)
-  val (cycleCount, _) = Counter(true.B, Int.MaxValue)
   
   // Calculate uop_pc early so it's available for debugging
   val uop_pc = if (isJmpUnit) {
@@ -431,6 +428,8 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     val jalr_target = (encodeVirtualAddress(jalr_target_xlen, jalr_target_xlen).asSInt & -2.S).asUInt
 
     if (IN_SIMULATION) {
+      val debug_ret_backend = PlusArg("debug-ret-backend", 0, "Print Return Instruction in Backend", 1)
+      val (cycleCount, _) = Counter(true.B, Int.MaxValue)
       val offset = jalr_target - uop_pc
       val abs_offset = Mux(offset(vaddrBitsExtended-1), -offset, offset)
       val is_ret = uop.is_jalr && uop.ldst =/= BitPat("b00?01") && (uop.lrs1 === BitPat("b00?01"))
