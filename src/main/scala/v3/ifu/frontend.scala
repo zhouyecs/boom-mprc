@@ -621,9 +621,6 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       bpu.io.mcontext := io.cpu.mcontext
       bpu.io.scontext := io.cpu.scontext
 
-      val (cycleCount, _) = Counter(true.B, Int.MaxValue)
-      val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
-
       val brsigs = Wire(new BranchDecodeSignals)
       if (w == 0) {
         val inst0 = Cat(bank_data(15,0), f3_prev_half)
@@ -658,6 +655,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           f3_fetch_bundle.edge_inst(b) := true.B
 
           if (IN_SIMULATION) {
+            val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+            val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
             when (rvc_expand_printf(0) && rvc0) {
               printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is half)\n", cycleCount, pc0, inst0(15,0), exp_inst0)
               // printf("rvc (prev bank): %x\n", f3_prev_half)
@@ -702,6 +701,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
           f3_fetch_bundle.edge_inst(b) := false.B
 
           if (IN_SIMULATION) {
+            val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+            val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
             when (rvc_expand_printf(0) && rvc1) {
               printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x (bank prev is not half)\n", cycleCount, pc1, inst1(15, 0), exp_inst1)
               // printf("rvc: %x\n", inst1(15, 0))
@@ -743,6 +744,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
         brsigs                       := bpd_decoder.io.out
 
         if (IN_SIMULATION) {
+          val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+          val rvc_expand_printf = PlusArg("rvc-exp-result", 0, "Print FUll Instruction After RVC Expand", 1)
           when (rvc_expand_printf(0) && rvc) {
             printf("[%d RVCExpand+Predecode] Expand: PC: %x, RVC inst: %x -> %x\n", cycleCount, pc, inst(15, 0), exp_inst)
             // printf("rvc: %x\n", inst(15, 0))

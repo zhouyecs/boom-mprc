@@ -38,13 +38,12 @@ class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
     RegNext(io.write_addr),
     RegNext(ras(io.read_idx)))
 
-  val ras_printf = PlusArg("ras-content", 0, "Print All RAS Content", 1)
-  val (cycleCount, _) = Counter(true.B, Int.MaxValue)
-
   when (io.write_valid) {
     ras(io.write_idx) := io.write_addr
 
     if (IN_SIMULATION) {
+      val ras_printf = PlusArg("ras-content", 0, "Print All RAS Content", 1)
+      val (cycleCount, _) = Counter(true.B, Int.MaxValue)
       when (ras_printf(0)) {
         printf(p"[${cycleCount} RAS] Content:\n")
         for (i <- 0 until nRasEntries) {
