@@ -94,7 +94,7 @@ class GetPCFromFtqIO(implicit p: Parameters) extends BoomBundle
 class FTQPtr(entries: Int)(implicit p: Parameters) extends CircularQueuePtr[FTQPtr](entries)
 {
   // 好像在执行构造函数的时候 trait 内部的代码还未执行，因此这里拿不到 ftqSz
-  def this()(implicit p: Parameters) = this(32)
+  def this()(implicit p: Parameters) = this(64)
   require(ftqSz == entries)
 }
 
