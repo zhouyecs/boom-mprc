@@ -32,6 +32,7 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     c.io.f3_write_valid := io.f3_write_valid
     c.io.f3_write_idx := io.f3_write_idx
     c.io.f3_write_addr := io.f3_write_addr
+    c.io.ras_corrupt_set := io.ras_corrupt_set
     if (c.metaSz > 0) {
       metas = (metas << c.metaSz) | c.io.f3_meta(c.metaSz-1,0)
     }

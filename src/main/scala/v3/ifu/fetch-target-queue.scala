@@ -153,6 +153,9 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     val ras_update_idx = Output(UInt(log2Ceil(nRasEntries).W))
     val ras_update_pc  = Output(UInt(vaddrBitsExtended.W))
 
+    // WP-RAS: Output which RAS entries to mark as corrupted
+    val ras_corrupt_set = Output(UInt(nRasEntries.W))
+
   })
   val bpd_ptr    = RegInit(FTQPtr(false.B, 0.U))
   val deq_ptr    = RegInit(FTQPtr(false.B, 0.U))
@@ -214,6 +217,22 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   }
 
   io.enq_idx := enq_ptr.value
+
+  // WP-RAS: CheckTOS table - records which RAS entry each fetch packet's call writes to
+  val checktos = Reg(Vec(num_entries, UInt(nRasEntries.W)))
+  val checktos_valid = RegInit(VecInit(Seq.fill(num_entries)(false.B)))
+
+  when (do_enq) {
+    val has_call = io.enq.bits.cfi_is_call && io.enq.bits.cfi_idx.valid &&
+                   !io.enq.bits.cfi_is_pop_push
+    val ras_write_idx = WrapInc(io.enq.bits.ghist.ras_idx, nRasEntries)
+    checktos(enq_ptr.value) := Mux(has_call, 1.U(nRasEntries.W) << ras_write_idx, 0.U)
+    checktos_valid(enq_ptr.value) := has_call
+  }
+
+  // WP-RAS: Compute corruption vector on redirect
+  val ras_corrupt_set_reg = RegInit(0.U(nRasEntries.W))
+  io.ras_corrupt_set := ras_corrupt_set_reg
 
   io.bpdupdate.valid := false.B
   io.bpdupdate.bits  := DontCare
@@ -400,12 +419,27 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     ras_update_pc  := redirect_entry.ras_top
     ras_update_idx := redirect_entry.ras_idx
 
+    // WP-RAS: Compute V_corrupt by ORing checktos entries for all wrong-path FTQ entries
+    val old_enq_value = enq_ptr.value
+    val redirect_ftq_value = WrapInc(redirect_idx, num_entries)
+    val v_corrupt = (0 until num_entries).map { i =>
+      val in_wrong_path = checktos_valid(i) &&
+        Mux(redirect_ftq_value <= old_enq_value,
+          i.U >= redirect_ftq_value && i.U < old_enq_value,
+          i.U >= redirect_ftq_value || i.U < old_enq_value)
+      Mux(in_wrong_path, checktos(i), 0.U(nRasEntries.W))
+    }.reduce(_ | _)
+    ras_corrupt_set_reg := v_corrupt
+
   } .elsewhen (RegNext(io.redirect.valid)) {
     prev_entry := RegNext(redirect_new_entry)
     prev_ghist := bpd_ghist_debug
     prev_pc    := bpd_pc_debug
 
     ram(RegNext(io.redirect.bits)) := RegNext(redirect_new_entry)
+
+    // WP-RAS: Clear corrupt_set after one cycle
+    ras_corrupt_set_reg := 0.U
   }
 
   //-------------------------------------------------------------

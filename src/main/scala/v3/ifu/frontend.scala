@@ -879,8 +879,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
+  // WP-RAS: Check if the RAS entry is corrupted by wrong-path pushes
+  val f3_ras_corrupted = f3_bpd_resp.io.deq.bits.preds(0).ras_corrupt
+
   val f3_predicted_target = Mux(f3_redirects.reduce(_||_),
-    Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B,
+    Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B && !f3_ras_corrupted,
       f3_bpd_resp.io.deq.bits.preds(0).ras_top,
       f3_targs(PriorityEncoder(f3_redirects))
     ),
@@ -1035,12 +1038,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   bpd.io.update := bpd_update_arbiter.io.out
   bpd_update_arbiter.io.out.ready := true.B
 
-  // 从 FTQ 来的 RAS 更新具有更高优先级 
+  // 从 FTQ 来的 RAS 更新具有更高优先级
   when (ftq.io.ras_update && enableRasTopRepair.B) {
     bpd.io.f3_write_valid := true.B
     bpd.io.f3_write_idx   := ftq.io.ras_update_idx
     bpd.io.f3_write_addr  := ftq.io.ras_update_pc
   }
+
+  // WP-RAS: Forward corruption set from FTQ to BPD
+  bpd.io.ras_corrupt_set := ftq.io.ras_corrupt_set
 
 
   // -------------------------------------------------------

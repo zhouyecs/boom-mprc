@@ -31,6 +31,8 @@ class BranchPrediction(implicit p: Parameters) extends BoomBundle()(p)
   val predicted_pc    = Valid(UInt(vaddrBitsExtended.W))
   // ras 的栈顶值，没有 valid 信号
   val ras_top         = UInt(vaddrBitsExtended.W)
+  // WP-RAS: Whether the RAS top entry is corrupted by wrong-path pushes
+  val ras_corrupt     = Bool()
 }
 
 // A branch prediction for a entire fetch-width worth of instructions
@@ -171,6 +173,9 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val f3_write_valid = Input(Bool())
     val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
     val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
+
+    // WP-RAS: Corruption recovery
+    val ras_corrupt_set = Input(UInt(nRasEntries.W))
   })
   io.resp := io.resp_in(0)
 
@@ -232,6 +237,9 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val f3_write_valid = Input(Bool())
     val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
     val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
+
+    // WP-RAS: Corruption recovery
+    val ras_corrupt_set = Input(UInt(nRasEntries.W))
   })
 
   var total_memsize = 0
@@ -268,6 +276,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(0).io.f3_write_valid := io.f3_write_valid
     banked_predictors(0).io.f3_write_idx := io.f3_write_idx
     banked_predictors(0).io.f3_write_addr := io.f3_write_addr
+    banked_predictors(0).io.ras_corrupt_set := io.ras_corrupt_set
   } else {
     require(nBanks == 2)
 
