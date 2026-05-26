@@ -56,6 +56,11 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
 
+  // CD-RAS (Corruption Detection RAS): detect stack overflow corruption
+  // cd_tos tracks the oldest valid entry; fw (first-wrap) indicates stack has wrapped
+  val ras_cd_tos = UInt(log2Ceil(nRasEntries).W)
+  val ras_fw = Bool()
+
   def histories(bank: Int) = {
     if (nBanks == 1) {
       old_history
@@ -122,8 +127,19 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
     }
     // 当 cfi_is_pop_push 为真时，RAS 指针不变 (pop + push = 0 change)
     // 注意：decode 逻辑中，is_pop_push 时 is_call 也为真，is_ret 为假
-    new_history.ras_idx := Mux(cfi_valid && cfi_is_call && !cfi_is_pop_push, WrapInc(ras_idx, nRasEntries),
-                           Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, nRasEntries), ras_idx))
+    val new_ras_idx = Mux(cfi_valid && cfi_is_call && !cfi_is_pop_push, WrapInc(ras_idx, nRasEntries),
+                      Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, nRasEntries), ras_idx))
+    new_history.ras_idx := new_ras_idx
+
+    // CD-RAS: Update corruption detection state
+    val is_call_push = cfi_valid && cfi_is_call && !cfi_is_pop_push
+    val is_ret_pop   = cfi_valid && cfi_is_ret
+    val overflow     = is_call_push && (new_ras_idx === ras_cd_tos)
+    val underflow    = is_ret_pop && (ras_idx === ras_cd_tos)
+    new_history.ras_cd_tos := Mux(overflow, WrapInc(ras_cd_tos, nRasEntries),
+                              Mux(underflow, WrapDec(ras_cd_tos, nRasEntries), ras_cd_tos))
+    new_history.ras_fw := Mux(overflow, true.B,
+                          Mux(underflow, false.B, ras_fw))
     new_history
   }
 
@@ -879,8 +895,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // Redirect earlier stages only if the later stage
   // can consume this packet
 
+  // CD-RAS: Detect RAS entry corruption from stack overflow
+  val f3_ras_corrupted = (f3_fetch_bundle.ghist.ras_idx === f3_fetch_bundle.ghist.ras_cd_tos) &&
+                         !f3_fetch_bundle.ghist.ras_fw
+
   val f3_predicted_target = Mux(f3_redirects.reduce(_||_),
-    Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B,
+    Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B && !f3_ras_corrupted,
       f3_bpd_resp.io.deq.bits.preds(0).ras_top,
       f3_targs(PriorityEncoder(f3_redirects))
     ),
