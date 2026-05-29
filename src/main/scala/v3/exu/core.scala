@@ -477,6 +477,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val com_is_bsrc3 = Wire(Vec(coreWidth, Bool())) // committed inst from f3 prediction
   val com_is_bsrcc = Wire(Vec(coreWidth, Bool())) // committed inst from backend correction
 
+  // partition correctly-predicted CFIs by predictor stage
+  val com_is_br_f1   = Wire(Vec(coreWidth, Bool()))
+  val com_is_br_f2   = Wire(Vec(coreWidth, Bool()))
+  val com_is_br_f3   = Wire(Vec(coreWidth, Bool()))
+  val com_is_jalr_f1 = Wire(Vec(coreWidth, Bool()))
+  val com_is_jalr_f2 = Wire(Vec(coreWidth, Bool()))
+  val com_is_jalr_f3 = Wire(Vec(coreWidth, Bool()))
+  val com_is_ret_f1  = Wire(Vec(coreWidth, Bool()))
+  val com_is_ret_f2  = Wire(Vec(coreWidth, Bool()))
+  val com_is_ret_f3  = Wire(Vec(coreWidth, Bool()))
+
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
@@ -501,11 +512,24 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_is_bsrc2(w) := valid && (uop.debug_tsrc === BSRC_2)
     com_is_bsrc3(w) := valid && (uop.debug_tsrc === BSRC_3)
     com_is_bsrcc(w) := valid && (uop.debug_tsrc === BSRC_C)
+
+    // partition correctly-predicted CFIs by predictor stage (debug_fsrc)
+    com_is_br_f1(w)   := com_is_br(w)   && uop.debug_fsrc === BSRC_1
+    com_is_br_f2(w)   := com_is_br(w)   && uop.debug_fsrc === BSRC_2
+    com_is_br_f3(w)   := com_is_br(w)   && uop.debug_fsrc === BSRC_3
+
+    com_is_jalr_f1(w) := com_is_jalr(w) && uop.debug_fsrc === BSRC_1
+    com_is_jalr_f2(w) := com_is_jalr(w) && uop.debug_fsrc === BSRC_2
+    com_is_jalr_f3(w) := com_is_jalr(w) && uop.debug_fsrc === BSRC_3
+
+    com_is_ret_f1(w)  := com_is_ret(w)  && uop.debug_fsrc === BSRC_1
+    com_is_ret_f2(w)  := com_is_ret(w)  && uop.debug_fsrc === BSRC_2
+    com_is_ret_f3(w)  := com_is_ret(w)  && uop.debug_fsrc === BSRC_3
   }
 
   when (startCounter) {
     event_counters.io.event_signals(0) :=   1.U  //cycles
-    event_counters.io.event_signals(1) :=  RegNext(PopCount(rob.io.commit.arch_valids.asUInt)) // commit inst
+    event_counters.io.event_signals(1) :=  PopCount(rob.io.commit.arch_valids.asUInt) // commit inst
     // TODO: 因为 BOOM 前端的 replay 机制，计数器 cache valid access 与 tlb valid access 的值
     // 会比实际的多，但 hit number 是准的，实际的 access time = hit number + perf miss？
     // 但这还是有点微妙，例如 icache miss 但 itlb hit 的情况，replay 会导致 itlb 反复 hit
@@ -529,6 +553,16 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(17) :=  PopCount(com_is_bsrc2.asUInt) // committed inst from f2 prediction
     event_counters.io.event_signals(18) :=  PopCount(com_is_bsrc3.asUInt) // committed inst from f3 prediction
     event_counters.io.event_signals(19) :=  PopCount(com_is_bsrcc.asUInt) // committed inst from backend correction
+
+    event_counters.io.event_signals(20) :=  PopCount(com_is_br_f1.asUInt)   // br predicted by f1
+    event_counters.io.event_signals(21) :=  PopCount(com_is_br_f2.asUInt)   // br predicted by f2
+    event_counters.io.event_signals(22) :=  PopCount(com_is_br_f3.asUInt)   // br predicted by f3
+    event_counters.io.event_signals(23) :=  PopCount(com_is_jalr_f1.asUInt) // jalr predicted by f1
+    event_counters.io.event_signals(24) :=  PopCount(com_is_jalr_f2.asUInt) // jalr predicted by f2
+    event_counters.io.event_signals(25) :=  PopCount(com_is_jalr_f3.asUInt) // jalr predicted by f3
+    event_counters.io.event_signals(26) :=  PopCount(com_is_ret_f1.asUInt)  // ret predicted by f1
+    event_counters.io.event_signals(27) :=  PopCount(com_is_ret_f2.asUInt)  // ret predicted by f2
+    event_counters.io.event_signals(28) :=  PopCount(com_is_ret_f3.asUInt)  // ret predicted by f3
   }
 
   //-------------------------------------------------------------
