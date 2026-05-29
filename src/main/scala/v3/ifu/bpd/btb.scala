@@ -42,11 +42,9 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
 
   class BTBMeta extends Bundle {
     val is_br = Bool()
-    val is_call = Bool()
-    val is_ret  = Bool()
     val tag   = UInt(tagSz.W)
   }
-  val btbMetaSz = tagSz + 3
+  val btbMetaSz = tagSz + 1
 
   class BTBPredictMeta extends Bundle {
     val write_way = UInt(log2Ceil(nWays).W)
@@ -164,8 +162,6 @@ class BTBBranchPredictorBank(params: BoomBTBParams = BoomBTBParams())(implicit p
   for (w <- 0 until bankWidth) {
     s1_update_wmeta_data(w).tag     := Mux(s1_update.bits.btb_mispredicts(w), 0.U, s1_update_idx >> log2Ceil(nSets))
     s1_update_wmeta_data(w).is_br   := s1_update.bits.br_mask(w)
-    s1_update_wmeta_data(w).is_call := s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_call
-    s1_update_wmeta_data(w).is_ret  := s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_is_ret
   }
 
   val btb_reset_value = WireDefault(0.U(btbEntrySz.W))
