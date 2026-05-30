@@ -244,6 +244,10 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
 
 
   val bpd_meta      = Vec(nBanks, UInt())
+  // TAGE/BIM observability per instruction slot (Layer 2 counters)
+  val tage_provided = Vec(fetchWidth, Bool())
+  val tage_pred     = Vec(fetchWidth, Bool())
+  val bim_pred      = Vec(fetchWidth, Bool())
 
   // Source of the prediction from this bundle
   val fsrc    = UInt(BSRC_SZ.W)
@@ -858,6 +862,20 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.ghist    := f3.io.deq.bits.ghist
   f3_fetch_bundle.lhist    := f3_bpd_resp.io.deq.bits.lhist
   f3_fetch_bundle.bpd_meta := f3_bpd_resp.io.deq.bits.meta
+
+  // Layer 2 counters: capture TAGE/BIM prediction info per instruction slot
+  // Composed meta layout (LSB to MSB): tage[bankWidth*14] | btb[1] | ubtb[8] | bim[8]
+  // TAGE is the FIRST component in the Seq, so it occupies the LSB of the composed meta.
+  // provider(slot).valid = tage meta bit (tageMetaSz - 1 - 4*slot)
+  // tageMetaSz = bankWidth * 14 (6 tables, log2Ceil(6)=3)
+  for (i <- 0 until fetchWidth) {
+    val bank = i / bankWidth
+    val slot = i % bankWidth
+    val tageMetaSz = bankWidth * 14
+    f3_fetch_bundle.tage_provided(i) := f3_bpd_resp.io.deq.bits.meta(bank)(tageMetaSz - 1 - 4*slot)
+    f3_fetch_bundle.tage_pred(i)     := f3_bpd_resp.io.deq.bits.preds(i).taken
+    f3_fetch_bundle.bim_pred(i)      := f3_bpd_resp.io.deq.bits.preds(i).taken
+  }
 
   f3_fetch_bundle.end_half.valid := bank_prev_is_half
   f3_fetch_bundle.end_half.bits  := bank_prev_half

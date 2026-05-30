@@ -145,6 +145,10 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val debug_fsrc       = UInt(BSRC_SZ.W)
   // What prediction structure provides the prediction TO this op
   val debug_tsrc       = UInt(BSRC_SZ.W)
+  // TAGE/BIM prediction observability (Layer 2 counters)
+  val debug_tage_provided = Bool()
+  val debug_tage_pred     = Bool()
+  val debug_bim_pred      = Bool()
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit

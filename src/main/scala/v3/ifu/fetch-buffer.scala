@@ -122,6 +122,9 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
 
       in_uops(i).debug_fsrc     := io.enq.bits.fsrc
       in_uops(i).debug_tsrc     := io.enq.bits.tsrc
+      in_uops(i).debug_tage_provided := io.enq.bits.tage_provided(i)
+      in_uops(i).debug_tage_pred     := io.enq.bits.tage_pred(i)
+      in_uops(i).debug_bim_pred      := io.enq.bits.bim_pred(i)
     }
   }
 

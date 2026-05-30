@@ -488,6 +488,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val com_is_ret_f2  = Wire(Vec(coreWidth, Bool()))
   val com_is_ret_f3  = Wire(Vec(coreWidth, Bool()))
 
+  // Layer 2 TAGE/BIM decomposition (observational)
+  val com_tage_prov   = Wire(Vec(coreWidth, Bool()))
+  val com_tage_pwrong = Wire(Vec(coreWidth, Bool()))
+  val com_bim_ok_nott = Wire(Vec(coreWidth, Bool()))
+
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
@@ -525,6 +530,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_is_ret_f1(w)  := com_is_ret(w)  && uop.debug_fsrc === BSRC_1
     com_is_ret_f2(w)  := com_is_ret(w)  && uop.debug_fsrc === BSRC_2
     com_is_ret_f3(w)  := com_is_ret(w)  && uop.debug_fsrc === BSRC_3
+
+    // Layer 2: TAGE/BIM decomposition
+    // uop.taken at commit = actual outcome (ROB overwrites to brupdate.b2.taken on mispredict)
+    com_tage_prov(w)   := com_is_br(w) && uop.debug_tage_provided
+    com_tage_pwrong(w) := com_is_br(w) && uop.debug_tage_provided && (uop.debug_tage_pred =/= uop.taken)
+    com_bim_ok_nott(w) := com_is_br(w) && !uop.debug_tage_provided && (uop.debug_bim_pred === uop.taken)
   }
 
   when (startCounter) {
@@ -563,6 +574,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(26) :=  PopCount(com_is_ret_f1.asUInt)  // ret predicted by f1
     event_counters.io.event_signals(27) :=  PopCount(com_is_ret_f2.asUInt)  // ret predicted by f2
     event_counters.io.event_signals(28) :=  PopCount(com_is_ret_f3.asUInt)  // ret predicted by f3
+
+    // Layer 2: TAGE/BIM decomposition
+    event_counters.io.event_signals(29) :=  PopCount(com_tage_prov.asUInt)   // TAGE provided
+    event_counters.io.event_signals(30) :=  PopCount(com_tage_pwrong.asUInt) // TAGE provided, wrong dir
+    event_counters.io.event_signals(31) :=  PopCount(com_bim_ok_nott.asUInt) // BIM correct, TAGE no-provide
   }
 
   //-------------------------------------------------------------
