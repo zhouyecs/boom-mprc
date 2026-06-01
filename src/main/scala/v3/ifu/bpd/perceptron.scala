@@ -90,15 +90,6 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   reset_idx := reset_idx + doing_reset
   when (reset_idx === (tableSize - 1).U) { doing_reset := false.B }
 
-  def adderTree(xs: Seq[SInt]): SInt = {
-    require(xs.nonEmpty)
-    if (xs.length == 1) xs.head
-    else adderTree(xs.grouped(2).map {
-      case a +: b +: _ => a +& b
-      case a +: _      => a
-    }.toSeq)
-  }
-
   // ============================================================
   // Prediction path
   //   F1: idx = PC_hash XOR folded(ghist) ; issue SyncReadMem read
@@ -131,8 +122,8 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   val s2_idxs = RegNext(s1_idxs)
 
   for (w <- 0 until bankWidth) {
-    val terms = (0 until nTables).map { t => s2_weights(t)(w) }
-    s2_sum(w)  := adderTree(terms)
+    val terms = VecInit((0 until nTables).map { t => s2_weights(t)(w) })
+    s2_sum(w)  := terms.reduceTree(_ +& _)
     s2_resp(w) := s2_valid && (s2_sum(w) >= 0.S) && !doing_reset
     io.resp.f2(w).taken := s2_resp(w)
     io.resp.f3(w).taken := RegNext(s2_resp(w))
