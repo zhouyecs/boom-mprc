@@ -310,6 +310,51 @@ class WithSimPercepBooms(n: Int = 1) extends Config(
   })
 )
 
+class WithSimTAGELGEHLBooms(n: Int = 1) extends Config(
+  new WithTageGehlOverrideBPD ++
+  new Config((site, here, up) => {
+    case TilesLocated(InSubsystem) => {
+      val prev = up(TilesLocated(InSubsystem), site)
+      val idOffset = up(NumTiles)
+      (0 until n).map { i =>
+        BoomTileAttachParams(
+          tileParams = BoomTileParams(
+            core = BoomCoreParams(
+              // enableBranchPrintf = true,
+              fetchWidth = 4,
+              decodeWidth = 2,
+              numRobEntries = 64,
+              issueParams = Seq(
+                IssueParams(issueWidth=1, numEntries=12, iqType=IQT_MEM.litValue, dispatchWidth=2),
+                IssueParams(issueWidth=2, numEntries=20, iqType=IQT_INT.litValue, dispatchWidth=2),
+                IssueParams(issueWidth=1, numEntries=16, iqType=IQT_FP.litValue , dispatchWidth=2)),
+              numIntPhysRegisters = 80,
+              numFpPhysRegisters = 64,
+              numLdqEntries = 16,
+              numStqEntries = 16,
+              maxBrCount = 12,
+              numFetchBufferEntries = 16,
+              ftq = FtqParameters(nEntries=32),
+              nPerfCounters = 6,
+              fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
+              inSimulation = true
+            ),
+            dcache = Some(
+              DCacheParams(rowBits = 64, nSets=64, nWays=4, nMSHRs=2, nTLBWays=8)
+            ),
+            icache = Some(
+              ICacheParams(rowBits = 64, nSets=64, nWays=4, fetchBytes=2*4)
+            ),
+            tileId = i + idOffset
+          ),
+          crossingParams = RocketCrossingParams()
+        )
+      } ++ prev
+    }
+    case NumTiles => up(NumTiles) + n
+  })
+)
+
 class WithMydevyzRASMediumBooms(n: Int = 1, nRAS: Int = 8) extends Config(
   new WithTAGEBPD ++ // Default to TAGE BPD
   new Config((site, here, up) => {
@@ -719,6 +764,42 @@ class WithGEHLBPD(maxHist: Int = 128) extends Config((site, here, up) => {
 
 // GEHL with maxHist=64 for ablation
 class WithGEHLBPD64 extends Config(new WithGEHLBPD(64))
+
+// TAGE-L + GEHL override: ubtb → bim → btb → tage → loop → GEHL → ras
+// GEHL acts as confidence-gated override of TAGE-L's F3 prediction.
+// Composed meta: GEHL(116)+loop(40)+tage(56)+btb(1)+ubtb(8)+bim(8)=229 → bpdMax=256
+class WithTageGehlOverrideBPD extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      bpdMaxMetaLength = 256,
+      globalHistoryLength = 64,
+      localHistoryLength = 1,
+      localHistoryNSets = 0,
+      branchPredictor = ((resp_in: BranchPredictionBankResponse, p: Parameters) => {
+        val gehl = Module(new GEHLBranchPredictorBank(
+          BoomGEHLParams(maxHist = 64, observerMode = true))(p))
+        val loop = Module(new LoopBranchPredictorBank()(p))
+        val tage = Module(new TageBranchPredictorBank()(p))
+        val btb  = Module(new BTBBranchPredictorBank()(p))
+        val bim  = Module(new BIMBranchPredictorBank()(p))
+        val ubtb = Module(new FAMicroBTBBranchPredictorBank()(p))
+        val ras  = Module(new RASBranchPredictorBank()(p))
+        val preds = Seq(gehl, loop, tage, btb, ubtb, bim, ras)
+        preds.map(_.io := DontCare)
+
+        ubtb.io.resp_in(0) := resp_in
+        bim.io.resp_in(0)  := ubtb.io.resp
+        btb.io.resp_in(0)  := bim.io.resp
+        tage.io.resp_in(0) := btb.io.resp
+        loop.io.resp_in(0) := tage.io.resp
+        gehl.io.resp_in(0) := loop.io.resp
+        ras.io.resp_in(0)  := gehl.io.resp
+        (preds, ras.io.resp)
+      })
+    )))
+    case other => other
+  }
+})
 
 class WithBoom2BPD extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {

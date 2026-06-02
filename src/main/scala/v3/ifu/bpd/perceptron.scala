@@ -17,7 +17,9 @@ case class BoomGEHLParams(
   tableSize:  Int = 256,
   weightBits: Int = 7,
   maxHist:    Int = 128,
-  minHist:    Int = 4
+  minHist:    Int = 4,
+  overrideTheta: Int = 32,
+  observerMode:  Boolean = true
 ) {
   require(nTables >= 2)
   require(isPow2(tableSize))
@@ -30,17 +32,21 @@ case class BoomGEHLParams(
     }
   }
 
-  // Jimenez static threshold (TODO: make adaptive later)
+  // Jimenez static threshold for training (TODO: make adaptive later)
   def theta: Int = floor(1.93 * maxHist).toInt + 14
 }
 
 
 // carried from predict to update: per-slot sums + shared per-table indices
+// + override decision fields for confidence-gated GEHL-on-TAGE override
 class GEHLMeta(val nTables: Int, val nIdxBits: Int, val sumBits: Int)(implicit p: Parameters) extends BoomBundle()(p)
   with HasBoomFrontendParameters
 {
-  val sums = Vec(bankWidth, SInt(sumBits.W))
-  val idxs = Vec(nTables, UInt(nIdxBits.W))
+  val sums       = Vec(bankWidth, SInt(sumBits.W))
+  val idxs       = Vec(nTables, UInt(nIdxBits.W))
+  val would_fire = Vec(bankWidth, Bool())
+  val gehl_pred  = Vec(bankWidth, Bool())
+  val tage_pred  = Vec(bankWidth, Bool())
 }
 
 
@@ -81,7 +87,7 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   // for BOOM SRAM reporting
   val mems = (0 until nTables).map { t => (s"gehl_t$t", tableSize, bankWidth * weightBits) }
 
-  override val metaSz = bankWidth * sumBits + nTables * nIdxBits
+  override val metaSz = bankWidth * sumBits + nTables * nIdxBits + 3 * bankWidth
   require(metaSz <= bpdMaxMetaLength)
 
   // ---- reset walk: zero the SRAMs (SyncReadMem cannot use RegInit) ----
@@ -126,15 +132,33 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
     s2_sum(w)  := terms.reduceTree(_ +& _)
     s2_resp(w) := s2_valid && (s2_sum(w) >= 0.S) && !doing_reset
     io.resp.f2(w).taken := s2_resp(w)
-    io.resp.f3(w).taken := RegNext(s2_resp(w))
   }
 
-  // F3 meta (shared indices + per-slot sums)
-  val s3_sum  = RegNext(s2_sum)
+  // pipeline s2→s3: GEHL sum + TAGE-L prediction for override decision
+  val s3_sum       = RegNext(s2_sum)
+  val s3_tage_pred = VecInit((0 until bankWidth).map { w => io.resp_in(0).f3(w).taken })
+
+  for (w <- 0 until bankWidth) {
+    val gehl_pred_w  = s3_sum(w) >= 0.S
+    val abs_sum_w    = Mux(s3_sum(w) >= 0.S, s3_sum(w), -s3_sum(w))
+    val would_fire_w = (abs_sum_w >= params.overrideTheta.S) && (gehl_pred_w =/= s3_tage_pred(w))
+    val fire_w       = would_fire_w && !params.observerMode.B
+    assert(!would_fire_w || (gehl_pred_w =/= s3_tage_pred(w)))
+    io.resp.f3(w).taken := Mux(fire_w, gehl_pred_w, s3_tage_pred(w))
+  }
+
+  // F3 meta (shared indices + per-slot sums + override decision)
   val s3_idxs = RegNext(s2_idxs)
   val s3_meta = Wire(new GEHLMeta(nTables, nIdxBits, sumBits))
   s3_meta.sums := s3_sum
   s3_meta.idxs := s3_idxs
+  for (w <- 0 until bankWidth) {
+    val gehl_pred_w  = s3_sum(w) >= 0.S
+    val abs_sum_w    = Mux(s3_sum(w) >= 0.S, s3_sum(w), -s3_sum(w))
+    s3_meta.would_fire(w) := (abs_sum_w >= params.overrideTheta.S) && (gehl_pred_w =/= s3_tage_pred(w))
+    s3_meta.gehl_pred(w)  := gehl_pred_w
+    s3_meta.tage_pred(w)  := s3_tage_pred(w)
+  }
   io.f3_meta := s3_meta.asUInt
 
   // ============================================================
