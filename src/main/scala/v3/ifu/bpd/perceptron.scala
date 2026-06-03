@@ -19,7 +19,8 @@ case class BoomGEHLParams(
   maxHist:    Int = 128,
   minHist:    Int = 4,
   overrideTheta: Int = 32,
-  observerMode:  Boolean = true
+  observerMode:  Boolean = true,
+  f2Passthrough: Boolean = false // true = corrector mode (pass incumbent F2)
 ) {
   require(nTables >= 2)
   require(isPow2(tableSize))
@@ -134,7 +135,9 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
     val terms = VecInit((0 until nTables).map { t => s2_weights(t)(w) })
     s2_sum(w)  := terms.reduceTree(_ +& _)
     s2_resp(w) := s2_valid && (s2_sum(w) >= 0.S) && !doing_reset
-    io.resp.f2(w).taken := s2_resp(w)
+    io.resp.f2(w).taken := Mux(params.f2Passthrough.B,
+      io.resp_in(0).f2(w).taken,   // corrector: leave F2 to incumbent
+      s2_resp(w))                  // standalone: GEHL drives F2
   }
 
   // side-channel confidence signals from TAGE and loop (F3, same cycle)

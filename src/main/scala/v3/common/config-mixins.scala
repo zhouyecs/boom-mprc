@@ -781,7 +781,7 @@ class WithTageGehlOverrideBPD extends Config((site, here, up) => {
       localHistoryNSets = 0,
       branchPredictor = ((resp_in: BranchPredictionBankResponse, p: Parameters) => {
         val gehl = Module(new GEHLBranchPredictorBank(
-          BoomGEHLParams(maxHist = 64, observerMode = true))(p))
+          BoomGEHLParams(maxHist = 64, observerMode = true, f2Passthrough = true))(p))
         val loop = Module(new LoopBranchPredictorBank()(p))
         val tage = Module(new TageBranchPredictorBank()(p))
         val btb  = Module(new BTBBranchPredictorBank()(p))
