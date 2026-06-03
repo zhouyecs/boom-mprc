@@ -199,6 +199,8 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
 {
   val tageUBitPeriod = params.uBitPeriod
   val tageNTables    = params.tableInfo.size
+  val f3_provided = IO(Output(Vec(bankWidth, Bool())))
+  val f3_strong   = IO(Output(Vec(bankWidth, Bool())))
 
   class TageMeta extends Bundle
   {
@@ -275,6 +277,8 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
     f3_meta.alt_differs(w)    := final_altpred =/= io.resp.f3(w).taken
     f3_meta.provider_u(w)     := f3_resps(provider)(w).bits.u
     f3_meta.provider_ctr(w)   := f3_resps(provider)(w).bits.ctr
+    f3_provided(w)            := provided
+    f3_strong(w)              := provided && (f3_meta.provider_ctr(w) =/= 3.U && f3_meta.provider_ctr(w) =/= 4.U)
 
     // Create a mask of tables which did not hit our query, and also contain useless entries
     // and also uses a longer history than the provider

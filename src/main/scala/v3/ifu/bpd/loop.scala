@@ -49,6 +49,7 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
       val f3_pred_in  = Input(Bool())
       val f3_pred     = Output(Bool())
+      val f3_provided = Output(Bool())
       val f3_meta     = Output(new LoopMeta)
 
       val update_mispredict = Input(Bool())
@@ -79,10 +80,12 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
     io.f3_pred := io.f3_pred_in
     io.f3_meta.s_cnt := f3_scnt
+    io.f3_provided := false.B
 
     when (f3_entry.tag === f3_tag) {
       when (f3_scnt === f3_entry.p_cnt && f3_entry.conf === 7.U) {
         io.f3_pred := !io.f3_pred_in
+        io.f3_provided := true.B
       }
     }
 
@@ -183,6 +186,7 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val columns = Seq.fill(bankWidth) { Module(new LoopBranchPredictorColumn) }
   val mems = Nil // TODO fix
+  val f3_provided = IO(Output(Vec(bankWidth, Bool())))
   val f3_meta = Wire(Vec(bankWidth, new LoopMeta))
   override val metaSz = f3_meta.asUInt.getWidth
 
@@ -196,6 +200,7 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
     columns(w).io.f3_pred_in  := io.resp_in(0).f3(w).taken
     io.resp.f3(w).taken       := columns(w).io.f3_pred
+    f3_provided(w)            := columns(w).io.f3_provided
 
     columns(w).io.update_mispredict      := (s1_update.valid &&
                                              s1_update.bits.br_mask(w) &&

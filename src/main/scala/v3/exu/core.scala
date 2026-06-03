@@ -498,6 +498,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val com_gehl_fix   = Wire(Vec(coreWidth, Bool()))
   val com_gehl_break = Wire(Vec(coreWidth, Bool()))
 
+  // TEMP diagnostics 36-39
+  val com_diag_inc_conf = Wire(Vec(coreWidth, Bool()))
+  val com_diag_ungated  = Wire(Vec(coreWidth, Bool()))
+  val com_diag_suppress = Wire(Vec(coreWidth, Bool()))
+
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
@@ -544,8 +549,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
     // Layer 3: GEHL override decomposition
     com_gehl_wf(w)    := com_is_br(w) && uop.debug_gehl_would_fire
-    com_gehl_fix(w)   := com_gehl_wf(w) && (uop.debug_gehl_pred_f3 === uop.taken) && (uop.debug_tage_pred_f3 =/= uop.taken)
-    com_gehl_break(w) := com_gehl_wf(w) && (uop.debug_gehl_pred_f3 =/= uop.taken) && (uop.debug_tage_pred_f3 === uop.taken)
+    com_gehl_fix(w)   := com_gehl_wf(w) &&  com_misp_br(w) && (uop.debug_gehl_pred_f3 === uop.taken)
+    com_gehl_break(w) := com_gehl_wf(w) && !com_misp_br(w) && (uop.debug_gehl_pred_f3 =/= uop.taken)
+
+    // TEMP diagnostics
+    com_diag_inc_conf(w) := com_is_br(w) && uop.debug_diag_incumbent_conf
+    com_diag_ungated(w)  := com_is_br(w) && uop.debug_diag_ungated_fire
+    com_diag_suppress(w) := com_is_br(w) && uop.debug_diag_incumbent_conf && uop.debug_diag_ungated_fire
   }
 
   when (startCounter) {
@@ -594,6 +604,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(32) :=  PopCount(com_gehl_wf.asUInt)    // GEHL would fire
     event_counters.io.event_signals(33) :=  PopCount(com_gehl_fix.asUInt)   // GEHL would fix
     event_counters.io.event_signals(34) :=  PopCount(com_gehl_break.asUInt) // GEHL would break
+
+    // TEMP diagnostics (36-38)
+    event_counters.io.event_signals(36) :=  PopCount(com_diag_inc_conf.asUInt) // incumbent_conf
+    event_counters.io.event_signals(37) :=  PopCount(com_diag_ungated.asUInt)  // ungated fire
+    event_counters.io.event_signals(38) :=  PopCount(com_diag_suppress.asUInt) // suppressed (ungated && incumbent_conf)
   }
 
   //-------------------------------------------------------------

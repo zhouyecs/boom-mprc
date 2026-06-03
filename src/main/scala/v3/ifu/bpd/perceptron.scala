@@ -47,6 +47,9 @@ class GEHLMeta(val nTables: Int, val nIdxBits: Int, val sumBits: Int)(implicit p
   val would_fire = Vec(bankWidth, Bool())
   val gehl_pred  = Vec(bankWidth, Bool())
   val tage_pred  = Vec(bankWidth, Bool())
+  // TEMPORARY diagnostics
+  val diag_incumbent_conf = Vec(bankWidth, Bool())
+  val diag_ungated_fire   = Vec(bankWidth, Bool())
 }
 
 
@@ -87,7 +90,7 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   // for BOOM SRAM reporting
   val mems = (0 until nTables).map { t => (s"gehl_t$t", tableSize, bankWidth * weightBits) }
 
-  override val metaSz = bankWidth * sumBits + nTables * nIdxBits + 3 * bankWidth
+  override val metaSz = bankWidth * sumBits + nTables * nIdxBits + 5 * bankWidth
   require(metaSz <= bpdMaxMetaLength)
 
   // ---- reset walk: zero the SRAMs (SyncReadMem cannot use RegInit) ----
@@ -134,17 +137,26 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
     io.resp.f2(w).taken := s2_resp(w)
   }
 
-  // pipeline s2→s3: GEHL sum + TAGE-L prediction for override decision
-  val s3_sum       = RegNext(s2_sum)
-  val s3_tage_pred = VecInit((0 until bankWidth).map { w => io.resp_in(0).f3(w).taken })
+  // side-channel confidence signals from TAGE and loop (F3, same cycle)
+  val tage_provided = IO(Input(Vec(bankWidth, Bool())))
+  val tage_strong   = IO(Input(Vec(bankWidth, Bool())))
+  val loop_provided = IO(Input(Vec(bankWidth, Bool())))
+
+  // pipeline s2→s3: GEHL sum + incumbent (loop/TAGE/BIM composite) prediction
+  val s3_sum           = RegNext(s2_sum)
+  val s3_incumbent     = VecInit((0 until bankWidth).map { w => io.resp_in(0).f3(w).taken })
+  val s3_incumbent_conf = VecInit((0 until bankWidth).map { w =>
+    loop_provided(w) || (tage_provided(w) && tage_strong(w))
+  })
 
   for (w <- 0 until bankWidth) {
     val gehl_pred_w  = s3_sum(w) >= 0.S
     val abs_sum_w    = Mux(s3_sum(w) >= 0.S, s3_sum(w), -s3_sum(w))
-    val would_fire_w = (abs_sum_w >= params.overrideTheta.S) && (gehl_pred_w =/= s3_tage_pred(w))
+    val would_fire_w = (abs_sum_w >= params.overrideTheta.S) &&
+                       (gehl_pred_w =/= s3_incumbent(w)) && !s3_incumbent_conf(w)
     val fire_w       = would_fire_w && !params.observerMode.B
-    assert(!would_fire_w || (gehl_pred_w =/= s3_tage_pred(w)))
-    io.resp.f3(w).taken := Mux(fire_w, gehl_pred_w, s3_tage_pred(w))
+    assert(!would_fire_w || (gehl_pred_w =/= s3_incumbent(w)))
+    io.resp.f3(w).taken := Mux(fire_w, gehl_pred_w, s3_incumbent(w))
   }
 
   // F3 meta (shared indices + per-slot sums + override decision)
@@ -155,9 +167,13 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   for (w <- 0 until bankWidth) {
     val gehl_pred_w  = s3_sum(w) >= 0.S
     val abs_sum_w    = Mux(s3_sum(w) >= 0.S, s3_sum(w), -s3_sum(w))
-    s3_meta.would_fire(w) := (abs_sum_w >= params.overrideTheta.S) && (gehl_pred_w =/= s3_tage_pred(w))
+      s3_meta.would_fire(w) := (abs_sum_w >= params.overrideTheta.S) &&
+                             (gehl_pred_w =/= s3_incumbent(w)) && !s3_incumbent_conf(w)
     s3_meta.gehl_pred(w)  := gehl_pred_w
-    s3_meta.tage_pred(w)  := s3_tage_pred(w)
+    s3_meta.tage_pred(w)  := s3_incumbent(w)
+    s3_meta.diag_incumbent_conf(w) := s3_incumbent_conf(w)
+    s3_meta.diag_ungated_fire(w)   := (abs_sum_w >= params.overrideTheta.S) &&
+                                      (gehl_pred_w =/= s3_incumbent(w))
   }
   io.f3_meta := s3_meta.asUInt
 

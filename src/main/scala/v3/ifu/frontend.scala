@@ -252,6 +252,9 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val gehl_would_fire = Vec(fetchWidth, Bool())
   val gehl_pred_f3    = Vec(fetchWidth, Bool())
   val tage_pred_f3    = Vec(fetchWidth, Bool())
+  // TEMP diagnostics
+  val diag_incumbent_conf = Vec(fetchWidth, Bool())
+  val diag_ungated_fire   = Vec(fetchWidth, Bool())
 
   // Source of the prediction from this bundle
   val fsrc    = UInt(BSRC_SZ.W)
@@ -882,15 +885,16 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
     // Layer 3: GEHL override observability
     // GEHL is FIRST in Seq → at MSB of composed meta (composer left-shifts into place).
-    // Total composed = 230 bits; GEHL(116) at bits [228:113] of meta(bank).
-    // Decode by type rather than hand-computing Vec bit offsets.
-    val gehlMetaSz  = 116  // bankWidth*sumBits + nTables*nIdxBits + 3*bankWidth
-    val composedTop = 229  // total composed bits - 1
-    val gmeta = f3_bpd_resp.io.deq.bits.meta(bank)(composedTop, composedTop - gehlMetaSz + 1)
+    // Anchor at LSB (lower-banks total, unchanged by GEHL meta growth) for robustness.
+    val gehlMetaSz = 124  // bankWidth*sumBits + nTables*nIdxBits + 5*bankWidth
+    val gehlLSB    = 113  // loop(40)+tage(56)+btb(1)+ubtb(8)+bim(8) = 113
+    val gmeta = f3_bpd_resp.io.deq.bits.meta(bank)(gehlLSB + gehlMetaSz - 1, gehlLSB)
                   .asTypeOf(new GEHLMeta(8, 8, 10))  // nTables=8, nIdxBits=8, sumBits=10
     f3_fetch_bundle.tage_pred_f3(i)    := gmeta.tage_pred(slot)
     f3_fetch_bundle.gehl_pred_f3(i)    := gmeta.gehl_pred(slot)
     f3_fetch_bundle.gehl_would_fire(i) := gmeta.would_fire(slot)
+    f3_fetch_bundle.diag_incumbent_conf(i) := gmeta.diag_incumbent_conf(slot)
+    f3_fetch_bundle.diag_ungated_fire(i)   := gmeta.diag_ungated_fire(slot)
   }
 
   f3_fetch_bundle.end_half.valid := bank_prev_is_half

@@ -749,6 +749,10 @@ class WithGEHLBPD(maxHist: Int = 128) extends Config((site, here, up) => {
         val ras = Module(new RASBranchPredictorBank()(p))
         val preds = Seq(gehl, btb, ubtb, bim, ras)
         preds.map(_.io := DontCare)
+        // side-channel inputs unused in standalone GEHL config
+        gehl.tage_provided := VecInit(Seq.fill(4)(false.B))
+        gehl.tage_strong   := VecInit(Seq.fill(4)(false.B))
+        gehl.loop_provided := VecInit(Seq.fill(4)(false.B))
 
         ubtb.io.resp_in(0)  := resp_in
         bim.io.resp_in(0)   := ubtb.io.resp
@@ -786,6 +790,11 @@ class WithTageGehlOverrideBPD extends Config((site, here, up) => {
         val ras  = Module(new RASBranchPredictorBank()(p))
         val preds = Seq(gehl, loop, tage, btb, ubtb, bim, ras)
         preds.map(_.io := DontCare)
+
+        // side-channel confidence signals for incumbent gate (driven by tage/loop internally)
+        gehl.tage_provided := tage.f3_provided
+        gehl.tage_strong   := tage.f3_strong
+        gehl.loop_provided := loop.f3_provided
 
         ubtb.io.resp_in(0) := resp_in
         bim.io.resp_in(0)  := ubtb.io.resp

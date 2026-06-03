@@ -153,6 +153,9 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val debug_gehl_would_fire = Bool()
   val debug_gehl_pred_f3    = Bool()
   val debug_tage_pred_f3    = Bool()
+  // TEMP diagnostics
+  val debug_diag_incumbent_conf = Bool()
+  val debug_diag_ungated_fire   = Bool()
 
   // Do we allocate a branch tag for this?
   // SFB branches don't get a mask, they get a predicate bit
