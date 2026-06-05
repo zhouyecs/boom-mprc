@@ -20,10 +20,18 @@ case class BoomGEHLParams(
   minHist:    Int = 4,
   overrideTheta: Int = 32,
   observerMode:  Boolean = true,
-  f2Passthrough: Boolean = false // true = corrector mode (pass incumbent F2)
+  f2Passthrough: Boolean = false, // true = corrector mode (pass incumbent F2)
+  // local history: repurpose tables 5,6,7 for local-history indexing
+  localTables:      Seq[Int] = Seq(5, 6, 7),
+  localHistLengths: Seq[Int] = Seq(8, 16, 32),
+  lhtEntries:       Int = 256,
+  lhtWidth:         Int = 32
 ) {
   require(nTables >= 2)
   require(isPow2(tableSize))
+  require(localTables.length == localHistLengths.length)
+  require(lhtWidth >= localHistLengths.maxOption.getOrElse(0),
+    s"lhtWidth $lhtWidth too narrow for max localHistLength ${localHistLengths.maxOption.getOrElse(0)}")
 
   // geometric history lengths: table 0 = bias (len 0), tables 1..n-1 geometric minHist..maxHist
   def histLengths: Seq[Int] = {
@@ -32,6 +40,8 @@ case class BoomGEHLParams(
       round(minHist * pow(maxHist.toDouble / minHist.toDouble, t)).toInt
     }
   }
+
+  def isLocalTable(t: Int): Boolean = localTables.contains(t)
 
   // Jimenez static threshold for training (TODO: make adaptive later)
   def theta: Int = floor(1.93 * maxHist).toInt + 14
@@ -89,10 +99,25 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   val tables = Seq.fill(nTables)(SyncReadMem(tableSize, Vec(bankWidth, SInt(weightBits.W))))
 
   // for BOOM SRAM reporting
-  val mems = (0 until nTables).map { t => (s"gehl_t$t", tableSize, bankWidth * weightBits) }
+  val lhtIdxBits = log2Ceil(params.lhtEntries)
+  val lht = if (params.localTables.nonEmpty) Some(SyncReadMem(params.lhtEntries, UInt(params.lhtWidth.W))) else None
+  val lhtWrBypassEntries = 2
+  val mems = {
+    val wm = (0 until nTables).map { t => (s"gehl_t$t", tableSize, bankWidth * weightBits) }
+    if (params.localTables.nonEmpty) wm :+ ("gehl_lht", params.lhtEntries, params.lhtWidth) else wm
+  }
 
   override val metaSz = bankWidth * sumBits + nTables * nIdxBits + 5 * bankWidth
   require(metaSz <= bpdMaxMetaLength)
+
+  // s0 LHT read -> data lands at F1
+  val s0_lht_idx = fetchIdx(io.f0_pc)(lhtIdxBits - 1, 0)
+  val s1_lhist = Wire(UInt(params.lhtWidth.W))
+  if (params.localTables.nonEmpty) {
+    s1_lhist := lht.get.read(s0_lht_idx, s0_valid)
+  } else {
+    s1_lhist := 0.U
+  }
 
   // ---- reset walk: zero the SRAMs (SyncReadMem cannot use RegInit) ----
   val doing_reset = RegInit(true.B)
@@ -115,6 +140,10 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   for (t <- 0 until nTables) {
     if (t == 0) {
       s1_idxs(t) := s1_pc_hash(nIdxBits - 1, 0)
+    } else if (params.isLocalTable(t)) {
+      val lhLen = params.localHistLengths(params.localTables.indexOf(t))
+      val folded = foldHist(s1_lhist, lhLen, nIdxBits)
+      s1_idxs(t) := (s1_pc_hash ^ folded)(nIdxBits - 1, 0)
     } else {
       val folded = foldHist(io.f1_ghist, histLens(t), nIdxBits)
       s1_idxs(t) := (s1_pc_hash ^ folded)(nIdxBits - 1, 0)
@@ -235,6 +264,65 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
     val wr_mask = Mux(doing_reset, fullMsk,   su2_wmask(t))
     when (wr_en) {
       tables(t).write(wr_idx, wr_data, (0 until bankWidth).map(i => wr_mask(i)))
+    }
+  }
+
+  // ---- Local History Table (LHT) commit write ----
+  if (params.localTables.nonEmpty) {
+    // su1: compute LHT index + per-slot outcome, issue read
+    val su1_lht_idx   = fetchIdx(s1_update.bits.pc)(lhtIdxBits - 1, 0)
+    val su1_any_br    = u_fire && s1_update.bits.br_mask.asUInt.orR
+    val su1_cfi_valid = s1_update.bits.cfi_idx.valid
+    val su1_cfi_idx   = s1_update.bits.cfi_idx.bits
+    val su1_was_taken = Wire(Vec(bankWidth, Bool()))
+    for (w <- 0 until bankWidth) {
+      su1_was_taken(w) := su1_cfi_valid && (su1_cfi_idx === w.U) && s1_update.bits.cfi_taken
+    }
+    // SyncReadMem.read already lands at su2 -- do NOT RegNext.
+    val su2_lht_old = this.lht.get.read(su1_lht_idx, su1_any_br)
+
+    // pipeline su1 → su2
+    val su2_any_br    = RegNext(su1_any_br)
+    val su2_br_mask   = RegNext(s1_update.bits.br_mask)
+    val su2_was_taken = RegNext(su1_was_taken)
+    val su2_lht_idx   = RegNext(su1_lht_idx)
+    val su2_cfi_valid = RegNext(su1_cfi_valid)
+    val su2_cfi_idx   = RegNext(su1_cfi_idx)
+
+    // LHT write-bypass (2 entries): covers read-during-write on back-to-back commits
+    val lht_byp_idxs  = RegInit(VecInit(Seq.fill(lhtWrBypassEntries)(0.U(lhtIdxBits.W))))
+    val lht_byp       = RegInit(VecInit(Seq.fill(lhtWrBypassEntries)(0.U(params.lhtWidth.W))))
+    val lht_byp_enq   = RegInit(0.U(log2Ceil(lhtWrBypassEntries).W))
+    val lht_byp_hits  = VecInit((0 until lhtWrBypassEntries).map { e =>
+      !doing_reset && lht_byp_idxs(e) === su2_lht_idx
+    })
+    val lht_byp_hit   = lht_byp_hits.reduce(_||_)
+    val lht_byp_hit_e = PriorityEncoder(lht_byp_hits)
+
+    // su2: chain-shift each EXECUTED branch into the entry in program order (w=0 first).
+    // Mux gates each shift in hardware; `executed` drops post-CFI phantom branches.
+    var lht_val = Mux(lht_byp_hit, lht_byp(lht_byp_hit_e), su2_lht_old)
+    for (w <- 0 until bankWidth) {
+      val executed = !su2_cfi_valid || (w.U <= su2_cfi_idx)
+      val do_shift = su2_any_br && su2_br_mask(w) && executed
+      lht_val = Mux(do_shift,
+        ((lht_val << 1) | su2_was_taken(w))(params.lhtWidth - 1, 0),
+        lht_val)
+    }
+    val su2_lht_new = lht_val
+
+    // write back + bypass update
+    when (doing_reset) {
+      this.lht.get.write(reset_idx(lhtIdxBits - 1, 0), 0.U(params.lhtWidth.W))
+    }.elsewhen (su2_any_br) {
+      this.lht.get.write(su2_lht_idx, su2_lht_new)
+      when (lht_byp_hit) {
+        lht_byp(lht_byp_hit_e) := su2_lht_new
+      }.otherwise {
+        lht_byp(lht_byp_enq)      := su2_lht_new
+        lht_byp_idxs(lht_byp_enq) := su2_lht_idx
+        lht_byp_enq := WrapInc(lht_byp_enq, lhtWrBypassEntries)
+      }
     }
   }
 }

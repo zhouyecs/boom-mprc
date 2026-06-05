@@ -742,7 +742,7 @@ class WithGEHLBPD(maxHist: Int = 128) extends Config((site, here, up) => {
       localHistoryNSets = 0,
       branchPredictor = ((resp_in: BranchPredictionBankResponse, p: Parameters) => {
         val gehl = Module(new GEHLBranchPredictorBank(
-          BoomGEHLParams(maxHist = maxHist))(p))
+          BoomGEHLParams(maxHist = maxHist, localTables = Seq()))(p))
         val btb = Module(new BTBBranchPredictorBank()(p))
         val bim = Module(new BIMBranchPredictorBank()(p))
         val ubtb = Module(new FAMicroBTBBranchPredictorBank()(p))

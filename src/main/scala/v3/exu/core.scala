@@ -37,7 +37,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.tile.{TraceBundle}
 import freechips.rocketchip.rocket.{Causes, PRV, TracedInstruction}
-import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle}
+import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle, PlusArg}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
 
 import boom.v3.common._
@@ -551,6 +551,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_gehl_wf(w)    := com_is_br(w) && uop.debug_gehl_would_fire
     com_gehl_fix(w)   := com_gehl_wf(w) &&  com_misp_br(w) && (uop.debug_gehl_pred_f3 === uop.taken)
     com_gehl_break(w) := com_gehl_wf(w) && !com_misp_br(w) && (uop.debug_gehl_pred_f3 =/= uop.taken)
+
+    if (IN_SIMULATION) {
+      val (cycleCount, _) = Counter(true.B, Int.MaxValue)
+      val core_brtrace_printf = PlusArg("brtrace-print", 0, "Print br trace", 1)
+      // per commit port w, at your existing commit instrumentation point:
+      when (core_brtrace_printf(0) && com_is_br(w)) {
+        printf("BRTRACE %x %d\n", uop.debug_pc, uop.taken)
+      }
+    }
 
     // TEMP diagnostics
     com_diag_inc_conf(w) := com_is_br(w) && uop.debug_diag_incumbent_conf
