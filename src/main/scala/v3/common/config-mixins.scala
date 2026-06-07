@@ -55,6 +55,12 @@ class UseLoopConfig(useLoop: Boolean) extends Config((site, here, up) => {
   case BoomLoopKey => useLoop
 })
 
+case object BoomSnipKey extends Field[Boolean](false)
+
+class WithSnip extends Config((site, here, up) => {
+  case BoomSnipKey => true
+})
+
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(crossingParams = tp.crossingParams.copy(
@@ -628,10 +634,22 @@ class WithTAGEBPD extends Config((site, here, up) => {
           loop.io := DontCare
           loop.io.resp_in(0)  := tage.io.resp
           ras.io.resp_in(0)   := loop.io.resp
-          (preds_with_loop, ras.io.resp)
+          if (p(BoomSnipKey)) {
+            val snip = Module(new SNIPBranchPredictorBank()(p))
+            snip.io.resp_in(0) := ras.io.resp
+            (preds_with_loop :+ snip, snip.io.resp)
+          } else {
+            (preds_with_loop, ras.io.resp)
+          }
         } else {
           ras.io.resp_in(0)   := tage.io.resp
-          (preds, ras.io.resp)
+          if (p(BoomSnipKey)) {
+            val snip = Module(new SNIPBranchPredictorBank()(p))
+            snip.io.resp_in(0) := ras.io.resp
+            (preds :+ snip, snip.io.resp)
+          } else {
+            (preds, ras.io.resp)
+          }
         }
       })
     )))
