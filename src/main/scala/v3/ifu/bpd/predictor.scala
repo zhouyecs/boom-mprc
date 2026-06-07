@@ -71,7 +71,7 @@ class BranchPredictionUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cfi_is_jal  = Bool()
   // Was the cfi a jalr
   val cfi_is_jalr = Bool()
-  //val cfi_is_ret  = Bool()
+  val cfi_is_ret  = Bool()
   val cfi_is_pop_push  = Bool()
 
   val ghist = new GlobalHistory
@@ -106,6 +106,7 @@ class BranchPredictionBankUpdate(implicit p: Parameters) extends BoomBundle()(p)
   val cfi_is_br        = Bool()
   val cfi_is_jal       = Bool()
   val cfi_is_jalr      = Bool()
+  val cfi_is_ret       = Bool()
   val cfi_is_pop_push  = Bool()
 
   val ghist            = UInt(globalHistoryLength.W)
@@ -403,12 +404,24 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(i).io.update.bits.cfi_is_br        := io.update.bits.cfi_is_br
     banked_predictors(i).io.update.bits.cfi_is_jal       := io.update.bits.cfi_is_jal
     banked_predictors(i).io.update.bits.cfi_is_jalr      := io.update.bits.cfi_is_jalr
+    banked_predictors(i).io.update.bits.cfi_is_ret       := io.update.bits.cfi_is_ret
     banked_predictors(i).io.update.bits.cfi_is_pop_push  := io.update.bits.cfi_is_pop_push
     banked_predictors(i).io.update.bits.target           := io.update.bits.target
 
     banked_lhist_providers(i).io.update.mispredict := io.update.bits.is_mispredict_update
     banked_lhist_providers(i).io.update.repair     := io.update.bits.is_repair_update
     banked_lhist_providers(i).io.update.lhist      := io.update.bits.lhist(i)
+  }
+
+  when (banked_predictors(0).io.update.valid &&
+        banked_predictors(0).io.update.bits.is_commit_update &&
+        (banked_predictors(0).io.update.bits.cfi_is_jal)) {
+    printf("[JALR-THREAD] pc=0x%x  is_jal=%d  is_jalr=%d  is_ret=%d  taken=%d\n",
+      banked_predictors(0).io.update.bits.pc,
+      banked_predictors(0).io.update.bits.cfi_is_jal,
+      banked_predictors(0).io.update.bits.cfi_is_jalr,
+      banked_predictors(0).io.update.bits.cfi_is_ret,
+      banked_predictors(0).io.update.bits.cfi_taken)
   }
 
   if (nBanks == 1) {
