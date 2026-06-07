@@ -56,6 +56,9 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
   val ras_idx = UInt(log2Ceil(nRasEntries).W)
 
+  // SNIP path-address ring: ringEntries × pcBits; 0-width when disabled
+  val path_history = UInt((if (useSnipPathRing) snipRingEntries * snipPcBits else 0).W)
+
   def histories(bank: Int) = {
     if (nBanks == 1) {
       old_history
@@ -95,10 +98,32 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
       new_history := DontCare
       new_history.current_saw_branch_not_taken := false.B
       val saw_not_taken_branch = not_taken_branches =/= 0.U || current_saw_branch_not_taken
-      new_history.old_history := Mux(cfi_is_br && cfi_taken && cfi_valid   , histories(0) << 1 | 1.U,
-                                 Mux(saw_not_taken_branch                  , histories(0) << 1,
-                                                                             histories(0)))
+      // Shared shift conditions: path ring binds to these, old_history uses them inline
+      val br_taken_cond     = cfi_is_br && cfi_taken && cfi_valid
+      val saw_nt_cond       = saw_not_taken_branch
+      val shift_old_history = br_taken_cond || saw_nt_cond
+      new_history.old_history := Mux(br_taken_cond, histories(0) << 1 | 1.U,
+                                 Mux(saw_nt_cond,   histories(0) << 1,
+                                                     histories(0)))
+      // NOTE: path ring is intentionally CONDITIONAL-BRANCH-ONLY. It binds to
+      // shift_old_history (the same condition that advances old_history), which fires
+      // only on conditional branches — not jumps/calls/returns. This keeps path[i]
+      // aligned with direction[i] (both conditional-only, ITTAGE-style) and is a
+      // deliberate deviation from SNIP's reference all-branch ring. If indirect
+      // accuracy is weak on call-heavy benchmarks, a separate all-branch history is
+      // the v2 fix.
+      if (useSnipPathRing) {
+        val newpc = addr(snipPcHiBit, snipPcLoBit)
+        new_history.path_history := Mux(shift_old_history,
+          (path_history << snipPcBits | newpc)((snipRingEntries * snipPcBits) - 1, 0),
+          path_history)
+      }
     } else {
+      // DEAD PATH for nBanks==1 configs (MediumBoomV3Config etc.).
+      // If targeting nBanks==2 (e.g., BigBoomV3Config), this path needs a
+      // deferred_path_pc field (UInt(snipPcBits.W)) in GlobalHistory, set
+      // alongside new_saw_branch_taken/not_taken, to avoid path[i]/direction[i]
+      // misalignment on deferred-bank entries.
       // In the two bank case every bank ignore the history added by the previous bank
       val base = histories(1)
       val cfi_in_bank_0 = cfi_valid && cfi_taken && cfi_idx_fixed < bankWidth.U
@@ -142,7 +167,6 @@ trait HasBoomFrontendParameters extends HasL1ICacheParameters
   val bankWidth = fetchWidth/nBanks
 
   require(nBanks == 1 || nBanks == 2)
-
 
 
   // How many "chunks"/interleavings make up a cache line?
@@ -499,7 +523,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     false.B,
     false.B)
 
-  val f2_correct_f1_ghist = s1_ghist =/= f2_predicted_ghist && enableGHistStallRepair.B
+  val f2_pathDiverged = if (useSnipPathRing) s1_ghist.path_history =/= f2_predicted_ghist.path_history else false.B
+  val f2_correct_f1_ghist = (s1_ghist =/= f2_predicted_ghist || f2_pathDiverged) && enableGHistStallRepair.B
 
   when ((s2_valid && !icache.io.resp.valid) ||
         (s2_valid && icache.io.resp.valid && !f3_ready)) {
@@ -918,14 +943,27 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_fetch_bundle.cfi_is_pop_push
   )
 
+  if (IN_SIMULATION && useSnipPathRing) {
+    val ring_shifted = f3_predicted_ghist.path_history =/= f3_fetch_bundle.ghist.path_history
+    when (f3.io.deq.valid && ring_shifted) {
+      printf("[GHIST] pc=0x%x  pc_slice=0x%x  newest=0x%x  oldhist_lo=0x%x\n",
+        f3_fetch_bundle.pc,
+        f3_fetch_bundle.pc(snipPcHiBit, snipPcLoBit),
+        f3_predicted_ghist.path_history(snipPcBits - 1, 0),
+        f3_predicted_ghist.old_history(snipRingEntries - 1, 0))
+    }
+  }
+
   bpd.io.f3_write_valid := false.B
   bpd.io.f3_write_addr  := f3_aligned_pc + (f3_fetch_bundle.cfi_idx.bits << 1) + Mux(
     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
   bpd.io.f3_write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
 
 
-  val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
-  val f3_correct_f2_ghist = s2_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
+  val f3_pathDiverged_f1 = if (useSnipPathRing) s1_ghist.path_history =/= f3_predicted_ghist.path_history else false.B
+  val f3_correct_f1_ghist = (s1_ghist =/= f3_predicted_ghist || f3_pathDiverged_f1) && enableGHistStallRepair.B
+  val f3_pathDiverged_f2 = if (useSnipPathRing) s2_ghist.path_history =/= f3_predicted_ghist.path_history else false.B
+  val f3_correct_f2_ghist = (s2_ghist =/= f3_predicted_ghist || f3_pathDiverged_f2) && enableGHistStallRepair.B
 
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
@@ -1100,6 +1138,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     s0_valid     := io.cpu.redirect_val
     s0_vpc       := io.cpu.redirect_pc
     s0_ghist     := io.cpu.redirect_ghist
+    if (IN_SIMULATION && useSnipPathRing) {
+      // On ROB flush: path ring is zeroed → restored_pathring == 0.
+      // On branch mispredict: snapshot shifted by 1 = corrected branch PC slice.
+      // Special case use_same_ghist: no shift → restored = snapshot (unchanged).
+      printf("[GHIST-RESTORE] redirect_pc=0x%x  restored_oldhist_lo=0x%x  restored_pathring=0x%x\n",
+        io.cpu.redirect_pc,
+        s0_ghist.old_history(snipRingEntries - 1, 0),
+        s0_ghist.path_history)
+    }
     s0_tsrc      := BSRC_C
     s0_is_replay := false.B
 

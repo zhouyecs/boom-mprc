@@ -67,6 +67,12 @@ case class BoomCoreParams(
   numRasEntries: Int = 32,
   enableRasTopRepair: Boolean = true,
 
+  /* SNIP path-address ring */
+  useSnipPathRing: Boolean = false,
+  snipRingEntries: Int = 16,
+  snipPcLoBit:    Int = 2,
+  snipPcBits:     Int = 11,
+
   /* more stuff */
   useCompressed: Boolean = true,
   useFetchMonitor: Boolean = true,
@@ -253,6 +259,13 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   }
 
   val nRasEntries = boomParams.numRasEntries max 2
+
+  // SNIP path-address ring
+  val useSnipPathRing = boomParams.useSnipPathRing
+  val snipRingEntries = boomParams.snipRingEntries
+  val snipPcLoBit    = boomParams.snipPcLoBit
+  val snipPcBits     = boomParams.snipPcBits
+  val snipPcHiBit    = snipPcLoBit + snipPcBits - 1
   val useRAS = boomParams.numRasEntries > 0
   val enableRasTopRepair = boomParams.enableRasTopRepair
 

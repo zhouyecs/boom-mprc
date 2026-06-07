@@ -699,6 +699,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       ftq_ghist,
       next_ghist)
     io.ifu.redirect_ghist.current_saw_branch_not_taken := use_same_ghist
+    if (useSnipPathRing) {
+      printf("[GHIST-REPLAY] misp_block_pc=0x%x  slice=0x%x  next_newest=0x%x  ftq_top=0x%x  next_oldhist=0x%x  ftq_oldhist=0x%x  rvc=%d  same_ghist=%d\n",
+        io.ifu.get_pc(1).pc,
+        io.ifu.get_pc(1).pc(snipPcLoBit + snipPcBits - 1, snipPcLoBit),
+        next_ghist.path_history(snipPcBits - 1, 0),
+        ftq_ghist.path_history(snipPcBits - 1, 0),
+        next_ghist.old_history(15, 0),    // direction after update
+        ftq_ghist.old_history(15, 0),     // direction in the snapshot (before)
+        brupdate.b2.uop.is_rvc,
+        use_same_ghist)
+    }
   } .elsewhen (rob.io.flush_frontend || brupdate.b1.mispredict_mask =/= 0.U) {
     io.ifu.redirect_flush   := true.B
   }
