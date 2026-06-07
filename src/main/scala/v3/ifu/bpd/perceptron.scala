@@ -20,7 +20,20 @@ case class BoomGEHLParams(
   minHist:    Int = 4,
   overrideTheta: Int = 32,
   observerMode:  Boolean = true,
-  f2Passthrough: Boolean = false // true = corrector mode (pass incumbent F2)
+  f2Passthrough: Boolean = false, // true = corrector mode (pass incumbent F2)
+  // training threshold: <0 => floor(1.93*nTables)+14 ; else fixed
+  trainTheta:         Int   = -1,
+  useAdaptiveTheta:   Boolean = false,
+  tcBound:            Int     = 63,
+  thetaMin:           Int     = 8,
+  thetaMax:           Int     = 160,
+  // override threshold: <0 => tracks training theta ; else fixed
+  overrideThetaFixed: Int   = -1,
+  // override-confidence table (SC-style learned gate)
+  useOCT:             Boolean = true,
+  octEntries:         Int     = 1024,
+  octBits:            Int     = 4,
+  octThreshold:       Int     = 0
 ) {
   require(nTables >= 2)
   require(isPow2(tableSize))
@@ -33,14 +46,16 @@ case class BoomGEHLParams(
     }
   }
 
-  // Jimenez static threshold for training (TODO: make adaptive later)
-  def theta: Int = floor(1.93 * maxHist).toInt + 14
+  // training threshold: nTables-based (correct), overridable
+  def trainThetaStatic: Int = if (trainTheta >= 0) trainTheta else floor(1.93 * nTables).toInt + 14
+  // override theta: tracks trainTheta unless pinned
+  def buildOverrideTheta(dyn: Int): Int = if (overrideThetaFixed >= 0) overrideThetaFixed else dyn
 }
 
 
 // carried from predict to update: per-slot sums + shared per-table indices
 // + override decision fields for confidence-gated GEHL-on-TAGE override
-class GEHLMeta(val nTables: Int, val nIdxBits: Int, val sumBits: Int)(implicit p: Parameters) extends BoomBundle()(p)
+class GEHLMeta(val nTables: Int, val nIdxBits: Int, val sumBits: Int, val octIdxBits: Int = 10)(implicit p: Parameters) extends BoomBundle()(p)
   with HasBoomFrontendParameters
 {
   val sums       = Vec(bankWidth, SInt(sumBits.W))
@@ -51,6 +66,12 @@ class GEHLMeta(val nTables: Int, val nIdxBits: Int, val sumBits: Int)(implicit p
   // TEMPORARY diagnostics
   val diag_incumbent_conf = Vec(bankWidth, Bool())
   val diag_ungated_fire   = Vec(bankWidth, Bool())
+  // OCT liveness diagnostics
+  val diag_oct_f3_nz  = Vec(bankWidth, Bool())
+  val diag_oct_suppress = Vec(bankWidth, Bool())
+  val diag_oct_write   = Vec(bankWidth, Bool())
+  // meta-carried OCT index (block-level, not per-slot)
+  val oct_idx = UInt(octIdxBits.W)
 }
 
 
@@ -61,12 +82,34 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   val weightBits = params.weightBits
   val nIdxBits   = log2Ceil(tableSize)
   val histLens   = params.histLengths
-  val theta      = params.theta
+  val trainThetaInit = params.trainThetaStatic
 
   // sum width: nTables * max_weight, plus sign
   val sumBits   = log2Ceil(nTables * ((1 << (weightBits - 1)) - 1) + 1) + 1
   val maxWeight = ((1 << (weightBits - 1)) - 1).S(weightBits.W)
   val minWeight = (-(1 << (weightBits - 1))).S(weightBits.W)
+
+  // ---- adaptive training theta (O-GEHL) ----
+  val theta_dyn = if (params.useAdaptiveTheta) RegInit(trainThetaInit.U(log2Ceil(params.thetaMax + 1).W)) else 0.U
+  val tc = if (params.useAdaptiveTheta) RegInit(0.S(log2Ceil(params.tcBound + 1).W)) else 0.S
+  val currentTheta = Mux(params.useAdaptiveTheta.B, theta_dyn, trainThetaInit.U)
+  val overrideTheta = Mux((params.overrideThetaFixed >= 0).B,
+    params.overrideThetaFixed.S, currentTheta.asSInt)
+
+  // ---- OCT: flop-based learned gate (no SyncReadMem -> no CIRCT memory lowering) ----
+  val octIdxBits = log2Ceil(params.octEntries)
+  val octEntries = if (params.useOCT) params.octEntries else 1
+  val oct = RegInit(VecInit(Seq.fill(octEntries)(0.S(params.octBits.W))))
+  // F1 read -> pipeline to F3 (flop is 0-cycle; SRAM was 1-cycle, so add 2nd RegNext)
+  // PC hash: XOR-fold fetchIdx to mix high bits into the index (avoids all-zero
+  // low bits when fetchIdx sits at a large aligned base like 0x10000000)
+  val oct_s1_idx = RegNext({
+    val fc = fetchIdx(io.f0_pc)
+    foldHist(fc, fc.getWidth, octIdxBits)
+  })
+  val oct_f3 = if (params.useOCT) {
+    RegNext(RegNext(oct(oct_s1_idx)))
+  } else { 0.S }
 
   require(histLens.last <= globalHistoryLength,
     s"GEHL maxHist ${histLens.last} exceeds globalHistoryLength $globalHistoryLength")
@@ -91,7 +134,7 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   // for BOOM SRAM reporting
   val mems = (0 until nTables).map { t => (s"gehl_t$t", tableSize, bankWidth * weightBits) }
 
-  override val metaSz = bankWidth * sumBits + nTables * nIdxBits + 5 * bankWidth
+  override val metaSz = bankWidth * sumBits + nTables * nIdxBits + 8 * bankWidth + octIdxBits
   require(metaSz <= bpdMaxMetaLength)
 
   // ---- reset walk: zero the SRAMs (SyncReadMem cannot use RegInit) ----
@@ -155,8 +198,9 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   for (w <- 0 until bankWidth) {
     val gehl_pred_w  = s3_sum(w) >= 0.S
     val abs_sum_w    = Mux(s3_sum(w) >= 0.S, s3_sum(w), -s3_sum(w))
-    val would_fire_w = (abs_sum_w >= params.overrideTheta.S) &&
-                       (gehl_pred_w =/= s3_incumbent(w)) && !s3_incumbent_conf(w)
+    val oct_ok       = (!params.useOCT).B || (oct_f3 >= params.octThreshold.S)
+    val would_fire_w = (abs_sum_w >= overrideTheta) &&
+                       (gehl_pred_w =/= s3_incumbent(w)) && !s3_incumbent_conf(w) && oct_ok
     val fire_w       = would_fire_w && !params.observerMode.B
     assert(!would_fire_w || (gehl_pred_w =/= s3_incumbent(w)))
     io.resp.f3(w).taken := Mux(fire_w, gehl_pred_w, s3_incumbent(w))
@@ -164,19 +208,29 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
 
   // F3 meta (shared indices + per-slot sums + override decision)
   val s3_idxs = RegNext(s2_idxs)
-  val s3_meta = Wire(new GEHLMeta(nTables, nIdxBits, sumBits))
+  val s3_meta = Wire(new GEHLMeta(nTables, nIdxBits, sumBits, octIdxBits))
   s3_meta.sums := s3_sum
   s3_meta.idxs := s3_idxs
   for (w <- 0 until bankWidth) {
     val gehl_pred_w  = s3_sum(w) >= 0.S
     val abs_sum_w    = Mux(s3_sum(w) >= 0.S, s3_sum(w), -s3_sum(w))
-      s3_meta.would_fire(w) := (abs_sum_w >= params.overrideTheta.S) &&
-                             (gehl_pred_w =/= s3_incumbent(w)) && !s3_incumbent_conf(w)
+    val oct_ok_w    = (!params.useOCT).B || (oct_f3 >= params.octThreshold.S)
+    val pre_oct_w   = (abs_sum_w >= overrideTheta) &&
+                      (gehl_pred_w =/= s3_incumbent(w)) && !s3_incumbent_conf(w)
+    s3_meta.would_fire(w) := pre_oct_w && oct_ok_w
     s3_meta.gehl_pred(w)  := gehl_pred_w
     s3_meta.tage_pred(w)  := s3_incumbent(w)
     s3_meta.diag_incumbent_conf(w) := s3_incumbent_conf(w)
-    s3_meta.diag_ungated_fire(w)   := (abs_sum_w >= params.overrideTheta.S) &&
+    s3_meta.diag_ungated_fire(w)   := (abs_sum_w >= overrideTheta) &&
                                       (gehl_pred_w =/= s3_incumbent(w))
+    s3_meta.diag_oct_f3_nz(w)     := oct_f3 =/= 0.S
+    s3_meta.diag_oct_suppress(w)  := pre_oct_w && !oct_ok_w
+    s3_meta.diag_oct_write(w)     := pre_oct_w
+  }
+  // meta-carried OCT index: capture read index at F3 for commit-path use
+  s3_meta.oct_idx := 0.U  // default (useOCT=false)
+  if (params.useOCT) {
+    s3_meta.oct_idx := RegNext(RegNext(oct_s1_idx))  // 3 deep from f0, same idx the read used
   }
   io.f3_meta := s3_meta.asUInt
 
@@ -186,7 +240,7 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
   //   su2: old weights land -> new = old +/-1 (saturating) -> masked write (slot w)
   // The SRAM read forces RMW: we can no longer read the old weight combinationally.
   // ============================================================
-  val u_meta = s1_update.bits.meta.asTypeOf(new GEHLMeta(nTables, nIdxBits, sumBits))
+  val u_meta = s1_update.bits.meta.asTypeOf(new GEHLMeta(nTables, nIdxBits, sumBits, octIdxBits))
   val u_fire = !doing_reset && s1_update.valid && s1_update.bits.is_commit_update
 
   // su1: per-slot train decision and resolved direction
@@ -199,7 +253,7 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
     val stored    = u_meta.sums(w)
     val abs_sum   = Mux(stored >= 0.S, stored, -stored)
     su1_taken(w) := was_taken
-    su1_train(w) := u_fire && s1_update.bits.br_mask(w) && (mispred || abs_sum < theta.S)
+    su1_train(w) := u_fire && s1_update.bits.br_mask(w) && (mispred || abs_sum < currentTheta.asSInt)
   }
 
   // su1: issue reads of the old weights at the stored indices -> data lands in su2
@@ -235,6 +289,59 @@ class GEHLBranchPredictorBank(params: BoomGEHLParams = BoomGEHLParams())(implici
     val wr_mask = Mux(doing_reset, fullMsk,   su2_wmask(t))
     when (wr_en) {
       tables(t).write(wr_idx, wr_data, (0 until bankWidth).map(i => wr_mask(i)))
+    }
+  }
+
+  // ---- adaptive training theta update (O-GEHL) ----
+  if (params.useAdaptiveTheta) {
+    val su1_trained  = Wire(Vec(bankWidth, Bool()))
+    val su2_trained  = RegNext(su1_trained)
+    val su2_mispred  = RegNext(s1_update.bits.cfi_mispredicted && s1_update.bits.cfi_idx.valid)
+    val su2_any_tr   = su2_trained.asUInt.orR
+    for (w <- 0 until bankWidth) {
+      su1_trained(w) := su1_train(w)  // computed above at su1
+    }
+    val net_delta = PopCount(su2_trained.asUInt) // +1 per trained slot
+    val tc_next = tc + Mux(su2_mispred, net_delta.asSInt, -net_delta.asSInt)
+    when (su2_any_tr) {
+      tc := tc_next
+      when (tc_next >= params.tcBound.S) {
+        theta_dyn := Mux(theta_dyn < params.thetaMax.U, theta_dyn + 1.U, theta_dyn)
+        tc := 0.S
+      }.elsewhen (tc_next <= (-params.tcBound).S) {
+        theta_dyn := Mux(theta_dyn > params.thetaMin.U, theta_dyn - 1.U, theta_dyn)
+        tc := 0.S
+      }
+    }
+  }
+
+  // ---- OCT commit write (SC-style learned gate, flop-based) ----
+  if (params.useOCT) {
+    // use F3-carried pre-oct decision, gated to real committed branches
+    val su1_pre_fire = Wire(Vec(bankWidth, Bool()))
+    for (w <- 0 until bankWidth) {
+      su1_pre_fire(w) := u_fire && s1_update.bits.br_mask(w) && u_meta.diag_oct_write(w)
+    }
+    val su2_pre_fire  = RegNext(su1_pre_fire)
+    val su2_gehl_pred = RegNext(u_meta.gehl_pred)
+    val su2_oct_idx   = RegNext(u_meta.oct_idx)
+    val su2_actual    = RegNext(su1_taken)
+
+    // combinational reg read at su2 (always latest committed value)
+    val su2_oct_old = oct(su2_oct_idx)
+
+    val maxOct = ((1 << (params.octBits - 1)) - 1).S
+    val minOct = (-(1 << (params.octBits - 1))).S
+    var oct_val: SInt = su2_oct_old
+    for (w <- 0 until bankWidth) {
+      val fix = su2_gehl_pred(w) === su2_actual(w)
+      val inc = Mux(fix && oct_val === maxOct, 0.S,
+                 Mux(!fix && oct_val === minOct, 0.S,
+                 Mux(fix, 1.S, -1.S)))
+      oct_val = Mux(su2_pre_fire(w), oct_val + inc, oct_val)
+    }
+    when (su2_pre_fire.asUInt.orR) {
+      oct(su2_oct_idx) := oct_val
     }
   }
 }

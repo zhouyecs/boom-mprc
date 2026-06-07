@@ -255,6 +255,10 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   // TEMP diagnostics
   val diag_incumbent_conf = Vec(fetchWidth, Bool())
   val diag_ungated_fire   = Vec(fetchWidth, Bool())
+  // OCT liveness diagnostics
+  val diag_oct_f3_nz    = Vec(fetchWidth, Bool())
+  val diag_oct_suppress = Vec(fetchWidth, Bool())
+  val diag_oct_write    = Vec(fetchWidth, Bool())
 
   // Source of the prediction from this bundle
   val fsrc    = UInt(BSRC_SZ.W)
@@ -886,15 +890,18 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     // Layer 3: GEHL override observability
     // GEHL is FIRST in Seq → at MSB of composed meta (composer left-shifts into place).
     // Anchor at LSB (lower-banks total, unchanged by GEHL meta growth) for robustness.
-    val gehlMetaSz = 124  // bankWidth*sumBits + nTables*nIdxBits + 5*bankWidth
+    val gehlMetaSz = 146  // bankWidth*sumBits + nTables*nIdxBits + 8*bankWidth + octIdxBits
     val gehlLSB    = 113  // loop(40)+tage(56)+btb(1)+ubtb(8)+bim(8) = 113
     val gmeta = f3_bpd_resp.io.deq.bits.meta(bank)(gehlLSB + gehlMetaSz - 1, gehlLSB)
-                  .asTypeOf(new GEHLMeta(8, 8, 10))  // nTables=8, nIdxBits=8, sumBits=10
+                  .asTypeOf(new GEHLMeta(8, 8, 10, 10))  // nTables=8, nIdxBits=8, sumBits=10, octIdxBits=10
     f3_fetch_bundle.tage_pred_f3(i)    := gmeta.tage_pred(slot)
     f3_fetch_bundle.gehl_pred_f3(i)    := gmeta.gehl_pred(slot)
     f3_fetch_bundle.gehl_would_fire(i) := gmeta.would_fire(slot)
     f3_fetch_bundle.diag_incumbent_conf(i) := gmeta.diag_incumbent_conf(slot)
     f3_fetch_bundle.diag_ungated_fire(i)   := gmeta.diag_ungated_fire(slot)
+    f3_fetch_bundle.diag_oct_f3_nz(i)      := gmeta.diag_oct_f3_nz(slot)
+    f3_fetch_bundle.diag_oct_suppress(i)   := gmeta.diag_oct_suppress(slot)
+    f3_fetch_bundle.diag_oct_write(i)      := gmeta.diag_oct_write(slot)
   }
 
   f3_fetch_bundle.end_half.valid := bank_prev_is_half

@@ -775,7 +775,7 @@ class WithGEHLBPD64 extends Config(new WithGEHLBPD(64))
 class WithTageGehlOverrideBPD extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
-      bpdMaxMetaLength = 256,
+      bpdMaxMetaLength = 512,
       globalHistoryLength = 64,
       localHistoryLength = 1,
       localHistoryNSets = 0,

@@ -498,10 +498,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val com_gehl_fix   = Wire(Vec(coreWidth, Bool()))
   val com_gehl_break = Wire(Vec(coreWidth, Bool()))
 
-  // TEMP diagnostics 36-39
+  // TEMP diagnostics 36-38
   val com_diag_inc_conf = Wire(Vec(coreWidth, Bool()))
   val com_diag_ungated  = Wire(Vec(coreWidth, Bool()))
   val com_diag_suppress = Wire(Vec(coreWidth, Bool()))
+
+  // OCT liveness diagnostics 39-41
+  val com_diag_oct_nz    = Wire(Vec(coreWidth, Bool()))
+  val com_diag_oct_supp  = Wire(Vec(coreWidth, Bool()))
+  val com_diag_oct_write = Wire(Vec(coreWidth, Bool()))
 
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
@@ -556,6 +561,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_diag_inc_conf(w) := com_is_br(w) && uop.debug_diag_incumbent_conf
     com_diag_ungated(w)  := com_is_br(w) && uop.debug_diag_ungated_fire
     com_diag_suppress(w) := com_is_br(w) && uop.debug_diag_incumbent_conf && uop.debug_diag_ungated_fire
+
+    // OCT liveness diagnostics
+    com_diag_oct_nz(w)    := com_is_br(w) && uop.debug_diag_oct_f3_nz
+    com_diag_oct_supp(w)  := com_is_br(w) && uop.debug_diag_oct_suppress
+    com_diag_oct_write(w) := com_is_br(w) && uop.debug_diag_oct_write
   }
 
   when (startCounter) {
@@ -609,6 +619,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(36) :=  PopCount(com_diag_inc_conf.asUInt) // incumbent_conf
     event_counters.io.event_signals(37) :=  PopCount(com_diag_ungated.asUInt)  // ungated fire
     event_counters.io.event_signals(38) :=  PopCount(com_diag_suppress.asUInt) // suppressed (ungated && incumbent_conf)
+
+    // OCT liveness diagnostics (39-41)
+    event_counters.io.event_signals(39) :=  PopCount(com_diag_oct_nz.asUInt)    // oct_f3 nonzero
+    event_counters.io.event_signals(40) :=  PopCount(com_diag_oct_supp.asUInt)  // oct suppressed
+    event_counters.io.event_signals(41) :=  PopCount(com_diag_oct_write.asUInt) // oct would write
   }
 
   //-------------------------------------------------------------
