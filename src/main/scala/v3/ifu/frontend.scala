@@ -326,6 +326,10 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val itlb_hit = Input(Bool())
   val icache_valid_access = Input(Bool())
   val icache_hit = Input(Bool())
+
+  // SNIP ITC observer events (frontend → core)
+  val itc_total_event = Input(Bool())
+  val itc_hit_event   = Input(Bool())
 }
 
 /**
@@ -371,6 +375,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   val bpd = Module(new BranchPredictor)
   bpd.io.f3_fire := true.B // 解耦前端 f3 预测不会被阻塞
+
+  // SNIP ITC observer passthrough
+  io.cpu.itc_total_event := bpd.io.itc_total_event
+  io.cpu.itc_hit_event   := bpd.io.itc_hit_event
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache

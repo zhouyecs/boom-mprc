@@ -579,6 +579,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(29) :=  PopCount(com_tage_prov.asUInt)   // TAGE provided
     event_counters.io.event_signals(30) :=  PopCount(com_tage_pwrong.asUInt) // TAGE provided, wrong dir
     event_counters.io.event_signals(31) :=  PopCount(com_bim_ok_nott.asUInt) // BIM correct, TAGE no-provide
+    // SNIP ITC observer
+    event_counters.io.event_signals(32) := io.ifu.itc_total_event.asUInt
+    event_counters.io.event_signals(33) := io.ifu.itc_hit_event.asUInt
   }
 
   //-------------------------------------------------------------

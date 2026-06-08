@@ -164,10 +164,16 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val f3_write_valid = Input(Bool())
     val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
     val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
+
+    // SNIP ITC observer events (driven false by default, overridden by SNIP bank)
+    val itc_total_event = Output(Bool())
+    val itc_hit_event   = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
   io.f3_meta := 0.U
+  io.itc_total_event := false.B
+  io.itc_hit_event   := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -225,6 +231,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val f3_write_valid = Input(Bool())
     val f3_write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
     val f3_write_addr  = Input(UInt(vaddrBitsExtended.W))
+
+    // SNIP ITC observer (always-present, driven false when BoomSnipKey=false)
+    val itc_total_event = Output(Bool())
+    val itc_hit_event   = Output(Bool())
   })
 
   var total_memsize = 0
@@ -240,6 +250,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   })
   bpdStr.append(BoomCoreStringPrefix(f"Total bpd size: ${total_memsize / 1024} KB\n"))
   override def toString: String = bpdStr.toString
+
+  // Wire SNIP ITC observer events to IO (aggregated from all composed banks)
+  io.itc_total_event := banked_predictors.map(_.io.itc_total_event).foldLeft(false.B)(_ || _)
+  io.itc_hit_event   := banked_predictors.map(_.io.itc_hit_event).foldLeft(false.B)(_ || _)
 
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 

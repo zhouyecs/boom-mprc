@@ -41,6 +41,8 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
   require(meta_sz < bpdMaxMetaLength)
   io.f3_meta := metas
 
+  io.itc_total_event := components.map(_.io.itc_total_event).foldLeft(false.B)(_ || _)
+  io.itc_hit_event   := components.map(_.io.itc_hit_event).foldLeft(false.B)(_ || _)
 
   var update_meta = io.update.bits.meta
   for (c <- components.reverse) {
