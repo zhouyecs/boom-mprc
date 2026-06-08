@@ -330,6 +330,11 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // SNIP ITC observer events (frontend → core)
   val itc_total_event = Input(Bool())
   val itc_hit_event   = Input(Bool())
+  // SNIP predict-side observer (Stage 4a)
+  val pred_taken_event           = Input(Bool())
+  val pred_pool_nonempty_event   = Input(Bool())
+  val pred_target_in_pool_event  = Input(Bool())
+  val pred_pool_saturated_event  = Input(Bool())
 }
 
 /**
@@ -379,6 +384,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   // SNIP ITC observer passthrough
   io.cpu.itc_total_event := bpd.io.itc_total_event
   io.cpu.itc_hit_event   := bpd.io.itc_hit_event
+  io.cpu.pred_taken_event          := bpd.io.pred_taken_event
+  io.cpu.pred_pool_nonempty_event  := bpd.io.pred_pool_nonempty_event
+  io.cpu.pred_target_in_pool_event := bpd.io.pred_target_in_pool_event
+  io.cpu.pred_pool_saturated_event := bpd.io.pred_pool_saturated_event
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache

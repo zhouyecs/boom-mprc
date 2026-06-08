@@ -168,12 +168,21 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     // SNIP ITC observer events (driven false by default, overridden by SNIP bank)
     val itc_total_event = Output(Bool())
     val itc_hit_event   = Output(Bool())
+    // SNIP predict-side observer (Stage 4a)
+    val pred_taken_event           = Output(Bool())
+    val pred_pool_nonempty_event   = Output(Bool())
+    val pred_target_in_pool_event  = Output(Bool())
+    val pred_pool_saturated_event  = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
   io.f3_meta := 0.U
   io.itc_total_event := false.B
   io.itc_hit_event   := false.B
+  io.pred_taken_event          := false.B
+  io.pred_pool_nonempty_event  := false.B
+  io.pred_target_in_pool_event := false.B
+  io.pred_pool_saturated_event := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -235,6 +244,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // SNIP ITC observer (always-present, driven false when BoomSnipKey=false)
     val itc_total_event = Output(Bool())
     val itc_hit_event   = Output(Bool())
+    // SNIP predict-side observer (Stage 4a)
+    val pred_taken_event           = Output(Bool())
+    val pred_pool_nonempty_event   = Output(Bool())
+    val pred_target_in_pool_event  = Output(Bool())
+    val pred_pool_saturated_event  = Output(Bool())
   })
 
   var total_memsize = 0
@@ -254,6 +268,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   // Wire SNIP ITC observer events to IO (aggregated from all composed banks)
   io.itc_total_event := banked_predictors.map(_.io.itc_total_event).foldLeft(false.B)(_ || _)
   io.itc_hit_event   := banked_predictors.map(_.io.itc_hit_event).foldLeft(false.B)(_ || _)
+  io.pred_taken_event          := banked_predictors.map(_.io.pred_taken_event).foldLeft(false.B)(_ || _)
+  io.pred_pool_nonempty_event  := banked_predictors.map(_.io.pred_pool_nonempty_event).foldLeft(false.B)(_ || _)
+  io.pred_target_in_pool_event := banked_predictors.map(_.io.pred_target_in_pool_event).foldLeft(false.B)(_ || _)
+  io.pred_pool_saturated_event := banked_predictors.map(_.io.pred_pool_saturated_event).foldLeft(false.B)(_ || _)
 
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 

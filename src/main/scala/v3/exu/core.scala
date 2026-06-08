@@ -582,6 +582,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // SNIP ITC observer
     event_counters.io.event_signals(32) := io.ifu.itc_total_event.asUInt
     event_counters.io.event_signals(33) := io.ifu.itc_hit_event.asUInt
+    // SNIP predict-side observer (Stage 4a)
+    event_counters.io.event_signals(34) := io.ifu.pred_taken_event.asUInt
+    event_counters.io.event_signals(35) := io.ifu.pred_pool_nonempty_event.asUInt
+    event_counters.io.event_signals(36) := io.ifu.pred_target_in_pool_event.asUInt
+    event_counters.io.event_signals(37) := io.ifu.pred_pool_saturated_event.asUInt
   }
 
   //-------------------------------------------------------------
