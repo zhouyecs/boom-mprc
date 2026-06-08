@@ -587,6 +587,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(35) := io.ifu.pred_pool_nonempty_event.asUInt
     event_counters.io.event_signals(36) := io.ifu.pred_target_in_pool_event.asUInt
     event_counters.io.event_signals(37) := io.ifu.pred_pool_saturated_event.asUInt
+    // SNIP fingerprint observer (Stage 4b)
+    event_counters.io.event_signals(38) := io.ifu.fp_computed_event.asUInt
+    event_counters.io.event_signals(39) := io.ifu.fp_nonzero_event.asUInt
   }
 
   //-------------------------------------------------------------

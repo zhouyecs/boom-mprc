@@ -173,6 +173,9 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val pred_pool_nonempty_event   = Output(Bool())
     val pred_target_in_pool_event  = Output(Bool())
     val pred_pool_saturated_event  = Output(Bool())
+    // SNIP fingerprint observer (Stage 4b)
+    val fp_computed_event = Output(Bool())
+    val fp_nonzero_event  = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
@@ -183,6 +186,8 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   io.pred_pool_nonempty_event  := false.B
   io.pred_target_in_pool_event := false.B
   io.pred_pool_saturated_event := false.B
+  io.fp_computed_event := false.B
+  io.fp_nonzero_event  := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -249,6 +254,9 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val pred_pool_nonempty_event   = Output(Bool())
     val pred_target_in_pool_event  = Output(Bool())
     val pred_pool_saturated_event  = Output(Bool())
+    // SNIP fingerprint observer (Stage 4b)
+    val fp_computed_event = Output(Bool())
+    val fp_nonzero_event  = Output(Bool())
   })
 
   var total_memsize = 0
@@ -272,6 +280,8 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.pred_pool_nonempty_event  := banked_predictors.map(_.io.pred_pool_nonempty_event).foldLeft(false.B)(_ || _)
   io.pred_target_in_pool_event := banked_predictors.map(_.io.pred_target_in_pool_event).foldLeft(false.B)(_ || _)
   io.pred_pool_saturated_event := banked_predictors.map(_.io.pred_pool_saturated_event).foldLeft(false.B)(_ || _)
+  io.fp_computed_event := banked_predictors.map(_.io.fp_computed_event).foldLeft(false.B)(_ || _)
+  io.fp_nonzero_event  := banked_predictors.map(_.io.fp_nonzero_event).foldLeft(false.B)(_ || _)
 
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 

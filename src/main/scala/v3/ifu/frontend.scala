@@ -335,6 +335,9 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val pred_pool_nonempty_event   = Input(Bool())
   val pred_target_in_pool_event  = Input(Bool())
   val pred_pool_saturated_event  = Input(Bool())
+  // SNIP fingerprint observer (Stage 4b)
+  val fp_computed_event = Input(Bool())
+  val fp_nonzero_event  = Input(Bool())
 }
 
 /**
@@ -388,6 +391,8 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.pred_pool_nonempty_event  := bpd.io.pred_pool_nonempty_event
   io.cpu.pred_target_in_pool_event := bpd.io.pred_target_in_pool_event
   io.cpu.pred_pool_saturated_event := bpd.io.pred_pool_saturated_event
+  io.cpu.fp_computed_event := bpd.io.fp_computed_event
+  io.cpu.fp_nonzero_event  := bpd.io.fp_nonzero_event
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache
