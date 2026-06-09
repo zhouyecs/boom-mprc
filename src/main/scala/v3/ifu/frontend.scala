@@ -344,6 +344,11 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   // SNIP Hamming observer (4c-obs)
   val tr_ham_le2 = Input(Bool())
   val tr_ham_le4 = Input(Bool())
+  // SNIP accuracy/confidence observer (4d)
+  val snip_has_cand_event     = Input(Bool())
+  val snip_pick_match_event   = Input(Bool())
+  val snip_min_ham_le2_event  = Input(Bool())
+  val snip_min_ham_le4_event  = Input(Bool())
 }
 
 /**
@@ -403,6 +408,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.tr_exact_event := bpd.io.tr_exact_event
   io.cpu.tr_ham_le2 := bpd.io.tr_ham_le2
   io.cpu.tr_ham_le4 := bpd.io.tr_ham_le4
+  io.cpu.snip_has_cand_event     := bpd.io.snip_has_cand_event
+  io.cpu.snip_pick_match_event   := bpd.io.snip_pick_match_event
+  io.cpu.snip_min_ham_le2_event  := bpd.io.snip_min_ham_le2_event
+  io.cpu.snip_min_ham_le4_event  := bpd.io.snip_min_ham_le4_event
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache

@@ -39,7 +39,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val fp_untrained = ((1 << F) - 1).U(F.W)
 
-  override val metaSz = 15  // carry predict fingerprint in f3_meta (TAGE pattern)
+  override val metaSz = 35  // valid(1) + min_ham(4) + sig(15) + fingerprint(15)
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 1))) ++
@@ -96,9 +96,6 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val s3_sum = RegNext(s2_sum)
   val s3_fingerprint = VecInit(s3_sum.map(s => (s >= 0.S).asUInt)).asUInt
-
-  // Carry predict fingerprint through f3_meta (TAGE pattern)
-  io.f3_meta := s3_fingerprint
 
   // ── Commit-side Training RMW ────────────────────────────────────────────────
   val u        = io.update.bits
@@ -175,6 +172,18 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_ham = PopCount(tr_xor)
   io.tr_ham_le2 := tr_b_fire && (tr_ham <= 2.U)
   io.tr_ham_le4 := tr_b_fire && (tr_ham <= 4.U)
+
+  // 4d meta unpack + accuracy/confidence observer (commit-side)
+  // Layout: meta(34)=valid, meta(33,30)=min_ham, meta(29,15)=sig, meta(14,0)=fingerprint(4c)
+  val carried_snip_valid = RegNext(io.update.bits.meta(34))
+  val carried_min_ham    = RegNext(io.update.bits.meta(33, 30))
+  val carried_sig        = RegNext(io.update.bits.meta(29, 15))
+  val actual_sig         = RegNext(u.target(F - 1, 0))
+
+  io.snip_has_cand_event     := tr_b_fire && carried_snip_valid
+  io.snip_pick_match_event   := tr_b_fire && carried_snip_valid && (carried_sig === actual_sig)
+  io.snip_min_ham_le2_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 2.U)
+  io.snip_min_ham_le4_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 4.U)
 
   // Shared set-index hash
   def itcSet(pc: UInt): UInt = fetchIdx(pc)(log2Ceil(itc_nSets) - 1, 0)
@@ -253,6 +262,39 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Fingerprint observer
   io.fp_computed_event := s3_valid && s3_has_taken
   io.fp_nonzero_event  := s3_valid && s3_has_taken && (s3_fingerprint =/= fp_untrained)
+
+  // ── Hamming-match + min-select (s3) ────────────────────────────────────────
+  val s3_taken_slot = PriorityEncoder(s3_taken_mask)
+  val s3_pool = VecInit((0 until itc_nWays).map(w => s3_pred_rows(w)(s3_taken_slot)))
+  val cand_fp    = VecInit(s3_pool.map(e => extractFp(e.target)))
+  val cand_valid = VecInit(s3_pool.map(e => e.valid))
+
+  val ham = VecInit((0 until itc_nWays).map { w =>
+    PopCount((s3_fingerprint ^ cand_fp(w)).asUInt)  // 4 bits, 0..15
+  })
+  // Key: top bit = !valid (invalid sorts above all valid), lower bits = ham
+  val key = VecInit((0 until itc_nWays).map { w =>
+    Cat(!cand_valid(w), ham(w))  // 5-bit key
+  })
+
+  // Pairwise min-select (8-way) on key, tie-break lower way
+  val k0 = Mux(key(0) <= key(1), 0.U, 1.U)
+  val k1 = Mux(key(2) <= key(3), 2.U, 3.U)
+  val k2 = Mux(key(4) <= key(5), 4.U, 5.U)
+  val k3 = Mux(key(6) <= key(7), 6.U, 7.U)
+  val k01 = Mux(key(k0) <= key(k1), k0, k1)
+  val k23 = Mux(key(k2) <= key(k3), k2, k3)
+  val snip_sel = Mux(key(k01) <= key(k23), k01, k23)
+
+  val snip_valid   = cand_valid.asUInt.orR
+  val snip_target  = s3_pool(snip_sel).target
+  val snip_sig     = snip_target(F - 1, 0)
+  val snip_min_ham = ham(snip_sel)  // 4 bits, fits metaSz=35
+
+  // Carry predict fingerprint + snip fields through f3_meta (TAGE pattern)
+  // Layout [34:0]: valid(1) | min_ham(4) | sig(15) | fingerprint(15)
+  // fingerprint at LSB [14:0] preserves 4c's tr_b_fp = meta(14,0)
+  io.f3_meta := Cat(snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
   val s3_slot_nonempty = VecInit((0 until bankWidth).map { w =>
     val col_w = s3_pred_rows.map(r => r(w))

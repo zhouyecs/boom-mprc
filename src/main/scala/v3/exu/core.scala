@@ -596,6 +596,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     // SNIP Hamming observer (4c-obs)
     event_counters.io.event_signals(42) := io.ifu.tr_ham_le2.asUInt
     event_counters.io.event_signals(43) := io.ifu.tr_ham_le4.asUInt
+    // SNIP accuracy/confidence observer (4d)
+    event_counters.io.event_signals(44) := io.ifu.snip_has_cand_event.asUInt
+    event_counters.io.event_signals(45) := io.ifu.snip_pick_match_event.asUInt
+    event_counters.io.event_signals(46) := io.ifu.snip_min_ham_le2_event.asUInt
+    event_counters.io.event_signals(47) := io.ifu.snip_min_ham_le4_event.asUInt
   }
 
   //-------------------------------------------------------------
