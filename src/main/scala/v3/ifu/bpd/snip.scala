@@ -22,7 +22,6 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
 
   val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets, Vec(bankWidth, new ITCEntry)) }
-  val itc_tr = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets, Vec(bankWidth, new ITCEntry)) }
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
   val F = 15
@@ -36,9 +35,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val coeffs = VecInit(Seq(68, 56, 48, 37, 31, 24, 17, 17).map(_.S(8.W)))
 
   val weights = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(5.W))))
-  val weights_tr = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(5.W))))
   val biasMem = SyncReadMem(nbias, Vec(F, SInt(5.W)))
-  val biasMem_tr = SyncReadMem(nbias, Vec(F, SInt(5.W)))
 
   val fp_untrained = ((1 << F) - 1).U(F.W)
 
@@ -46,11 +43,8 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 1))) ++
-    Seq.tabulate(itc_nWays)(w => (s"snip_itc_tr_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 1))) ++
-    Seq.tabulate(Tbl)(t => (s"snip_weight$t", E, F * 5)) ++
-    Seq.tabulate(Tbl)(t => (s"snip_weight_tr$t", E, F * 5)) :+
-    ("snip_bias", nbias, F * 5) :+
-    ("snip_bias_tr", nbias, F * 5)
+    Seq.tabulate(Tbl)(t => (s"snip_weight$t", E, F * 5)) :+
+    ("snip_bias", nbias, F * 5)
 
   // Index helpers
   def foldHist(hist: UInt, len: Int): UInt = {
@@ -110,8 +104,8 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Issue reads at tr_fire (commit cycle, data 1 cycle later — same as ITC rd_rows)
   def tblIdxUpd(t: Int): UInt = tblIdx(u.pc, io.update.bits.ghist, t)
-  val tr_rd      = VecInit((0 until Tbl).map(t => weights_tr(t).read(tblIdxUpd(t), tr_fire)))
-  val tr_bias_rd = biasMem_tr.read(fetchIdx(u.pc)(log2Ceil(nbias) - 1, 0), tr_fire)
+  val tr_rd      = VecInit((0 until Tbl).map(t => weights(t).read(tblIdxUpd(t), tr_fire)))
+  val tr_bias_rd = biasMem.read(fetchIdx(u.pc)(log2Ceil(nbias) - 1, 0), tr_fire)
 
   // 1 cycle later: read data available (tr_rd/tr_bias_rd used DIRECTLY, no RegNext — ITC pattern)
   val tr_b_fire      = RegNext(tr_fire, false.B)
@@ -161,13 +155,13 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val wr_en   = init_wr || (tr_b_fire && tr_any_we)
     val wr_idx  = Mux(init_wr, wt_init_idx(log2Ceil(E)-1, 0), tr_b_idx(t))
     val wr_data = Mux(init_wr, initRow, tr_updated_wt(t))
-    when (wr_en) { weights(t).write(wr_idx, wr_data); weights_tr(t).write(wr_idx, wr_data) }
+    when (wr_en) { weights(t).write(wr_idx, wr_data) }
   }
   val bias_init = !wt_init_done
   val bwr_en    = bias_init || (tr_b_fire && tr_any_we)
   val bwr_idx   = Mux(bias_init, wt_init_idx, tr_b_bias_idx)
   val bwr_data  = Mux(bias_init, initRow, tr_updated_bias)
-  when (bwr_en) { biasMem.write(bwr_idx, bwr_data); biasMem_tr.write(bwr_idx, bwr_data) }
+  when (bwr_en) { biasMem.write(bwr_idx, bwr_data) }
 
   // Convergence observer
   io.tr_event       := tr_b_fire
@@ -200,7 +194,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val upd_idx  = itcSet(u.pc)
   val upd_col  = u.cfi_idx.bits
 
-  val rd_rows = VecInit(itc_tr.map(_.read(upd_idx, upd_fire)))
+  val rd_rows = VecInit(itc.map(_.read(upd_idx, upd_fire)))
 
   val b_fire   = RegNext(upd_fire, false.B)
   val b_idx    = RegNext(upd_idx)
@@ -253,7 +247,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val addr = Mux(init_done, b_idx,       init_idx)
     val data = Mux(init_done, commit_row,  init_data)
     val mask = Mux(init_done, commit_mask, init_mask)
-    when (we) { itc(w).write(addr, data, mask); itc_tr(w).write(addr, data, mask) }
+    when (we) { itc(w).write(addr, data, mask) }
   }
 
   // ── Predict-side ITC Read (Observer) ──────────────────────────────────────
