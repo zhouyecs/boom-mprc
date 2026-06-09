@@ -264,8 +264,15 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.fp_nonzero_event  := s3_valid && s3_has_taken && (s3_fingerprint =/= fp_untrained)
 
   // ── Hamming-match + min-select (s3) ────────────────────────────────────────
-  val s3_taken_slot = PriorityEncoder(s3_taken_mask)
-  val s3_pool = VecInit((0 until itc_nWays).map(w => s3_pred_rows(w)(s3_taken_slot)))
+  // JALR proxy: is_jal && taken. No per-slot is_jalr at predict (BTB stores only
+  // is_br; is_jal = !is_br conflates JAL+JALR). Direct JALs have empty ITC columns
+  // (never populated by the commit gate), so snip_valid stays false for them.
+  val s3_jalr_mask = VecInit((0 until bankWidth).map(w =>
+    s3_resp(w).is_jal && s3_resp(w).taken))
+  val s3_has_jalr  = s3_jalr_mask.asUInt.orR
+  val snip_col     = PriorityEncoder(s3_jalr_mask)
+
+  val s3_pool = VecInit((0 until itc_nWays).map(w => s3_pred_rows(w)(snip_col)))
   val cand_fp    = VecInit(s3_pool.map(e => extractFp(e.target)))
   val cand_valid = VecInit(s3_pool.map(e => e.valid))
 
@@ -286,7 +293,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val k23 = Mux(key(k2) <= key(k3), k2, k3)
   val snip_sel = Mux(key(k01) <= key(k23), k01, k23)
 
-  val snip_valid   = cand_valid.asUInt.orR
+  val snip_valid   = cand_valid.asUInt.orR && s3_has_jalr
   val snip_target  = s3_pool(snip_sel).target
   val snip_sig     = snip_target(F - 1, 0)
   val snip_min_ham = ham(snip_sel)  // 4 bits, fits metaSz=35
