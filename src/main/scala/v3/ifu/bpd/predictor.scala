@@ -176,6 +176,12 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     // SNIP fingerprint observer (Stage 4b)
     val fp_computed_event = Output(Bool())
     val fp_nonzero_event  = Output(Bool())
+    // SNIP training observer (Stage 4c)
+    val tr_event       = Output(Bool())
+    val tr_exact_event = Output(Bool())
+    // SNIP Hamming observer (4c-obs)
+    val tr_ham_le2 = Output(Bool())
+    val tr_ham_le4 = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
@@ -188,6 +194,10 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   io.pred_pool_saturated_event := false.B
   io.fp_computed_event := false.B
   io.fp_nonzero_event  := false.B
+  io.tr_event       := false.B
+  io.tr_exact_event := false.B
+  io.tr_ham_le2 := false.B
+  io.tr_ham_le4 := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -257,6 +267,12 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     // SNIP fingerprint observer (Stage 4b)
     val fp_computed_event = Output(Bool())
     val fp_nonzero_event  = Output(Bool())
+    // SNIP training observer (Stage 4c)
+    val tr_event       = Output(Bool())
+    val tr_exact_event = Output(Bool())
+    // SNIP Hamming observer (4c-obs)
+    val tr_ham_le2 = Output(Bool())
+    val tr_ham_le4 = Output(Bool())
   })
 
   var total_memsize = 0
@@ -282,6 +298,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.pred_pool_saturated_event := banked_predictors.map(_.io.pred_pool_saturated_event).foldLeft(false.B)(_ || _)
   io.fp_computed_event := banked_predictors.map(_.io.fp_computed_event).foldLeft(false.B)(_ || _)
   io.fp_nonzero_event  := banked_predictors.map(_.io.fp_nonzero_event).foldLeft(false.B)(_ || _)
+  io.tr_event       := banked_predictors.map(_.io.tr_event).foldLeft(false.B)(_ || _)
+  io.tr_exact_event := banked_predictors.map(_.io.tr_exact_event).foldLeft(false.B)(_ || _)
+  io.tr_ham_le2 := banked_predictors.map(_.io.tr_ham_le2).foldLeft(false.B)(_ || _)
+  io.tr_ham_le4 := banked_predictors.map(_.io.tr_ham_le4).foldLeft(false.B)(_ || _)
 
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 

@@ -611,7 +611,7 @@ class WithTAGEBPD extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
       // tage 56, fau btb 8, bim 8, btb 1, meta size 共 73
-      bpdMaxMetaLength = if (site(BoomLoopKey)) 120 else 80,
+      bpdMaxMetaLength = if (site(BoomLoopKey)) 256 else 256,
       globalHistoryLength = 64,
       localHistoryLength = 1,
       localHistoryNSets = 0,
