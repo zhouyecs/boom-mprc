@@ -39,7 +39,21 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val fp_untrained = ((1 << F) - 1).U(F.W)
 
-  override val metaSz = 110 // bias(75) + valid(1) + min_ham(4) + sig(15) + fingerprint(15)
+  // ── Meta layout constants (LSB-first) ─────────────────────────────────────
+  // [W_FP-1:0] fp (15) | [W_SIG+W_FP-1:W_FP] sig (15) |
+  // [W_HAM+W_SIG+W_FP-1:W_SIG+W_FP] min_ham (4) |
+  // [W_BASE-1:W_HAM+W_SIG+W_FP] valid (1) → W_BASE = 35
+  val W_FP = F; val W_SIG = F; val W_HAM = 4; val W_VALID = 1
+  val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
+  val W_BIAS  = F * 5                              // 75
+  val W_WT    = Tbl * F * 5                        // 600
+  val W_ITC_ENTRY = 2 + vaddrBitsExtended   // valid(1) + target + nru(1)
+  val W_POOL  = itc_nWays * W_ITC_ENTRY
+  val offBias = W_BASE                             // 35
+  val offWt   = offBias + W_BIAS                   // 110
+  val offPool = offWt   + W_WT                     // 710
+
+  override val metaSz = offPool + W_POOL // pool + wt + bias + valid+min_ham+sig+fp
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 1))) ++
@@ -96,6 +110,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val s3_sum = RegNext(s2_sum)
   val s3_bia = RegNext(s2_bia)
+  val s3_wt  = RegNext(s2_wt)
   val s3_fingerprint = VecInit(s3_sum.map(s => (s >= 0.S).asUInt)).asUInt
 
   // ── Commit-side Training RMW ────────────────────────────────────────────────
@@ -103,16 +118,16 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_fire  = io.update.valid && u.is_commit_update &&
                  u.cfi_is_jalr && !u.cfi_is_ret && u.cfi_taken && u.cfi_idx.valid
 
-  // Issue reads at tr_fire (commit cycle, data 1 cycle later — same as ITC rd_rows)
+  // commit-side reads DROPPED — weights + ITC carried in meta (TAGE pattern)
   def tblIdxUpd(t: Int): UInt = tblIdx(u.pc, io.update.bits.ghist, t)
-  val tr_rd      = VecInit((0 until Tbl).map(t => weights(t).read(tblIdxUpd(t), tr_fire)))
-  // bias commit read DROPPED — carried in meta (TAGE pattern). Unpack @ tr_b_fire.
 
-  // 1 cycle later: read data available (tr_rd used DIRECTLY, no RegNext — ITC pattern)
+  // 1 cycle later: unpack carried snapshots
   val tr_b_fire      = RegNext(tr_fire, false.B)
   val tr_b_target    = RegNext(u.target)
-  val tr_b_fp        = RegNext(io.update.bits.meta(F - 1, 0))  // carried predict fingerprint
-  val tr_carried_bia = RegNext(io.update.bits.meta(109, 35)).asTypeOf(Vec(F, SInt(5.W)))
+  val tr_b_fp        = RegNext(io.update.bits.meta(F - 1, 0))
+  val tr_carried_bia = RegNext(io.update.bits.meta(offBias + W_BIAS - 1, offBias)).asTypeOf(Vec(F, SInt(5.W)))
+  val tr_carried_wt  = RegNext(io.update.bits.meta(offWt   + W_WT   - 1, offWt  )).asTypeOf(Vec(Tbl, Vec(F, SInt(5.W))))
+  val tr_carried_pool= RegNext(io.update.bits.meta(offPool + W_POOL - 1, offPool)).asTypeOf(Vec(itc_nWays, new ITCEntry))
   val tr_b_idx       = RegInit(VecInit(Seq.fill(Tbl)(0.U(log2Ceil(E).W))))
   val tr_b_bias_idx  = RegInit(0.U(log2Ceil(nbias).W))
   when (tr_fire) {
@@ -125,14 +140,14 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Per-bit train_we and updated rows (combinational, computed at tr_b_fire)
   // TRAINING-SIDE sum_w formula (must be bit-identical to predict-side s2_sum above):
-  //   sum_w = Σ_t (tr_rd(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
+  //   sum_w = Σ_t (tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
   val tr_we = Wire(Vec(F, Bool()))
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
 
   for (w <- 0 until F) {
     val sum_w = (0 until Tbl).map { t =>
-      (tr_rd(t)(w) * coeffs(t)).asSInt
+      (tr_carried_wt(t)(w) * coeffs(t)).asSInt
     }.reduce(_ + _) + (tr_carried_bia(w) * coeffBias.S).asSInt
     val pred_bit   = (sum_w >= 0.S).asUInt
     val target_bit = tr_actual_fp(w)
@@ -140,7 +155,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
     for (t <- 0 until Tbl) {
       val delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-      val raw   = Mux(tr_we(w), tr_rd(t)(w) + delta, tr_rd(t)(w))
+      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) + delta, tr_carried_wt(t)(w))
       tr_updated_wt(t)(w) := Mux(raw > 15.S, 15.S, Mux(raw < -16.S, -16.S, raw))
     }
     val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
@@ -196,13 +211,13 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val upd_idx  = itcSet(u.pc)
   val upd_col  = u.cfi_idx.bits
 
-  val rd_rows = VecInit(itc.map(_.read(upd_idx, upd_fire)))
+  // ITC commit read DROPPED — carried in meta (TAGE pattern). Unpacked as tr_carried_pool.
 
   val b_fire   = RegNext(upd_fire, false.B)
   val b_idx    = RegNext(upd_idx)
   val b_col    = RegNext(upd_col)
   val b_target = RegNext(u.target)
-  val b_ways   = VecInit(rd_rows.map(r => r(b_col)))
+  val b_ways   = tr_carried_pool
 
   val b_hit_oh = VecInit(b_ways.map(w => w.valid && w.target === b_target))
   val b_hit    = b_hit_oh.asUInt.orR
@@ -300,9 +315,10 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val snip_sig     = snip_target(F - 1, 0)
   val snip_min_ham = ham(snip_sel)
 
-  // Carry predict bias + fingerprint + snip fields through f3_meta (TAGE pattern)
-  // Layout [109:35]: bias(75) | [34:0]: valid|min_ham|sig|fingerprint as before
-  io.f3_meta := Cat(s3_bia.asUInt, snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
+  // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
+  // Layout: pool | wt | bias | valid|min_ham|sig|fingerprint
+  io.f3_meta := Cat(s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
+                    snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
   val s3_slot_nonempty = VecInit((0 until bankWidth).map { w =>
     val col_w = s3_pred_rows.map(r => r(w))
