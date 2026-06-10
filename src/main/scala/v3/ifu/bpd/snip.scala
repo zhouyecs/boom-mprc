@@ -39,7 +39,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val fp_untrained = ((1 << F) - 1).U(F.W)
 
-  override val metaSz = 35  // valid(1) + min_ham(4) + sig(15) + fingerprint(15)
+  override val metaSz = 110 // bias(75) + valid(1) + min_ham(4) + sig(15) + fingerprint(15)
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 1))) ++
@@ -95,6 +95,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   })
 
   val s3_sum = RegNext(s2_sum)
+  val s3_bia = RegNext(s2_bia)
   val s3_fingerprint = VecInit(s3_sum.map(s => (s >= 0.S).asUInt)).asUInt
 
   // ── Commit-side Training RMW ────────────────────────────────────────────────
@@ -105,12 +106,13 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Issue reads at tr_fire (commit cycle, data 1 cycle later — same as ITC rd_rows)
   def tblIdxUpd(t: Int): UInt = tblIdx(u.pc, io.update.bits.ghist, t)
   val tr_rd      = VecInit((0 until Tbl).map(t => weights(t).read(tblIdxUpd(t), tr_fire)))
-  val tr_bias_rd = biasMem.read(fetchIdx(u.pc)(log2Ceil(nbias) - 1, 0), tr_fire)
+  // bias commit read DROPPED — carried in meta (TAGE pattern). Unpack @ tr_b_fire.
 
-  // 1 cycle later: read data available (tr_rd/tr_bias_rd used DIRECTLY, no RegNext — ITC pattern)
+  // 1 cycle later: read data available (tr_rd used DIRECTLY, no RegNext — ITC pattern)
   val tr_b_fire      = RegNext(tr_fire, false.B)
   val tr_b_target    = RegNext(u.target)
   val tr_b_fp        = RegNext(io.update.bits.meta(F - 1, 0))  // carried predict fingerprint
+  val tr_carried_bia = RegNext(io.update.bits.meta(109, 35)).asTypeOf(Vec(F, SInt(5.W)))
   val tr_b_idx       = RegInit(VecInit(Seq.fill(Tbl)(0.U(log2Ceil(E).W))))
   val tr_b_bias_idx  = RegInit(0.U(log2Ceil(nbias).W))
   when (tr_fire) {
@@ -123,7 +125,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Per-bit train_we and updated rows (combinational, computed at tr_b_fire)
   // TRAINING-SIDE sum_w formula (must be bit-identical to predict-side s2_sum above):
-  //   sum_w = Σ_t (tr_rd(t)(w) * coeffs(t)) + (tr_bias_rd(w) * coeffBias)
+  //   sum_w = Σ_t (tr_rd(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
   val tr_we = Wire(Vec(F, Bool()))
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
@@ -131,7 +133,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   for (w <- 0 until F) {
     val sum_w = (0 until Tbl).map { t =>
       (tr_rd(t)(w) * coeffs(t)).asSInt
-    }.reduce(_ + _) + (tr_bias_rd(w) * coeffBias.S).asSInt
+    }.reduce(_ + _) + (tr_carried_bia(w) * coeffBias.S).asSInt
     val pred_bit   = (sum_w >= 0.S).asUInt
     val target_bit = tr_actual_fp(w)
     tr_we(w) := (pred_bit =/= target_bit)
@@ -142,7 +144,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       tr_updated_wt(t)(w) := Mux(raw > 15.S, 15.S, Mux(raw < -16.S, -16.S, raw))
     }
     val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-    val b_raw   = Mux(tr_we(w), tr_bias_rd(w) + b_delta, tr_bias_rd(w))
+    val b_raw   = Mux(tr_we(w), tr_carried_bia(w) + b_delta, tr_carried_bia(w))
     tr_updated_bias(w) := Mux(b_raw > 15.S, 15.S, Mux(b_raw < -16.S, -16.S, b_raw))
   }
 
@@ -296,12 +298,11 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val snip_valid   = cand_valid.asUInt.orR && s3_has_jalr
   val snip_target  = s3_pool(snip_sel).target
   val snip_sig     = snip_target(F - 1, 0)
-  val snip_min_ham = ham(snip_sel)  // 4 bits, fits metaSz=35
+  val snip_min_ham = ham(snip_sel)
 
-  // Carry predict fingerprint + snip fields through f3_meta (TAGE pattern)
-  // Layout [34:0]: valid(1) | min_ham(4) | sig(15) | fingerprint(15)
-  // fingerprint at LSB [14:0] preserves 4c's tr_b_fp = meta(14,0)
-  io.f3_meta := Cat(snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
+  // Carry predict bias + fingerprint + snip fields through f3_meta (TAGE pattern)
+  // Layout [109:35]: bias(75) | [34:0]: valid|min_ham|sig|fingerprint as before
+  io.f3_meta := Cat(s3_bia.asUInt, snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
   val s3_slot_nonempty = VecInit((0 until bankWidth).map { w =>
     val col_w = s3_pred_rows.map(r => r(w))
