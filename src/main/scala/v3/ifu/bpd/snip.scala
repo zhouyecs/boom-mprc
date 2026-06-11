@@ -14,6 +14,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   def itc_nSets = p(BoomSnipITCSets)
   def itc_nWays = p(BoomSnipITCWays)
+  def override_thresh = p(BoomSnipOverrideThresh)
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
@@ -326,6 +327,13 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Layout: pool | wt | bias | valid|min_ham|sig|fingerprint
   io.f3_meta := Cat(s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
                     snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
+
+  // F3 target override: correct predicted_pc when confident (first active change)
+  val snip_override = snip_valid && (snip_min_ham <= override_thresh.U)
+  when (snip_override) {
+    io.resp.f3(snip_col).predicted_pc.valid := true.B
+    io.resp.f3(snip_col).predicted_pc.bits  := snip_target
+  }
 
   val s3_slot_nonempty = VecInit((0 until bankWidth).map { w =>
     val col_w = s3_pred_rows.map(r => r(w))

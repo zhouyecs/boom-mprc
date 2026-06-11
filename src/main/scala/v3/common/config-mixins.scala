@@ -59,6 +59,7 @@ case object BoomSnipKey extends Field[Boolean](false)
 
 case object BoomSnipITCSets extends Field[Int](256)
 case object BoomSnipITCWays extends Field[Int](8)
+case object BoomSnipOverrideThresh extends Field[Int](2)
 
 class WithSnip extends Config((site, here, up) => {
   case BoomSnipKey => true
@@ -67,6 +68,7 @@ class WithSnip extends Config((site, here, up) => {
 class WithSnipSmallITC extends Config((site, here, up) => {
   case BoomSnipITCSets => 64
   case BoomSnipITCWays => 4
+  case BoomSnipOverrideThresh => 2
 })
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
