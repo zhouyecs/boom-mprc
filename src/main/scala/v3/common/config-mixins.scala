@@ -66,7 +66,7 @@ class WithSnip extends Config((site, here, up) => {
 
 class WithSnipSmallITC extends Config((site, here, up) => {
   case BoomSnipITCSets => 64
-  case BoomSnipITCWays => 8
+  case BoomSnipITCWays => 4
 })
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
