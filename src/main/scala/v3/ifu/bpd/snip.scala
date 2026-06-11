@@ -21,10 +21,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val nru    = Bool()
   }
 
-  // Per-(way,column) split: full-entry write (no mask) → BRAM-compatible
-  val itc = Seq.tabulate(itc_nWays, bankWidth) { (w, c) =>
-    SyncReadMem(itc_nSets, new ITCEntry)
-  }
+  val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets, Vec(bankWidth, new ITCEntry)) }
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
   val F = 15
@@ -59,9 +56,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   override val metaSz = offPool + W_POOL // pool + wt + bias + valid+min_ham+sig+fp
 
   override val mems =
-    Seq.tabulate(itc_nWays, bankWidth){ (w, c) =>
-      (s"snip_itc_w${w}_c$c", itc_nSets, W_ITC_ENTRY)
-    }.flatten ++
+    Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 1))) ++
     Seq.tabulate(Tbl)(t => (s"snip_weight$t", E, F * 5)) :+
     ("snip_bias", nbias, F * 5)
 
@@ -242,7 +237,10 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val init_zero = {
     val e = Wire(new ITCEntry); e.valid := false.B; e.target := 0.U; e.nru := false.B; e
   }
-  val init_wr = !init_done
+  val init_data = Wire(Vec(bankWidth, new ITCEntry))
+  init_data := DontCare
+  for (c <- 0 until bankWidth) { init_data(c) := init_zero }
+  val init_mask = VecInit(Seq.fill(bankWidth)(true.B))
 
   when (!init_done) {
     init_idx := init_idx + 1.U
@@ -259,19 +257,18 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     e.valid  := true.B
     e.target := Mux(is_victim, b_target, b_ways(w).target)
     e.nru    := !clear_nru
+    val commit_row = Wire(Vec(bankWidth, new ITCEntry)); commit_row := DontCare; commit_row(b_col) := e
+    val commit_mask = VecInit((0 until bankWidth).map(_.U === b_col))
 
-    // Per-column write — only column b_col gets written (no mask needed)
-    for (c <- 0 until bankWidth) {
-      when (init_wr) { itc(w)(c).write(init_idx, init_zero) }
-      .elsewhen (commit_we && (c.U === b_col)) { itc(w)(c).write(b_idx, e) }
-    }
+    val we   = !init_done || commit_we
+    val addr = Mux(init_done, b_idx,       init_idx)
+    val data = Mux(init_done, commit_row,  init_data)
+    val mask = Mux(init_done, commit_mask, init_mask)
+    when (we) { itc(w).write(addr, data, mask) }
   }
 
   // ── Predict-side ITC Read (Observer) ──────────────────────────────────────
-  val predict_idx = itcSet(io.f0_pc)
-  val pred_rows = VecInit((0 until itc_nWays).map { w =>
-    VecInit((0 until bankWidth).map { c => itc(w)(c).read(predict_idx, io.f0_valid) })
-  })
+  val pred_rows = VecInit(itc.map(_.read(itcSet(io.f0_pc), io.f0_valid)))
   val s2_pred_rows = RegNext(pred_rows)
   val s3_pred_rows = RegNext(s2_pred_rows)
 
