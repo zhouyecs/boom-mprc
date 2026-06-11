@@ -12,8 +12,8 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Stage 4b: fingerprint compute datapath (observer-only).
   // Stage 4c: training + f3_meta carry + convergence observer.
 
-  val itc_nSets = 256
-  val itc_nWays = 8
+  def itc_nSets = p(BoomSnipITCSets)
+  def itc_nWays = p(BoomSnipITCWays)
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
