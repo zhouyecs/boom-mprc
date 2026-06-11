@@ -301,14 +301,21 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     Cat(!cand_valid(w), ham(w))  // 5-bit key
   })
 
-  // Pairwise min-select (8-way) on key, tie-break lower way
-  val k0 = Mux(key(0) <= key(1), 0.U, 1.U)
-  val k1 = Mux(key(2) <= key(3), 2.U, 3.U)
-  val k2 = Mux(key(4) <= key(5), 4.U, 5.U)
-  val k3 = Mux(key(6) <= key(7), 6.U, 7.U)
-  val k01 = Mux(key(k0) <= key(k1), k0, k1)
-  val k23 = Mux(key(k2) <= key(k3), k2, k3)
-  val snip_sel = Mux(key(k01) <= key(k23), k01, k23)
+  // Pairwise min-select over itc_nWays ways, tie-break lower way
+  def reduceMin(pairs: Seq[(UInt, UInt)]): (UInt, UInt) = {
+    if (pairs.length == 1) {
+      pairs.head
+    } else {
+      val half = pairs.grouped(2).map { g =>
+        val (a_idx, a_key) = g(0)
+        val (b_idx, b_key) = if (g.length == 2) g(1) else (a_idx, a_key) // pad odd
+        (Mux(b_key <= a_key, b_idx, a_idx), Mux(b_key <= a_key, b_key, a_key))
+      }.toSeq
+      reduceMin(half)
+    }
+  }
+  val (snip_sel, _) = reduceMin((0 until itc_nWays).map(w =>
+    (w.U(log2Ceil(itc_nWays).W), key(w))))
 
   val snip_valid   = cand_valid.asUInt.orR && s3_has_jalr
   val snip_target  = s3_pool(snip_sel).target
