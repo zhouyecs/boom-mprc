@@ -71,6 +71,21 @@ class WithSnipSmallITC extends Config((site, here, up) => {
   case BoomSnipOverrideThresh => 2
 })
 
+// BigITC baseline — PC-indexed BRAM tag-cache (no perceptron)
+case object BoomBigITCKey   extends Field[Boolean](false)
+case object BoomBigITCSets  extends Field[Int](2048)
+case object BoomBigITCWays  extends Field[Int](8)
+case object BoomBigITCTag   extends Field[Int](12)
+
+class WithBigITC extends Config((site, here, up) => {
+  case BoomBigITCKey => true
+})
+
+class WithBigITCFPGA extends Config((site, here, up) => {
+  case BoomBigITCSets => 1024
+  case BoomBigITCWays => 8
+})
+
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(crossingParams = tp.crossingParams.copy(
@@ -648,6 +663,10 @@ class WithTAGEBPD extends Config((site, here, up) => {
             val snip = Module(new SNIPBranchPredictorBank()(p))
             snip.io.resp_in(0) := ras.io.resp
             (preds_with_loop :+ snip, snip.io.resp)
+          } else if (p(BoomBigITCKey)) {
+            val bigitc = Module(new BigITCPredictorBank()(p))
+            bigitc.io.resp_in(0) := ras.io.resp
+            (preds_with_loop :+ bigitc, bigitc.io.resp)
           } else {
             (preds_with_loop, ras.io.resp)
           }
@@ -657,6 +676,10 @@ class WithTAGEBPD extends Config((site, here, up) => {
             val snip = Module(new SNIPBranchPredictorBank()(p))
             snip.io.resp_in(0) := ras.io.resp
             (preds :+ snip, snip.io.resp)
+          } else if (p(BoomBigITCKey)) {
+            val bigitc = Module(new BigITCPredictorBank()(p))
+            bigitc.io.resp_in(0) := ras.io.resp
+            (preds :+ bigitc, bigitc.io.resp)
           } else {
             (preds, ras.io.resp)
           }
