@@ -14,6 +14,7 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
   def bWays   = p(BoomBigITCWays)   // default 8
   def bTagBits = p(BoomBigITCTag)   // default 12
 
+  // BigEntry kept as local Wire type for readability; memory stores flat UInt
   class BigEntry extends Bundle {
     val valid  = Bool()
     val tag    = UInt(bTagBits.W)
@@ -21,14 +22,30 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
     val nru    = Bool()
   }
 
-  // ── ITC memories: bWays parallel SyncReadMem, PC-indexed, full-entry write ──
-  val itc = Seq.fill(bWays) { SyncReadMem(bSets, new BigEntry) }
+  val ENTRY_BITS = 1 + bTagBits + vaddrBitsExtended + 1  // valid + tag + target + nru
+  def packEntry(v: Bool, t: UInt, target: UInt, n: Bool): UInt =
+    Cat(v, t, target, n)
+  def unpackEntry(raw: UInt): (Bool, UInt, UInt, Bool) = {
+    val v      = raw(ENTRY_BITS - 1)
+    val t      = raw(ENTRY_BITS - 2, ENTRY_BITS - 1 - bTagBits)
+    val target = raw(ENTRY_BITS - 1 - bTagBits - 1, 1)
+    val n      = raw(0)
+    (v, t, target, n)
+  }
+  def toWire(raw: UInt): BigEntry = {
+    val w = Wire(new BigEntry)
+    val (v, t, target, n) = unpackEntry(raw)
+    w.valid := v; w.tag := t; w.target := target; w.nru := n
+    w
+  }
 
-  val W_ENTRY = 2 + vaddrBitsExtended + bTagBits  // valid(1) + target + nru(1) + tag
-  override val metaSz = bWays * W_ENTRY + log2Ceil(bSets)
+  // ── ITC memories: bWays parallel SyncReadMem, flat UInt → BRAM ────────────
+  val itc = Seq.fill(bWays) { SyncReadMem(bSets, UInt(ENTRY_BITS.W)) }
+
+  override val metaSz = bWays * ENTRY_BITS + log2Ceil(bSets)
 
   override val mems =
-    Seq.tabulate(bWays)(w => (s"bigitc_way$w", bSets, W_ENTRY))
+    Seq.tabulate(bWays)(w => (s"bigitc_way$w", bSets, ENTRY_BITS))
 
   // PC slicing (mirrors BTB index/tag pattern)
   def setIdx(pc: UInt): UInt = (pc >> log2Ceil(coreInstBytes))(log2Ceil(bSets) - 1, 0)
@@ -36,7 +53,8 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
 
   // ── Predict-side: read at f0, data pipelines to s3 ─────────────────────────
   val s1_read_set = setIdx(io.f0_pc)
-  val s1_ways = VecInit(itc.map(_.read(s1_read_set, io.f0_valid)))
+  val s1_ways_raw = VecInit(itc.map(_.read(s1_read_set, io.f0_valid)))
+  val s1_ways = VecInit(s1_ways_raw.map(toWire))
   val s2_ways = RegNext(s1_ways)
   val s3_ways = RegNext(s2_ways)
   val s3_set  = RegNext(RegNext(s1_read_set))
@@ -80,8 +98,14 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
   val b_set     = RegNext(cm_set)
   val b_tag     = RegNext(cm_tag)
   val b_c_set   = RegNext(io.update.bits.meta(log2Ceil(bSets) - 1, 0))
-  val b_ways    = RegNext(io.update.bits.meta(metaSz - 1, log2Ceil(bSets)))
-                    .asTypeOf(Vec(bWays, new BigEntry))
+  val b_raw     = RegNext(io.update.bits.meta(metaSz - 1, log2Ceil(bSets)))
+  val b_ways    = VecInit((0 until bWays).map { w =>
+    val raw = b_raw(ENTRY_BITS*(w+1) - 1, ENTRY_BITS*w)
+    val ww = Wire(new BigEntry)
+    val (v, t, target, n) = unpackEntry(raw)
+    ww.valid := v; ww.tag := t; ww.target := target; ww.nru := n
+    ww
+  })
 
   val do_upd = b_fire && (b_set === b_c_set)
 
@@ -98,9 +122,7 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
   // ── Init FSM ──────────────────────────────────────────────────────────────
   val init_done = RegInit(false.B)
   val init_idx  = RegInit(0.U(log2Ceil(bSets).W))
-  val init_zero = {
-    val e = Wire(new BigEntry); e.valid := false.B; e.tag := 0.U; e.target := 0.U; e.nru := false.B; e
-  }
+  val init_zero = 0.U(ENTRY_BITS.W)
   val init_wr = !init_done
 
   when (!init_done) {
@@ -123,7 +145,7 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
     when (init_wr) {
       itc(w).write(init_idx, init_zero)
     }.elsewhen (commit_we) {
-      itc(w).write(b_set, e)
+      itc(w).write(b_set, packEntry(e.valid, e.tag, e.target, e.nru))
     }
   }
 
