@@ -10,29 +10,29 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
   // Baseline for equal-storage comparison: reassigns the perceptron BRAM budget
   // (weights+bias, 24 RAMB36) to a large tag-cache.
 
-  def nSets   = p(BoomBigITCSets)   // default 2048
-  def nWays   = p(BoomBigITCWays)   // default 8
-  def tagBits = p(BoomBigITCTag)    // default 12
+  def bSets   = p(BoomBigITCSets)   // default 2048
+  def bWays   = p(BoomBigITCWays)   // default 8
+  def bTagBits = p(BoomBigITCTag)   // default 12
 
   class BigEntry extends Bundle {
     val valid  = Bool()
-    val tag    = UInt(tagBits.W)
+    val tag    = UInt(bTagBits.W)
     val target = UInt(vaddrBitsExtended.W)
     val nru    = Bool()
   }
 
-  // ── ITC memories: nWays parallel SyncReadMem, PC-indexed, full-entry write ──
-  val itc = Seq.fill(nWays) { SyncReadMem(nSets, new BigEntry) }
+  // ── ITC memories: bWays parallel SyncReadMem, PC-indexed, full-entry write ──
+  val itc = Seq.fill(bWays) { SyncReadMem(bSets, new BigEntry) }
 
-  val W_ENTRY = 2 + vaddrBitsExtended + tagBits  // valid(1) + target + nru(1) + tag
-  override val metaSz = nWays * W_ENTRY + log2Ceil(nSets)
+  val W_ENTRY = 2 + vaddrBitsExtended + bTagBits  // valid(1) + target + nru(1) + tag
+  override val metaSz = bWays * W_ENTRY + log2Ceil(bSets)
 
   override val mems =
-    Seq.tabulate(nWays)(w => (s"bigitc_way$w", nSets, W_ENTRY))
+    Seq.tabulate(bWays)(w => (s"bigitc_way$w", bSets, W_ENTRY))
 
   // PC slicing (mirrors BTB index/tag pattern)
-  def setIdx(pc: UInt): UInt = (pc >> log2Ceil(coreInstBytes))(log2Ceil(nSets) - 1, 0)
-  def tagOf(pc: UInt):  UInt = (pc >> (log2Ceil(coreInstBytes) + log2Ceil(nSets)))(tagBits - 1, 0)
+  def setIdx(pc: UInt): UInt = (pc >> log2Ceil(coreInstBytes))(log2Ceil(bSets) - 1, 0)
+  def tagOf(pc: UInt):  UInt = (pc >> (log2Ceil(coreInstBytes) + log2Ceil(bSets)))(bTagBits - 1, 0)
 
   // ── Predict-side: read at f0, data pipelines to s3 ─────────────────────────
   val s1_read_set = setIdx(io.f0_pc)
@@ -64,7 +64,7 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
     io.resp.f3(s3_slot).predicted_pc.bits  := s3_hit_target
   }
 
-  // ── Meta carry: snapshot ways + set index (nWays*W_ENTRY + setBits = metaSz) ──
+  // ── Meta carry: snapshot ways + set index (bWays*W_ENTRY + setBits = metaSz) ──
   io.f3_meta := Cat(s3_ways.asUInt, s3_set)
 
   // ── Commit-side update (meta-carry, no re-read → 1R1W) ──────────────────────
@@ -79,9 +79,9 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
   val b_target  = RegNext(u.target)
   val b_set     = RegNext(cm_set)
   val b_tag     = RegNext(cm_tag)
-  val b_c_set   = RegNext(io.update.bits.meta(log2Ceil(nSets) - 1, 0))
-  val b_ways    = RegNext(io.update.bits.meta(metaSz - 1, log2Ceil(nSets)))
-                    .asTypeOf(Vec(nWays, new BigEntry))
+  val b_c_set   = RegNext(io.update.bits.meta(log2Ceil(bSets) - 1, 0))
+  val b_ways    = RegNext(io.update.bits.meta(metaSz - 1, log2Ceil(bSets)))
+                    .asTypeOf(Vec(bWays, new BigEntry))
 
   val do_upd = b_fire && (b_set === b_c_set)
 
@@ -97,7 +97,7 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
 
   // ── Init FSM ──────────────────────────────────────────────────────────────
   val init_done = RegInit(false.B)
-  val init_idx  = RegInit(0.U(log2Ceil(nSets).W))
+  val init_idx  = RegInit(0.U(log2Ceil(bSets).W))
   val init_zero = {
     val e = Wire(new BigEntry); e.valid := false.B; e.tag := 0.U; e.target := 0.U; e.nru := false.B; e
   }
@@ -105,10 +105,10 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
 
   when (!init_done) {
     init_idx := init_idx + 1.U
-    when (init_idx === (nSets - 1).U) { init_done := true.B }
+    when (init_idx === (bSets - 1).U) { init_done := true.B }
   }
 
-  for (w <- 0 until nWays) {
+  for (w <- 0 until bWays) {
     val is_victim = !b_hit && (w.U === victim)
     val is_hitway = b_hit && b_hit_oh(w)
     val clear_nru = all_used && !is_victim
