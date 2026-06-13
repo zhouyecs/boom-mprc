@@ -86,6 +86,17 @@ class WithBigITCFPGA extends Config((site, here, up) => {
   case BoomBigITCWays => 8
 })
 
+class WithBigITCFPGAS2048W8 extends Config((site, here, up) => {
+  case BoomBigITCSets => 2048
+  case BoomBigITCWays => 8
+  case BoomBigITCTag  => 4
+})
+
+class WithBigITCFPGAS64W4 extends Config((site, here, up) => {
+  case BoomBigITCSets => 64
+  case BoomBigITCWays => 4
+})
+
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(crossingParams = tp.crossingParams.copy(

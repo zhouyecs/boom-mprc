@@ -97,7 +97,6 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
   val b_target  = RegNext(u.target)
   val b_set     = RegNext(cm_set)
   val b_tag     = RegNext(cm_tag)
-  val b_c_set   = RegNext(io.update.bits.meta(log2Ceil(bSets) - 1, 0))
   val b_raw     = RegNext(io.update.bits.meta(metaSz - 1, log2Ceil(bSets)))
   val b_ways    = VecInit((0 until bWays).map { w =>
     val raw = b_raw(ENTRY_BITS*(w+1) - 1, ENTRY_BITS*w)
@@ -107,7 +106,7 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
     ww
   })
 
-  val do_upd = b_fire && (b_set === b_c_set)
+  val do_upd = b_fire
 
   // Reuse SNIP-style NRU/victim on the carried snapshot
   val b_hit_oh = VecInit(b_ways.map(w => w.valid && w.tag === b_tag))
@@ -142,10 +141,12 @@ class BigITCPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(
     e.target := Mux(is_victim, b_target, b_ways(w).target)
     e.nru    := !clear_nru
 
-    when (init_wr) {
-      itc(w).write(init_idx, init_zero)
-    }.elsewhen (commit_we) {
-      itc(w).write(b_set, packEntry(e.valid, e.tag, e.target, e.nru))
+
+    val wr_en   = init_wr || commit_we
+    val wr_addr = Mux(init_wr, init_idx, b_set)
+    val wr_data = Mux(init_wr, init_zero, packEntry(e.valid, e.tag, e.target, e.nru))
+    when (wr_en) {
+      itc(w).write(wr_addr, wr_data)
     }
   }
 
