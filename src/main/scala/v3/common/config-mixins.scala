@@ -71,6 +71,21 @@ class WithSnipSmallITC extends Config((site, here, up) => {
   case BoomSnipOverrideThresh => 2
 })
 
+// BLBP — behavioral clone of SNIP, separate config keys for side-by-side eval
+case object BoomBlbpKey            extends Field[Boolean](false)
+case object BoomBlbpITCSets        extends Field[Int](256)
+case object BoomBlbpITCWays        extends Field[Int](8)
+case object BoomBlbpOverrideThresh extends Field[Int](2)
+
+class WithBlbp extends Config((site, here, up) => {
+  case BoomBlbpKey => true
+})
+class WithBlbpSmallITC extends Config((site, here, up) => {
+  case BoomBlbpITCSets       => 64
+  case BoomBlbpITCWays       => 4
+  case BoomBlbpOverrideThresh => 2
+})
+
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(crossingParams = tp.crossingParams.copy(
@@ -648,6 +663,10 @@ class WithTAGEBPD extends Config((site, here, up) => {
             val snip = Module(new SNIPBranchPredictorBank()(p))
             snip.io.resp_in(0) := ras.io.resp
             (preds_with_loop :+ snip, snip.io.resp)
+          } else if (p(BoomBlbpKey)) {
+            val blbp = Module(new BLBPBranchPredictorBank()(p))
+            blbp.io.resp_in(0) := ras.io.resp
+            (preds_with_loop :+ blbp, blbp.io.resp)
           } else {
             (preds_with_loop, ras.io.resp)
           }
@@ -657,6 +676,10 @@ class WithTAGEBPD extends Config((site, here, up) => {
             val snip = Module(new SNIPBranchPredictorBank()(p))
             snip.io.resp_in(0) := ras.io.resp
             (preds :+ snip, snip.io.resp)
+          } else if (p(BoomBlbpKey)) {
+            val blbp = Module(new BLBPBranchPredictorBank()(p))
+            blbp.io.resp_in(0) := ras.io.resp
+            (preds :+ blbp, blbp.io.resp)
           } else {
             (preds, ras.io.resp)
           }
