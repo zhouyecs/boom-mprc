@@ -15,11 +15,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def itc_nSets = p(BoomBlbpITCSets)
   def itc_nWays = p(BoomBlbpITCWays)
   def override_thresh = p(BoomBlbpOverrideThresh)
+  val useRRIP = p(BoomBlbpUseRRIP)
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
     val target = UInt(vaddrBitsExtended.W)
-    val nru    = Bool()
+    val rpv    = UInt(2.W)   // NRU uses {0,1}; RRIP uses {0..3}
   }
 
   val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets, Vec(bankWidth, new ITCEntry)) }
@@ -48,7 +49,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
   val W_BIAS  = F * 5                              // 75
   val W_WT    = Tbl * F * 5                        // 600
-  val W_ITC_ENTRY = 2 + vaddrBitsExtended   // valid(1) + target + nru(1)
+  val W_ITC_ENTRY = 1 + vaddrBitsExtended + 2   // valid(1) + target + rpv(2)
   val W_POOL  = itc_nWays * W_ITC_ENTRY
   val offBias = W_BASE                             // 35
   val offWt   = offBias + W_BIAS                   // 110
@@ -57,7 +58,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   override val metaSz = offPool + W_POOL // pool + wt + bias + valid+min_ham+sig+fp
 
   override val mems =
-    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 1))) ++
+    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 2))) ++
     Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) :+
     ("blbp_bias", nbias, F * 5)
 
@@ -226,17 +227,13 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.itc_total_event := b_fire
   io.itc_hit_event   := b_fire && b_hit
 
-  val inval_oh = VecInit(b_ways.map(w => !w.valid))
-  val nru_oh   = VecInit(b_ways.map(w => !w.nru))
-  val victim   = Mux(inval_oh.asUInt.orR, PriorityEncoder(inval_oh),
-                 Mux(nru_oh.asUInt.orR,   PriorityEncoder(nru_oh), 0.U))
-  val all_used = !inval_oh.asUInt.orR && !nru_oh.asUInt.orR
-
   // ── ITC Initialization FSM ─────────────────────────────────────────────────
   val init_done = RegInit(false.B)
   val init_idx  = RegInit(0.U(log2Ceil(itc_nSets).W))
   val init_zero = {
-    val e = Wire(new ITCEntry); e.valid := false.B; e.target := 0.U; e.nru := false.B; e
+    val e = Wire(new ITCEntry); e.valid := false.B; e.target := 0.U
+    e.rpv := (if (useRRIP) 3.U(2.W) else 0.U(2.W))   // RRIP: distant; NRU: 0
+    e
   }
   val init_data = Wire(Vec(bankWidth, new ITCEntry))
   init_data := DontCare
@@ -248,24 +245,62 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     when (init_idx === (itc_nSets - 1).U) { init_done := true.B }
   }
 
-  for (w <- 0 until itc_nWays) {
-    val is_victim = !b_hit && (w.U === victim)
-    val is_hitway = b_hit && b_hit_oh(w)
-    val clear_nru = all_used && !is_victim
-    val commit_we = b_fire && (is_victim || is_hitway || clear_nru)
+  if (!useRRIP) {
+    // ── NRU (reproduces Stage 2 exactly, rpv in {0,1}) ──
+    val inval_oh = VecInit(b_ways.map(w => !w.valid))
+    val nru_oh   = VecInit(b_ways.map(w => w.rpv === 0.U))
+    val victim   = Mux(inval_oh.asUInt.orR, PriorityEncoder(inval_oh),
+                   Mux(nru_oh.asUInt.orR,   PriorityEncoder(nru_oh), 0.U))
+    val all_used = !inval_oh.asUInt.orR && !nru_oh.asUInt.orR
 
-    val e = Wire(new ITCEntry)
-    e.valid  := true.B
-    e.target := Mux(is_victim, b_target, b_ways(w).target)
-    e.nru    := !clear_nru
-    val commit_row = Wire(Vec(bankWidth, new ITCEntry)); commit_row := DontCare; commit_row(b_col) := e
-    val commit_mask = VecInit((0 until bankWidth).map(_.U === b_col))
+    for (w <- 0 until itc_nWays) {
+      val is_victim = !b_hit && (w.U === victim)
+      val is_hitway = b_hit && b_hit_oh(w)
+      val clear_nru = all_used && !is_victim
+      val commit_we = b_fire && (is_victim || is_hitway || clear_nru)
 
-    val we   = !init_done || commit_we
-    val addr = Mux(init_done, b_idx,       init_idx)
-    val data = Mux(init_done, commit_row,  init_data)
-    val mask = Mux(init_done, commit_mask, init_mask)
-    when (we) { itc(w).write(addr, data, mask) }
+      val e = Wire(new ITCEntry)
+      e.valid  := true.B
+      e.target := Mux(is_victim, b_target, b_ways(w).target)
+      e.rpv    := Mux(clear_nru, 0.U, 1.U)
+      val commit_row = Wire(Vec(bankWidth, new ITCEntry)); commit_row := DontCare; commit_row(b_col) := e
+      val commit_mask = VecInit((0 until bankWidth).map(_.U === b_col))
+      val we   = !init_done || commit_we
+      val addr = Mux(init_done, b_idx,       init_idx)
+      val data = Mux(init_done, commit_row,  init_data)
+      val mask = Mux(init_done, commit_mask, init_mask)
+      when (we) { itc(w).write(addr, data, mask) }
+    }
+  } else {
+    // ── SRRIP (2-bit RRPV; invalid-first, else max-RRPV victim with one-shot aging) ──
+    val inval_oh  = VecInit(b_ways.map(w => !w.valid))
+    val has_inval = inval_oh.asUInt.orR
+    val maxRRPV   = b_ways.map(_.rpv).reduce((a, b) => Mux(a >= b, a, b))
+    val delta     = 3.U - maxRRPV                 // aging amount (sum stays <= 3)
+    val max_oh    = VecInit(b_ways.map(w => w.rpv === maxRRPV))
+    val victim    = Mux(has_inval, PriorityEncoder(inval_oh), PriorityEncoder(max_oh))
+    val age_all   = !b_hit && !has_inval          // age the set only on a full miss
+
+    for (w <- 0 until itc_nWays) {
+      val is_victim = !b_hit && (w.U === victim)
+      val is_hitway = b_hit && b_hit_oh(w)
+      val do_age    = age_all && !is_victim
+      val commit_we = b_fire && (is_victim || is_hitway || do_age)
+
+      val e = Wire(new ITCEntry)
+      e.valid  := true.B
+      e.target := Mux(is_victim, b_target, b_ways(w).target)
+      e.rpv    := Mux(is_hitway, 0.U,                       // hit-promotion
+                  Mux(is_victim, 2.U,                       // SRRIP long insertion
+                                 b_ways(w).rpv + delta))    // aging (do_age)
+      val commit_row = Wire(Vec(bankWidth, new ITCEntry)); commit_row := DontCare; commit_row(b_col) := e
+      val commit_mask = VecInit((0 until bankWidth).map(_.U === b_col))
+      val we   = !init_done || commit_we
+      val addr = Mux(init_done, b_idx,       init_idx)
+      val data = Mux(init_done, commit_row,  init_data)
+      val mask = Mux(init_done, commit_mask, init_mask)
+      when (we) { itc(w).write(addr, data, mask) }
+    }
   }
 
   // ── Predict-side ITC Read (Observer) ──────────────────────────────────────

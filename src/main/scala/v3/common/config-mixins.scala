@@ -76,6 +76,7 @@ case object BoomBlbpKey            extends Field[Boolean](false)
 case object BoomBlbpITCSets        extends Field[Int](256)
 case object BoomBlbpITCWays        extends Field[Int](8)
 case object BoomBlbpOverrideThresh extends Field[Int](2)
+case object BoomBlbpUseRRIP extends Field[Boolean](false)
 
 class WithBlbp extends Config((site, here, up) => {
   case BoomBlbpKey => true
@@ -84,6 +85,10 @@ class WithBlbpSmallITC extends Config((site, here, up) => {
   case BoomBlbpITCSets       => 64
   case BoomBlbpITCWays       => 4
   case BoomBlbpOverrideThresh => 2
+})
+
+class WithBlbpRRIP extends Config((site, here, up) => {
+  case BoomBlbpUseRRIP => true
 })
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
