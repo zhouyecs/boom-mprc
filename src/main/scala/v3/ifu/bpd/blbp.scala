@@ -16,6 +16,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def itc_nWays = p(BoomBlbpITCWays)
   def override_thresh = p(BoomBlbpOverrideThresh)
   val useRRIP = p(BoomBlbpUseRRIP)
+  val useDotProduct = p(BoomBlbpUseDotProduct)
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
@@ -350,8 +351,23 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       reduceMin(half)
     }
   }
-  val (snip_sel, _) = reduceMin((0 until itc_nWays).map(w =>
-    (w.U(log2Ceil(itc_nWays).W), key(w))))
+  val snip_sel = if (useDotProduct) {
+    // Soft cosine/dot-product: Σ_k s3_sum(k) * (cand_fp(w)(k) ? +1 : -1)
+    val dotw = VecInit((0 until itc_nWays).map { w =>
+      (0 until F).map { k =>
+        Mux(cand_fp(w)(k).asBool, s3_sum(k), -s3_sum(k))
+      }.reduce(_ +& _)            // signed accumulation, width auto-grown
+    })
+    // argmax over VALID ways, tie -> lower index (no sentinel needed)
+    (0 until itc_nWays).foldLeft(0.U(log2Ceil(itc_nWays).W)) { (acc, w) =>
+      val wBetter = cand_valid(w) && (!cand_valid(acc) || (dotw(w) > dotw(acc)))
+      Mux(wBetter, w.U, acc)
+    }
+  } else {
+    val (sel, _) = reduceMin((0 until itc_nWays).map(w =>
+      (w.U(log2Ceil(itc_nWays).W), key(w))))
+    sel
+  }
 
   val snip_valid   = cand_valid.asUInt.orR && s3_has_jalr
   val snip_target  = s3_pool(snip_sel).target
