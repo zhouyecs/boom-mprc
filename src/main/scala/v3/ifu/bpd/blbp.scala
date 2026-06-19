@@ -18,6 +18,11 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val useRRIP = p(BoomBlbpUseRRIP)
   val useDotProduct = p(BoomBlbpUseDotProduct)
   val useTransfer = p(BoomBlbpUseTransfer)
+  val useAdaptive = p(BoomBlbpUseAdaptive)
+  val thetaInit   = p(BoomBlbpThetaInit)
+  val thetaStep   = p(BoomBlbpThetaStep)
+  val thetaSpeed  = p(BoomBlbpThetaSpeed)
+  val THETA_W = 20   // |sum| reaches ~16 bits with transfer; +headroom for theta
 
   // Convex, monotonic transfer on |weight|. 5-bit signed weights => |w| in 0..16,
   // so 17 entries. xlat[0] = 0 (zero weight contributes nothing). Increasing
@@ -55,6 +60,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val coeffBias = 68
   val coeffs = VecInit(Seq(68, 56, 48, 37, 31, 24, 17, 17).map(_.S(8.W)))
+
+  // Per-bit adaptive threshold (Seznec/O-GEHL). Module Regs, commit-updated.
+  val theta = RegInit(VecInit(Seq.fill(F)(thetaInit.S(THETA_W.W))))
+  val tc    = RegInit(VecInit(Seq.fill(F)(0.S(8.W))))
+
+  val adapt_train = WireDefault(false.B)
 
   val weights = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(5.W))))
   val biasMem = SyncReadMem(nbias, Vec(F, SInt(5.W)))
@@ -173,7 +184,27 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     }.reduce(_ + _) + (xfer(tr_carried_bia(w)) * coeffBias.S).asSInt
     val pred_bit   = (sum_w >= 0.S).asUInt
     val target_bit = tr_actual_fp(w)
-    tr_we(w) := (pred_bit =/= target_bit)
+    val correct = (pred_bit === target_bit)
+    val absSum  = Mux(sum_w < 0.S, -sum_w, sum_w)              // |sum_w|
+    val underConf    = if (useAdaptive) (absSum < theta(w)) else false.B
+    tr_we(w) := (pred_bit =/= target_bit) || underConf
+
+    if (useAdaptive) {
+      when (tr_fire) {
+        when (!correct) {
+          when (tc(w) >= (thetaSpeed - 1).S) {
+            theta(w) := theta(w) + thetaStep.S
+            tc(w)    := 0.S
+          } .otherwise { tc(w) := tc(w) + 1.S }
+        } .elsewhen (underConf) {
+          adapt_train := true.B
+          when (tc(w) <= -(thetaSpeed - 1).S) {
+            theta(w) := Mux(theta(w) > thetaStep.S, theta(w) - thetaStep.S, 0.S)
+            tc(w)    := 0.S
+          } .otherwise { tc(w) := tc(w) - 1.S }
+        }
+      }
+    }
 
     for (t <- 0 until Tbl) {
       val delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
@@ -223,6 +254,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.snip_pick_match_event   := tr_b_fire && carried_snip_valid && (carried_sig === actual_sig)
   io.snip_min_ham_le2_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 2.U)
   io.snip_min_ham_le4_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 4.U)
+  io.adapt_train_event := adapt_train
 
   // Shared set-index hash
   def itcSet(pc: UInt): UInt = fetchIdx(pc)(log2Ceil(itc_nSets) - 1, 0)

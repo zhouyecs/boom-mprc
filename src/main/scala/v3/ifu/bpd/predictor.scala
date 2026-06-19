@@ -187,6 +187,7 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val snip_pick_match_event   = Output(Bool())
     val snip_min_ham_le2_event  = Output(Bool())
     val snip_min_ham_le4_event  = Output(Bool())
+    val adapt_train_event        = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
@@ -207,6 +208,7 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   io.snip_pick_match_event   := false.B
   io.snip_min_ham_le2_event  := false.B
   io.snip_min_ham_le4_event  := false.B
+  io.adapt_train_event := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -287,6 +289,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val snip_pick_match_event   = Output(Bool())
     val snip_min_ham_le2_event  = Output(Bool())
     val snip_min_ham_le4_event  = Output(Bool())
+    val adapt_train_event        = Output(Bool())
   })
 
   var total_memsize = 0
@@ -320,6 +323,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.snip_pick_match_event   := banked_predictors.map(_.io.snip_pick_match_event).foldLeft(false.B)(_ || _)
   io.snip_min_ham_le2_event  := banked_predictors.map(_.io.snip_min_ham_le2_event).foldLeft(false.B)(_ || _)
   io.snip_min_ham_le4_event  := banked_predictors.map(_.io.snip_min_ham_le4_event).foldLeft(false.B)(_ || _)
+  io.adapt_train_event := banked_predictors.map(_.io.adapt_train_event).foldLeft(false.B)(_ || _)
 
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 

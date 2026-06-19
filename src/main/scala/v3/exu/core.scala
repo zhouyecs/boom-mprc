@@ -601,6 +601,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(45) := io.ifu.snip_pick_match_event.asUInt
     event_counters.io.event_signals(46) := io.ifu.snip_min_ham_le2_event.asUInt
     event_counters.io.event_signals(47) := io.ifu.snip_min_ham_le4_event.asUInt
+    event_counters.io.event_signals(48) := io.ifu.adapt_train_event.asUInt
   }
 
   //-------------------------------------------------------------

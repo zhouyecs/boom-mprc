@@ -57,6 +57,7 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
   io.snip_pick_match_event   := components.map(_.io.snip_pick_match_event).foldLeft(false.B)(_ || _)
   io.snip_min_ham_le2_event  := components.map(_.io.snip_min_ham_le2_event).foldLeft(false.B)(_ || _)
   io.snip_min_ham_le4_event  := components.map(_.io.snip_min_ham_le4_event).foldLeft(false.B)(_ || _)
+  io.adapt_train_event := components.map(_.io.adapt_train_event).foldLeft(false.B)(_ || _)
 
   var update_meta = io.update.bits.meta
   for (c <- components.reverse) {

@@ -349,6 +349,7 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val snip_pick_match_event   = Input(Bool())
   val snip_min_ham_le2_event  = Input(Bool())
   val snip_min_ham_le4_event  = Input(Bool())
+  val adapt_train_event        = Input(Bool())
 }
 
 /**
@@ -412,6 +413,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.snip_pick_match_event   := bpd.io.snip_pick_match_event
   io.cpu.snip_min_ham_le2_event  := bpd.io.snip_min_ham_le2_event
   io.cpu.snip_min_ham_le4_event  := bpd.io.snip_min_ham_le4_event
+  io.cpu.adapt_train_event := bpd.io.adapt_train_event
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache

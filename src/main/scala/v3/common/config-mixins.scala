@@ -79,6 +79,10 @@ case object BoomBlbpOverrideThresh extends Field[Int](2)
 case object BoomBlbpUseRRIP extends Field[Boolean](false)
 case object BoomBlbpUseDotProduct extends Field[Boolean](false)
 case object BoomBlbpUseTransfer extends Field[Boolean](false)
+case object BoomBlbpUseAdaptive extends Field[Boolean](false)
+case object BoomBlbpThetaInit   extends Field[Int](256)
+case object BoomBlbpThetaStep   extends Field[Int](32)
+case object BoomBlbpThetaSpeed  extends Field[Int](4)
 
 class WithBlbp extends Config((site, here, up) => {
   case BoomBlbpKey => true
@@ -99,6 +103,10 @@ class WithBlbpDotProduct extends Config((site, here, up) => {
 
 class WithBlbpTransfer extends Config((site, here, up) => {
   case BoomBlbpUseTransfer => true
+})
+
+class WithBlbpAdaptive extends Config((site, here, up) => {
+  case BoomBlbpUseAdaptive => true
 })
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
