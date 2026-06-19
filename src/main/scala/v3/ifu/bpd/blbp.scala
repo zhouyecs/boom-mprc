@@ -19,6 +19,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val useDotProduct = p(BoomBlbpUseDotProduct)
   val useTransfer = p(BoomBlbpUseTransfer)
   val useAdaptive = p(BoomBlbpUseAdaptive)
+  val useSelectiveBit = p(BoomBlbpUseSelectiveBit)
   val thetaInit   = p(BoomBlbpThetaInit)
   val thetaStep   = p(BoomBlbpThetaStep)
   val thetaSpeed  = p(BoomBlbpThetaSpeed)
@@ -178,6 +179,15 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
 
+  // Which-bits mask from carried pool (same pool s3_pool / cand_fp used at predict)
+  val sb_fp    = VecInit(tr_carried_pool.map(e => extractFp(e.target)))
+  val sb_valid = VecInit(tr_carried_pool.map(_.valid))
+  def discriminative(w: Int): Bool = {
+    val anyOne  = (0 until itc_nWays).map(c => sb_valid(c) &&  sb_fp(c)(w)).reduce(_ || _)
+    val anyZero = (0 until itc_nWays).map(c => sb_valid(c) && !sb_fp(c)(w)).reduce(_ || _)
+    anyOne && anyZero
+  }
+
   for (w <- 0 until F) {
     val sum_w = (0 until Tbl).map { t =>
       (xfer(tr_carried_wt(t)(w)) * coeffs(t)).asSInt
@@ -187,7 +197,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val correct = (pred_bit === target_bit)
     val absSum  = Mux(sum_w < 0.S, -sum_w, sum_w)              // |sum_w|
     val underConf    = if (useAdaptive) (absSum < theta(w)) else false.B
-    tr_we(w) := (pred_bit =/= target_bit) || underConf
+    val trainBit = if (useSelectiveBit) discriminative(w) else true.B
+    tr_we(w) := ((pred_bit =/= target_bit) || underConf) && trainBit
 
     if (useAdaptive) {
       when (tr_fire) {
@@ -381,8 +392,19 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val cand_fp    = VecInit(s3_pool.map(e => extractFp(e.target)))
   val cand_valid = VecInit(s3_pool.map(e => e.valid))
 
+  // Predict-side which-bits mask: only discriminative bits count toward the gate.
+  // Mirrors training-side suppression so the confidence gate ignores untrained bits.
+  def discrimP(w: Int): Bool = {
+    val anyOne  = (0 until itc_nWays).map(c => cand_valid(c) &&  cand_fp(c)(w)).reduce(_ || _)
+    val anyZero = (0 until itc_nWays).map(c => cand_valid(c) && !cand_fp(c)(w)).reduce(_ || _)
+    anyOne && anyZero
+  }
+  val discrimMask =
+    if (useSelectiveBit) VecInit((0 until F).map(w => discrimP(w))).asUInt
+    else                 ((BigInt(1) << F) - 1).U(F.W)
+
   val ham = VecInit((0 until itc_nWays).map { w =>
-    PopCount((s3_fingerprint ^ cand_fp(w)).asUInt)  // 4 bits, 0..15
+    PopCount(((s3_fingerprint ^ cand_fp(w)) & discrimMask).asUInt)  // masked
   })
   // Key: top bit = !valid (invalid sorts above all valid), lower bits = ham
   val key = VecInit((0 until itc_nWays).map { w =>
