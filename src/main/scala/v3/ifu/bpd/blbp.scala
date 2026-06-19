@@ -17,6 +17,25 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def override_thresh = p(BoomBlbpOverrideThresh)
   val useRRIP = p(BoomBlbpUseRRIP)
   val useDotProduct = p(BoomBlbpUseDotProduct)
+  val useTransfer = p(BoomBlbpUseTransfer)
+
+  // Convex, monotonic transfer on |weight|. 5-bit signed weights => |w| in 0..16,
+  // so 17 entries. xlat[0] = 0 (zero weight contributes nothing). Increasing
+  // first differences => convex (amplifies confident weights). SPEC-tunable.
+  val xlatRom = VecInit(
+    Seq(0, 1, 2, 4, 6, 8, 11, 14, 18, 22, 27, 32, 38, 44, 51, 58, 66).map(_.S(8.W)))
+  // val xlatRom = VecInit(Seq.fill(17)(0.S(8.W)))   // PROBE ONLY — revert after
+
+  // Read-side magnitude transfer. Pure function => identical HW at every call site.
+  def xfer(wt: SInt): SInt = {
+    if (!useTransfer) {
+      wt
+    } else {
+      val mag = Mux(wt < 0.S, -wt, wt).asUInt   // 0..16
+      val m   = xlatRom(mag)                      // SInt(8.W), >= 0
+      Mux(wt < 0.S, -m, m)
+    }
+  }
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
@@ -107,8 +126,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val s2_bia = biasMem.read(biasIdx, readEn)
 
   val s2_sum = VecInit((0 until F).map { w =>
-    val wt = (0 until Tbl).map { t => (s2_wt(t)(w) * coeffs(t)).asSInt }.reduce(_ + _)
-    (wt + (s2_bia(w) * coeffBias.S).asSInt).asSInt
+    val wt = (0 until Tbl).map { t => (xfer(s2_wt(t)(w)) * coeffs(t)).asSInt }.reduce(_ + _)
+    (wt + (xfer(s2_bia(w)) * coeffBias.S).asSInt).asSInt
   })
 
   val s3_sum = RegNext(s2_sum)
@@ -150,8 +169,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   for (w <- 0 until F) {
     val sum_w = (0 until Tbl).map { t =>
-      (tr_carried_wt(t)(w) * coeffs(t)).asSInt
-    }.reduce(_ + _) + (tr_carried_bia(w) * coeffBias.S).asSInt
+      (xfer(tr_carried_wt(t)(w)) * coeffs(t)).asSInt
+    }.reduce(_ + _) + (xfer(tr_carried_bia(w)) * coeffBias.S).asSInt
     val pred_bit   = (sum_w >= 0.S).asUInt
     val target_bit = tr_actual_fp(w)
     tr_we(w) := (pred_bit =/= target_bit)
