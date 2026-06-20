@@ -52,7 +52,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val rpv    = UInt(2.W)   // NRU uses {0,1}; RRIP uses {0..3}
   }
 
-  val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets, Vec(bankWidth, new ITCEntry)) }
+  // Folded Cat(set,col) index — full-entry write (no mask) → BRAM-compatible
+  val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets * bankWidth, new ITCEntry) }
+  def itcAddr(set: UInt, col: UInt): UInt = Cat(set, col(log2Ceil(bankWidth)-1, 0))
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
   val F = 15
@@ -99,7 +101,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   override val metaSz = offHist + W_HIST // hist + pool + wt + bias + valid+min_ham+sig+fp
 
   override val mems =
-    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets, bankWidth * (1 + vaddrBitsExtended + 2))) ++
+    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + vaddrBitsExtended + 2)) ++
     Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) :+
     ("blbp_bias", nbias, F * 5)
 
@@ -329,22 +331,19 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.itc_total_event := b_fire
   io.itc_hit_event   := b_fire && b_hit
 
-  // ── ITC Initialization FSM ─────────────────────────────────────────────────
+  // ── ITC Initialization FSM (flat depth, single-entry writes) ─────────────────
+  val flatDepth = itc_nSets * bankWidth
   val init_done = RegInit(false.B)
-  val init_idx  = RegInit(0.U(log2Ceil(itc_nSets).W))
+  val init_idx  = RegInit(0.U(log2Ceil(flatDepth).W))
   val init_zero = {
     val e = Wire(new ITCEntry); e.valid := false.B; e.target := 0.U
     e.rpv := (if (useRRIP) 3.U(2.W) else 0.U(2.W))   // RRIP: distant; NRU: 0
     e
   }
-  val init_data = Wire(Vec(bankWidth, new ITCEntry))
-  init_data := DontCare
-  for (c <- 0 until bankWidth) { init_data(c) := init_zero }
-  val init_mask = VecInit(Seq.fill(bankWidth)(true.B))
-
+  val init_wr = !init_done
   when (!init_done) {
     init_idx := init_idx + 1.U
-    when (init_idx === (itc_nSets - 1).U) { init_done := true.B }
+    when (init_idx === (flatDepth - 1).U) { init_done := true.B }
   }
 
   if (!useRRIP) {
@@ -365,13 +364,11 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       e.valid  := true.B
       e.target := Mux(is_victim, b_target, b_ways(w).target)
       e.rpv    := Mux(clear_nru, 0.U, 1.U)
-      val commit_row = Wire(Vec(bankWidth, new ITCEntry)); commit_row := DontCare; commit_row(b_col) := e
-      val commit_mask = VecInit((0 until bankWidth).map(_.U === b_col))
-      val we   = !init_done || commit_we
-      val addr = Mux(init_done, b_idx,       init_idx)
-      val data = Mux(init_done, commit_row,  init_data)
-      val mask = Mux(init_done, commit_mask, init_mask)
-      when (we) { itc(w).write(addr, data, mask) }
+      // Folded write: single call site, Muxed addr/data, no mask → 1R1W → BRAM
+      val we    = init_wr || commit_we
+      val waddr = Mux(init_wr, init_idx, itcAddr(b_idx, b_col))
+      val wdata = Mux(init_wr, init_zero, e)
+      when (we) { itc(w).write(waddr, wdata) }
     }
   } else {
     // ── SRRIP (2-bit RRPV; invalid-first, else max-RRPV victim with one-shot aging) ──
@@ -395,20 +392,29 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       e.rpv    := Mux(is_hitway, 0.U,                       // hit-promotion
                   Mux(is_victim, 2.U,                       // SRRIP long insertion
                                  b_ways(w).rpv + delta))    // aging (do_age)
-      val commit_row = Wire(Vec(bankWidth, new ITCEntry)); commit_row := DontCare; commit_row(b_col) := e
-      val commit_mask = VecInit((0 until bankWidth).map(_.U === b_col))
-      val we   = !init_done || commit_we
-      val addr = Mux(init_done, b_idx,       init_idx)
-      val data = Mux(init_done, commit_row,  init_data)
-      val mask = Mux(init_done, commit_mask, init_mask)
-      when (we) { itc(w).write(addr, data, mask) }
+      // Folded write: single call site, Muxed addr/data, no mask → 1R1W → BRAM
+      val we    = init_wr || commit_we
+      val waddr = Mux(init_wr, init_idx, itcAddr(b_idx, b_col))
+      val wdata = Mux(init_wr, init_zero, e)
+      when (we) { itc(w).write(waddr, wdata) }
     }
   }
 
-  // ── Predict-side ITC Read (Observer) ──────────────────────────────────────
-  val pred_rows = VecInit(itc.map(_.read(itcSet(io.f0_pc), io.f0_valid)))
-  val s2_pred_rows = RegNext(pred_rows)
-  val s3_pred_rows = RegNext(s2_pred_rows)
+  // ── Predict-side ITC Read — folded: single-column pool directly ────────────
+  // Derive snip_col at s2 from f2 response (is_jal stable s1→s3; taken stable
+  // for non-BR entries). Read address = Cat(set, s2_snip_col) → single column.
+  val s2_resp = io.resp_in(0).f2
+  val s2_jalr_mask = VecInit((0 until bankWidth).map(w =>
+    s2_resp(w).is_jal && s2_resp(w).taken))
+  val s2_snip_col   = PriorityEncoder(s2_jalr_mask)
+  val s2_itc_set    = RegNext(RegNext(itcSet(io.f0_pc)))  // double RegNext → s2 stage
+  val s2_read_addr  = itcAddr(s2_itc_set, s2_snip_col)
+  val s3_pool = VecInit((0 until itc_nWays).map(w =>
+    itc(w).read(s2_read_addr, s2_valid)))
+
+  // Carry s2_snip_col to s3 — one source, used for both read and override
+  val snip_col     = RegNext(s2_snip_col)
+  val s3_has_jalr  = RegNext(s2_jalr_mask.asUInt.orR)
 
   val s3_resp = io.resp_in(0).f3
   val s3_taken_mask = VecInit((0 until bankWidth).map(w => s3_resp(w).taken))
@@ -419,15 +425,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.fp_nonzero_event  := s3_valid && s3_has_taken && (s3_fingerprint =/= fp_untrained)
 
   // ── Hamming-match + min-select (s3) ────────────────────────────────────────
-  // JALR proxy: is_jal && taken. No per-slot is_jalr at predict (BTB stores only
-  // is_br; is_jal = !is_br conflates JAL+JALR). Direct JALs have empty ITC columns
-  // (never populated by the commit gate), so snip_valid stays false for them.
-  val s3_jalr_mask = VecInit((0 until bankWidth).map(w =>
-    s3_resp(w).is_jal && s3_resp(w).taken))
-  val s3_has_jalr  = s3_jalr_mask.asUInt.orR
-  val snip_col     = PriorityEncoder(s3_jalr_mask)
-
-  val s3_pool = VecInit((0 until itc_nWays).map(w => s3_pred_rows(w)(snip_col)))
+  // JALR proxy: is_jal && taken. Already computed at s2, carried via RegNext.
   val cand_fp    = VecInit(s3_pool.map(e => extractFp(e.target)))
   val cand_valid = VecInit(s3_pool.map(e => e.valid))
 
@@ -498,22 +496,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     io.resp.f3(snip_col).predicted_pc.bits  := snip_target
   }
 
-  val s3_slot_nonempty = VecInit((0 until bankWidth).map { w =>
-    val col_w = s3_pred_rows.map(r => r(w))
-    s3_resp(w).taken && col_w.map(_.valid).reduce(_ || _)
-  })
-  val s3_slot_hit = VecInit((0 until bankWidth).map { w =>
-    val col_w = s3_pred_rows.map(r => r(w))
-    val tgt_w = s3_resp(w).predicted_pc.bits
-    s3_resp(w).taken && col_w.map(cw => cw.valid && cw.target === tgt_w).reduce(_ || _)
-  })
-  val s3_slot_saturated = VecInit((0 until bankWidth).map { w =>
-    val col_w = s3_pred_rows.map(r => r(w))
-    s3_resp(w).taken && col_w.map(_.valid).reduce(_ && _)
-  })
-
+  // All-column observers dropped (folded read provides single column only)
   io.pred_taken_event          := s3_valid && s3_has_taken
-  io.pred_pool_nonempty_event  := s3_valid && s3_slot_nonempty.asUInt.orR
-  io.pred_target_in_pool_event := s3_valid && s3_slot_hit.asUInt.orR
-  io.pred_pool_saturated_event := s3_valid && s3_slot_saturated.asUInt.orR
+  io.pred_pool_nonempty_event  := false.B
+  io.pred_target_in_pool_event := false.B
+  io.pred_pool_saturated_event := false.B
 }
