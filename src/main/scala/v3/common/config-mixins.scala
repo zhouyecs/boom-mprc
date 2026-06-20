@@ -86,6 +86,9 @@ case object BoomBlbpUsePrivateHist extends Field[Boolean](false)
 case object BoomBlbpHistIdBits     extends Field[Int](3)
 case object BoomBlbpUseTags  extends Field[Boolean](false)
 case object BoomBlbpTagBits  extends Field[Int](8)
+case object BoomBlbpUseRegion  extends Field[Boolean](false)
+case object BoomBlbpLg2Regions extends Field[Int](7)
+case object BoomBlbpOffsetBits extends Field[Int](20)
 case object BoomBlbpThetaInit   extends Field[Int](256)
 case object BoomBlbpThetaStep   extends Field[Int](32)
 case object BoomBlbpThetaSpeed  extends Field[Int](4)
@@ -131,6 +134,13 @@ class WithBlbpTags(bits: Int = 8) extends Config((site, here, up) => {
   case BoomBlbpUseTags => true
   case BoomBlbpTagBits  => bits
 })
+
+class WithBlbpRegion(lg2Regions: Int = 7, offsetBits: Int = 20)
+  extends Config((site, here, up) => {
+    case BoomBlbpUseRegion  => true
+    case BoomBlbpLg2Regions => lg2Regions
+    case BoomBlbpOffsetBits => offsetBits
+  })
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {

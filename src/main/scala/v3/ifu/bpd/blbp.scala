@@ -23,6 +23,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val useTargetHash = p(BoomBlbpUseTargetHash)
   val useTags = p(BoomBlbpUseTags)
   val blbpTagBits = p(BoomBlbpTagBits)
+  val useRegion  = p(BoomBlbpUseRegion)
+  val lg2Regions = p(BoomBlbpLg2Regions)
+  val offsetBits = p(BoomBlbpOffsetBits)
+  val nregions   = 1 << lg2Regions
+  val regionBits = vaddrBitsExtended - offsetBits
+  val tgtBits    = if (useRegion) lg2Regions + offsetBits else vaddrBitsExtended
   val usePrivateHist = p(BoomBlbpUsePrivateHist)
   val histIdBits     = p(BoomBlbpHistIdBits)
   val thetaInit   = p(BoomBlbpThetaInit)
@@ -51,13 +57,22 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   class ITCEntry extends Bundle {
     val valid  = Bool()
     val tag    = UInt(blbpTagBits.W)
-    val target = UInt(vaddrBitsExtended.W)
-    val rpv    = UInt(2.W)   // NRU uses {0,1}; RRIP uses {0..3}
+    val tgt    = UInt(tgtBits.W)   // full target (off) or {region_index, offset} (on)
+    val rpv    = UInt(2.W)
   }
 
   // Folded Cat(set,col) index — full-entry write (no mask) → BRAM-compatible
   val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets * bankWidth, new ITCEntry) }
   def itcAddr(set: UInt, col: UInt): UInt = Cat(set, col(log2Ceil(bankWidth)-1, 0))
+
+  // Region table: compressed {region_index, offset} → full target reconstruction
+  val region_entries = RegInit(VecInit(Seq.fill(nregions)(0.U(regionBits.W))))
+  val region_valid   = RegInit(VecInit(Seq.fill(nregions)(false.B)))
+  val rand_counter   = RegInit("hdeadb10c".U(32.W))
+  def entryTarget(e: ITCEntry): UInt =
+    if (!useRegion) e.tgt
+    else (region_entries(e.tgt(tgtBits-1, offsetBits)) << offsetBits) |
+          e.tgt(offsetBits-1, 0)
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
   val F = 15
@@ -93,7 +108,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
   val W_BIAS  = F * 5                              // 75
   val W_WT    = Tbl * F * 5                        // 600
-  val W_ITC_ENTRY = 1 + blbpTagBits + vaddrBitsExtended + 2   // valid(1) + tag + target + rpv(2)
+  val W_ITC_ENTRY = 1 + blbpTagBits + tgtBits + 2   // valid(1) + tag + tgt + rpv(2)
   val W_POOL  = itc_nWays * W_ITC_ENTRY
   val offBias = W_BASE                             // 35
   val offWt   = offBias + W_BIAS                   // 110
@@ -104,7 +119,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   override val metaSz = offHist + W_HIST // hist + pool + wt + bias + valid+min_ham+sig+fp
 
   override val mems =
-    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + vaddrBitsExtended + 2)) ++
+    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++
     Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) :+
     ("blbp_bias", nbias, F * 5)
 
@@ -227,7 +242,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
 
   // Which-bits mask from carried pool (same pool s3_pool / cand_fp used at predict)
-  val sb_fp    = VecInit(tr_carried_pool.map(e => extractFp(e.target)))
+  val sb_fp    = VecInit(tr_carried_pool.map(e => extractFp(entryTarget(e))))
   val sb_valid = VecInit(tr_carried_pool.map(e =>
     e.valid && (if (useTags) (e.tag === b_tag) else true.B)))
   def discriminative(w: Int): Bool = {
@@ -333,19 +348,42 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val b_target = RegNext(u.target)
   val b_ways   = tr_carried_pool
 
-  val b_hit_oh = VecInit(b_ways.map(w =>
-    w.valid && (if (useTags) (w.tag === b_tag) else true.B) && w.target === b_target))
+  // Decompress carried pool for commit-side hit/sb (identity when off)
+  val b_tgt = VecInit(b_ways.map(entryTarget))
+
+  val b_hit_oh = VecInit((0 until itc_nWays).map(w =>
+    b_ways(w).valid && (if (useTags) (b_ways(w).tag === b_tag) else true.B) &&
+    (b_tgt(w) === b_target)))
   val b_hit    = b_hit_oh.asUInt.orR
 
   io.itc_total_event := b_fire
   io.itc_hit_event   := b_fire && b_hit
+
+  // Region-table allocation (insert only)
+  val victim_tgt = if (useRegion) {
+    val region_number = b_target(vaddrBitsExtended-1, offsetBits)
+    val match_oh = VecInit((0 until nregions).map(i =>
+      region_valid(i) && (region_entries(i) === region_number)))
+    val free_oh  = VecInit(region_valid.map(!_))
+    val rand_slot = rand_counter(lg2Regions-1, 0)
+    val alloc_slot = Mux(match_oh.asUInt.orR, PriorityEncoder(match_oh),
+                     Mux(free_oh.asUInt.orR,  PriorityEncoder(free_oh), rand_slot))
+    when (b_fire && !b_hit) {
+      region_entries(alloc_slot) := region_number
+      region_valid(alloc_slot)   := true.B
+      rand_counter := rand_counter + 17.U
+    }
+    Cat(alloc_slot, b_target(offsetBits-1, 0))
+  } else {
+    0.U(tgtBits.W)
+  }
 
   // ── ITC Initialization FSM (flat depth, single-entry writes) ─────────────────
   val flatDepth = itc_nSets * bankWidth
   val init_done = RegInit(false.B)
   val init_idx  = RegInit(0.U(log2Ceil(flatDepth).W))
   val init_zero = {
-    val e = Wire(new ITCEntry); e.valid := false.B; e.tag := 0.U; e.target := 0.U
+    val e = Wire(new ITCEntry); e.valid := false.B; e.tag := 0.U; e.tgt := 0.U
     e.rpv := (if (useRRIP) 3.U(2.W) else 0.U(2.W))   // RRIP: distant; NRU: 0
     e
   }
@@ -372,7 +410,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       val e = Wire(new ITCEntry)
       e.valid  := true.B
       e.tag    := (if (useTags) Mux(is_victim, b_tag, b_ways(w).tag) else 0.U)
-      e.target := Mux(is_victim, b_target, b_ways(w).target)
+      e.tgt    := (if (useRegion) Mux(is_victim, victim_tgt, b_ways(w).tgt)
+                    else           Mux(is_victim, b_target,   b_ways(w).tgt))
       e.rpv    := Mux(clear_nru, 0.U, 1.U)
       // Folded write: single call site, Muxed addr/data, no mask → 1R1W → BRAM
       val we    = init_wr || commit_we
@@ -399,7 +438,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       val e = Wire(new ITCEntry)
       e.valid  := true.B
       e.tag    := (if (useTags) Mux(is_victim, b_tag, b_ways(w).tag) else 0.U)
-      e.target := Mux(is_victim, b_target, b_ways(w).target)
+      e.tgt    := (if (useRegion) Mux(is_victim, victim_tgt, b_ways(w).tgt)
+                    else           Mux(is_victim, b_target,   b_ways(w).tgt))
       e.rpv    := Mux(is_hitway, 0.U,                       // hit-promotion
                   Mux(is_victim, 2.U,                       // SRRIP long insertion
                                  b_ways(w).rpv + delta))    // aging (do_age)
@@ -429,6 +469,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val s3_has_jalr  = RegNext(s2_jalr_mask.asUInt.orR)
   val s3_itc_tag   = RegNext(s2_itc_tag)
 
+  // Decompress pool (identity when useRegion=false)
+  val s3_pool_tgt = VecInit(s3_pool.map(entryTarget))
+
   val s3_resp = io.resp_in(0).f3
   val s3_taken_mask = VecInit((0 until bankWidth).map(w => s3_resp(w).taken))
   val s3_has_taken = s3_taken_mask.asUInt.orR
@@ -439,7 +482,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // ── Hamming-match + min-select (s3) ────────────────────────────────────────
   // JALR proxy: is_jal && taken. Already computed at s2, carried via RegNext.
-  val cand_fp    = VecInit(s3_pool.map(e => extractFp(e.target)))
+  val cand_fp    = VecInit(s3_pool_tgt.map(t => extractFp(t)))
   val cand_valid = VecInit(s3_pool.map { e =>
     e.valid && (if (useTags) (e.tag === s3_itc_tag) else true.B)
   })
@@ -495,7 +538,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
 
   val snip_valid   = cand_valid.asUInt.orR && s3_has_jalr
-  val snip_target  = s3_pool(snip_sel).target
+  val snip_target  = s3_pool_tgt(snip_sel)
   val snip_sig     = snip_target(F - 1, 0)
   val snip_min_ham = ham(snip_sel)
 
