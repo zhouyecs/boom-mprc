@@ -21,6 +21,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val useAdaptive = p(BoomBlbpUseAdaptive)
   val useSelectiveBit = p(BoomBlbpUseSelectiveBit)
   val useTargetHash = p(BoomBlbpUseTargetHash)
+  val useTags = p(BoomBlbpUseTags)
+  val blbpTagBits = p(BoomBlbpTagBits)
   val usePrivateHist = p(BoomBlbpUsePrivateHist)
   val histIdBits     = p(BoomBlbpHistIdBits)
   val thetaInit   = p(BoomBlbpThetaInit)
@@ -48,6 +50,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
+    val tag    = UInt(blbpTagBits.W)
     val target = UInt(vaddrBitsExtended.W)
     val rpv    = UInt(2.W)   // NRU uses {0,1}; RRIP uses {0..3}
   }
@@ -90,7 +93,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
   val W_BIAS  = F * 5                              // 75
   val W_WT    = Tbl * F * 5                        // 600
-  val W_ITC_ENTRY = 1 + vaddrBitsExtended + 2   // valid(1) + target + rpv(2)
+  val W_ITC_ENTRY = 1 + blbpTagBits + vaddrBitsExtended + 2   // valid(1) + tag + target + rpv(2)
   val W_POOL  = itc_nWays * W_ITC_ENTRY
   val offBias = W_BASE                             // 35
   val offWt   = offBias + W_BIAS                   // 110
@@ -101,7 +104,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   override val metaSz = offHist + W_HIST // hist + pool + wt + bias + valid+min_ham+sig+fp
 
   override val mems =
-    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + vaddrBitsExtended + 2)) ++
+    Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + vaddrBitsExtended + 2)) ++
     Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) :+
     ("blbp_bias", nbias, F * 5)
 
@@ -179,6 +182,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_fire  = io.update.valid && u.is_commit_update &&
                  u.cfi_is_jalr && !u.cfi_is_ret && u.cfi_taken && u.cfi_idx.valid
 
+  // Tag for commit-side hit detection + train-side pool (defined early for sb_valid)
+  val b_tag = RegNext(itcTag(u.pc))
+
   // commit-side reads DROPPED — weights + ITC carried in meta (TAGE pattern)
   def tblIdxUpd(t: Int): UInt = {
     if (usePrivateHist) tblIdxMix(u.pc, io.update.bits.ghist, carried_hist, t)
@@ -222,7 +228,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Which-bits mask from carried pool (same pool s3_pool / cand_fp used at predict)
   val sb_fp    = VecInit(tr_carried_pool.map(e => extractFp(e.target)))
-  val sb_valid = VecInit(tr_carried_pool.map(_.valid))
+  val sb_valid = VecInit(tr_carried_pool.map(e =>
+    e.valid && (if (useTags) (e.tag === b_tag) else true.B)))
   def discriminative(w: Int): Bool = {
     val anyOne  = (0 until itc_nWays).map(c => sb_valid(c) &&  sb_fp(c)(w)).reduce(_ || _)
     val anyZero = (0 until itc_nWays).map(c => sb_valid(c) && !sb_fp(c)(w)).reduce(_ || _)
@@ -310,6 +317,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Shared set-index hash
   def itcSet(pc: UInt): UInt = fetchIdx(pc)(log2Ceil(itc_nSets) - 1, 0)
+  def itcTag(pc: UInt): UInt = fetchIdx(pc)(log2Ceil(itc_nSets) + blbpTagBits - 1, log2Ceil(itc_nSets))
 
   // ── Commit-side ITC Update RMW ─────────────────────────────────────────────
   val upd_fire = io.update.valid && u.is_commit_update &&
@@ -325,7 +333,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val b_target = RegNext(u.target)
   val b_ways   = tr_carried_pool
 
-  val b_hit_oh = VecInit(b_ways.map(w => w.valid && w.target === b_target))
+  val b_hit_oh = VecInit(b_ways.map(w =>
+    w.valid && (if (useTags) (w.tag === b_tag) else true.B) && w.target === b_target))
   val b_hit    = b_hit_oh.asUInt.orR
 
   io.itc_total_event := b_fire
@@ -336,7 +345,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val init_done = RegInit(false.B)
   val init_idx  = RegInit(0.U(log2Ceil(flatDepth).W))
   val init_zero = {
-    val e = Wire(new ITCEntry); e.valid := false.B; e.target := 0.U
+    val e = Wire(new ITCEntry); e.valid := false.B; e.tag := 0.U; e.target := 0.U
     e.rpv := (if (useRRIP) 3.U(2.W) else 0.U(2.W))   // RRIP: distant; NRU: 0
     e
   }
@@ -362,6 +371,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
       val e = Wire(new ITCEntry)
       e.valid  := true.B
+      e.tag    := (if (useTags) Mux(is_victim, b_tag, b_ways(w).tag) else 0.U)
       e.target := Mux(is_victim, b_target, b_ways(w).target)
       e.rpv    := Mux(clear_nru, 0.U, 1.U)
       // Folded write: single call site, Muxed addr/data, no mask → 1R1W → BRAM
@@ -388,6 +398,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
       val e = Wire(new ITCEntry)
       e.valid  := true.B
+      e.tag    := (if (useTags) Mux(is_victim, b_tag, b_ways(w).tag) else 0.U)
       e.target := Mux(is_victim, b_target, b_ways(w).target)
       e.rpv    := Mux(is_hitway, 0.U,                       // hit-promotion
                   Mux(is_victim, 2.U,                       // SRRIP long insertion
@@ -408,6 +419,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     s2_resp(w).is_jal && s2_resp(w).taken))
   val s2_snip_col   = PriorityEncoder(s2_jalr_mask)
   val s2_itc_set    = RegNext(RegNext(itcSet(io.f0_pc)))  // double RegNext → s2 stage
+  val s2_itc_tag    = RegNext(RegNext(itcTag(io.f0_pc)))
   val s2_read_addr  = itcAddr(s2_itc_set, s2_snip_col)
   val s3_pool = VecInit((0 until itc_nWays).map(w =>
     itc(w).read(s2_read_addr, s2_valid)))
@@ -415,6 +427,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Carry s2_snip_col to s3 — one source, used for both read and override
   val snip_col     = RegNext(s2_snip_col)
   val s3_has_jalr  = RegNext(s2_jalr_mask.asUInt.orR)
+  val s3_itc_tag   = RegNext(s2_itc_tag)
 
   val s3_resp = io.resp_in(0).f3
   val s3_taken_mask = VecInit((0 until bankWidth).map(w => s3_resp(w).taken))
@@ -427,7 +440,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // ── Hamming-match + min-select (s3) ────────────────────────────────────────
   // JALR proxy: is_jal && taken. Already computed at s2, carried via RegNext.
   val cand_fp    = VecInit(s3_pool.map(e => extractFp(e.target)))
-  val cand_valid = VecInit(s3_pool.map(e => e.valid))
+  val cand_valid = VecInit(s3_pool.map { e =>
+    e.valid && (if (useTags) (e.tag === s3_itc_tag) else true.B)
+  })
 
   // Predict-side which-bits mask: only discriminative bits count toward the gate.
   // Mirrors training-side suppression so the confidence gate ignores untrained bits.

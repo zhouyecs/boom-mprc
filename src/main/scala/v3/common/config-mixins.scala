@@ -84,6 +84,8 @@ case object BoomBlbpUseSelectiveBit extends Field[Boolean](false)
 case object BoomBlbpUseTargetHash extends Field[Boolean](false)
 case object BoomBlbpUsePrivateHist extends Field[Boolean](false)
 case object BoomBlbpHistIdBits     extends Field[Int](3)
+case object BoomBlbpUseTags  extends Field[Boolean](false)
+case object BoomBlbpTagBits  extends Field[Int](8)
 case object BoomBlbpThetaInit   extends Field[Int](256)
 case object BoomBlbpThetaStep   extends Field[Int](32)
 case object BoomBlbpThetaSpeed  extends Field[Int](4)
@@ -123,6 +125,11 @@ class WithBlbpTargetHash extends Config((site, here, up) => {
 
 class WithBlbpPrivateHist extends Config((site, here, up) => {
   case BoomBlbpUsePrivateHist => true
+})
+
+class WithBlbpTags(bits: Int = 8) extends Config((site, here, up) => {
+  case BoomBlbpUseTags => true
+  case BoomBlbpTagBits  => bits
 })
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
