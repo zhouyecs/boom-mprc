@@ -26,9 +26,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val useRegion  = p(BoomBlbpUseRegion)
   val lg2Regions = p(BoomBlbpLg2Regions)
   val offsetBits = p(BoomBlbpOffsetBits)
-  val nregions   = 1 << lg2Regions
+  val nRegions   = p(BoomBlbpNRegions)
+  val regionRRIP = p(BoomBlbpRegionRRIP)
+  require(isPow2(nRegions), s"BoomBlbpNRegions ($nRegions) must be a power of 2")
+  val regionIdxW = log2Ceil(nRegions)
   val regionBits = vaddrBitsExtended - offsetBits
-  val tgtBits    = if (useRegion) lg2Regions + offsetBits else vaddrBitsExtended
+  val tgtBits    = if (useRegion) regionIdxW + offsetBits else vaddrBitsExtended
   val usePrivateHist = p(BoomBlbpUsePrivateHist)
   val useLocalHist   = p(BoomBlbpUseLocalHist)
   val nLHist         = p(BoomBlbpNLHist)
@@ -70,8 +73,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def itcAddr(set: UInt, col: UInt): UInt = Cat(set, col(log2Ceil(bankWidth)-1, 0))
 
   // Region table: compressed {region_index, offset} → full target reconstruction
-  val region_entries = RegInit(VecInit(Seq.fill(nregions)(0.U(regionBits.W))))
-  val region_valid   = RegInit(VecInit(Seq.fill(nregions)(false.B)))
+  val region_entries = RegInit(VecInit(Seq.fill(nRegions)(0.U(regionBits.W))))
+  val region_valid   = RegInit(VecInit(Seq.fill(nRegions)(false.B)))
+  // RRIP replacement for region table (2-bit RRPV, opt-in; default random unchanged)
+  val region_rrpv = if (regionRRIP) Some(RegInit(VecInit(Seq.fill(nRegions)(3.U(2.W))))) else None
   val rand_counter   = RegInit("hdeadb10c".U(32.W))
   def entryTarget(e: ITCEntry): UInt =
     if (!useRegion) e.tgt
@@ -113,6 +118,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val blbp_ghist = if (!useBlbpSpecHist) RegInit(0.U(maxHist.W)) else 0.U(maxHist.W)
   val idhPredict = if (useBlbpSpecHist) io.f1_idh else blbp_ghist   // s1-aligned
 
+  val useBias   = p(BoomBlbpUseBias)
   val coeffBias = 68
   val coeffs = VecInit(Seq(68, 56, 48, 37, 31, 24, 17, 17).map(_.S(8.W)))
 
@@ -123,8 +129,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val adapt_train = WireDefault(false.B)
 
   val weights = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(5.W))))
-  val biasMem = SyncReadMem(nbias, Vec(F, SInt(5.W)))
-
+  val biasMem = if (useBias) Some(SyncReadMem(nbias, Vec(F, SInt(5.W)))) else None
   val fp_untrained = ((1 << F) - 1).U(F.W)
 
   // ── Meta layout constants (LSB-first) ─────────────────────────────────────
@@ -133,12 +138,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // [W_BASE-1:W_HAM+W_SIG+W_FP] valid (1) → W_BASE = 35
   val W_FP = F; val W_SIG = F; val W_HAM = 4; val W_VALID = 1
   val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
-  val W_BIAS  = F * 5                              // 75
+  val W_BIAS  = if (useBias) F * 5 else 0            // 75 or 0 (gated)
   val W_WT    = Tbl * F * 5                        // 600
   val W_ITC_ENTRY = 1 + blbpTagBits + tgtBits + 2   // valid(1) + tag + tgt + rpv(2)
   val W_POOL  = itc_nWays * W_ITC_ENTRY
   val offBias = W_BASE                             // 35
-  val offWt   = offBias + W_BIAS                   // 110
+  val offWt   = offBias + W_BIAS                   // 110 (bias on) or 35 (bias off)
   val offPool = offWt   + W_WT                     // 710
   val W_HIST  = maxHist                              // carried private history
   val offHist = offPool + W_POOL                     // after pool
@@ -149,8 +154,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++
-    Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) :+
-    ("blbp_bias", nbias, F * 5)
+    Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) ++
+    (if (useBias) Seq(("blbp_bias", nbias, F * 5)) else Nil)
 
   // Index helpers
   def foldHist(hist: UInt, len: Int): UInt = {
@@ -201,7 +206,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // PREDICT-SIDE sum_w formula (for bit-identity check with training):
   //   s2_sum(w) = Σ_t (s2_wt(t)(w) * coeffs(t)) + (s2_bia(w) * coeffBias)
   //   s3_sum = RegNext(s2_sum); fp_bit = (s3_sum(w) >= 0.S)
-  val biasIdx = fetchIdx(s1_pc)(log2Ceil(nbias) - 1, 0)
+  val biasIdx = if (useBias) fetchIdx(s1_pc)(log2Ceil(nbias) - 1, 0) else 0.U
   val readEn  = s1_valid && wt_init_done
   val local_hist = lhist(lhIdx(s1_pc))                 // combinational, s1
   val s2_wt = VecInit((0 until Tbl).map { t =>
@@ -211,15 +216,16 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       else                        tblIdx(s1_pc, io.f1_ghist, t)
     weights(t).read(idx, readEn)
   })
-  val s2_bia = biasMem.read(biasIdx, readEn)
+  val s2_bia = if (useBias) biasMem.get.read(biasIdx, readEn) else VecInit(Seq.fill(F)(0.S(5.W)))
 
   val s2_sum = VecInit((0 until F).map { w =>
     val wt = (0 until Tbl).map { t => (xfer(s2_wt(t)(w)) * coeffs(t)).asSInt }.reduce(_ + _)
-    (wt + (xfer(s2_bia(w)) * coeffBias.S).asSInt).asSInt
+    if (useBias) (wt + (xfer(s2_bia(w)) * coeffBias.S).asSInt).asSInt
+    else         wt
   })
 
   val s3_sum = RegNext(s2_sum)
-  val s3_bia = RegNext(s2_bia)
+  val s3_bia = if (useBias) RegNext(s2_bia) else 0.U.asTypeOf(Vec(F, SInt(5.W)))
   val s3_wt  = RegNext(s2_wt)
   val s3_local_hist = RegNext(RegNext(local_hist))   // s1 → s3
   val s3_blbp_ghist =
@@ -246,7 +252,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_b_fire      = RegNext(tr_fire, false.B)
   val tr_b_target    = RegNext(u.target)
   val tr_b_fp        = RegNext(io.update.bits.meta(F - 1, 0))
-  val tr_carried_bia = RegNext(io.update.bits.meta(offBias + W_BIAS - 1, offBias)).asTypeOf(Vec(F, SInt(5.W)))
+  val tr_carried_bia = if (useBias)
+    RegNext(io.update.bits.meta(offBias + W_BIAS - 1, offBias)).asTypeOf(Vec(F, SInt(5.W)))
+    else VecInit(Seq.fill(F)(0.S(5.W)))
   val tr_carried_wt  = RegNext(io.update.bits.meta(offWt   + W_WT   - 1, offWt  )).asTypeOf(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_carried_pool= RegNext(io.update.bits.meta(offPool + W_POOL - 1, offPool)).asTypeOf(Vec(itc_nWays, new ITCEntry))
   val carried_hist   = RegNext(io.update.bits.meta(offHist + W_HIST - 1, offHist))
@@ -276,7 +284,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_b_bias_idx  = RegInit(0.U(log2Ceil(nbias).W))
   when (tr_fire) {
     tr_b_idx      := VecInit((0 until Tbl).map(t => tblIdxUpd(t)))
-    tr_b_bias_idx := fetchIdx(u.pc)(log2Ceil(nbias) - 1, 0)
+    if (useBias) { tr_b_bias_idx := fetchIdx(u.pc)(log2Ceil(nbias) - 1, 0) }
   }
 
   // Training RMW at tr_b_fire: one write per table, all F bits updated in parallel
@@ -287,7 +295,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   //   sum_w = Σ_t (tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
   val tr_we = Wire(Vec(F, Bool()))
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
-  val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
+  val tr_updated_bias = if (useBias) Wire(Vec(F, SInt(5.W))) else VecInit(Seq.fill(F)(0.S(5.W)))
 
   // Which-bits mask from carried pool (same pool s3_pool / cand_fp used at predict)
   val sb_fp    = VecInit(tr_carried_pool.map(e => extractFp(entryTarget(e))))
@@ -300,9 +308,13 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
 
   for (w <- 0 until F) {
-    val sum_w = (0 until Tbl).map { t =>
-      (xfer(tr_carried_wt(t)(w)) * coeffs(t)).asSInt
-    }.reduce(_ + _) + (xfer(tr_carried_bia(w)) * coeffBias.S).asSInt
+    val sum_w = {
+      val wsum = (0 until Tbl).map { t =>
+        (xfer(tr_carried_wt(t)(w)) * coeffs(t)).asSInt
+      }.reduce(_ + _)
+      if (useBias) wsum + (xfer(tr_carried_bia(w)) * coeffBias.S).asSInt
+      else         wsum
+    }
     val pred_bit   = (sum_w >= 0.S).asUInt
     val target_bit = tr_actual_fp(w)
     val correct = (pred_bit === target_bit)
@@ -333,9 +345,11 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) + delta, tr_carried_wt(t)(w))
       tr_updated_wt(t)(w) := Mux(raw > 15.S, 15.S, Mux(raw < -16.S, -16.S, raw))
     }
-    val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-    val b_raw   = Mux(tr_we(w), tr_carried_bia(w) + b_delta, tr_carried_bia(w))
-    tr_updated_bias(w) := Mux(b_raw > 15.S, 15.S, Mux(b_raw < -16.S, -16.S, b_raw))
+    if (useBias) {
+      val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
+      val b_raw   = Mux(tr_we(w), tr_carried_bia(w) + b_delta, tr_carried_bia(w))
+      tr_updated_bias(w) := Mux(b_raw > 15.S, 15.S, Mux(b_raw < -16.S, -16.S, b_raw))
+    }
   }
 
   val tr_any_we = tr_we.asUInt.orR
@@ -349,11 +363,13 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val wr_data = Mux(init_wr, initRow, tr_updated_wt(t))
     when (wr_en) { weights(t).write(wr_idx, wr_data) }
   }
-  val bias_init = !wt_init_done
-  val bwr_en    = bias_init || (tr_b_fire && tr_any_we)
-  val bwr_idx   = Mux(bias_init, wt_init_idx, tr_b_bias_idx)
-  val bwr_data  = Mux(bias_init, initRow, tr_updated_bias)
-  when (bwr_en) { biasMem.write(bwr_idx, bwr_data) }
+  if (useBias) {
+    val bias_init = !wt_init_done
+    val bwr_en    = bias_init || (tr_b_fire && tr_any_we)
+    val bwr_idx   = Mux(bias_init, wt_init_idx, tr_b_bias_idx)
+    val bwr_data  = Mux(bias_init, initRow, tr_updated_bias)
+    when (bwr_en) { biasMem.get.write(bwr_idx, bwr_data) }
+  }
 
   // Convergence observer
   io.tr_event       := tr_b_fire
@@ -410,16 +426,36 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Region-table allocation (insert only)
   val victim_tgt = if (useRegion) {
     val region_number = b_target(vaddrBitsExtended-1, offsetBits)
-    val match_oh = VecInit((0 until nregions).map(i =>
+    val match_oh = VecInit((0 until nRegions).map(i =>
       region_valid(i) && (region_entries(i) === region_number)))
     val free_oh  = VecInit(region_valid.map(!_))
-    val rand_slot = rand_counter(lg2Regions-1, 0)
+    val rand_slot = rand_counter(regionIdxW-1, 0)
+
+    val region_full = !free_oh.asUInt.orR
+    val rrip_victim = if (regionRRIP) {
+      val rr = region_rrpv.get
+      val maxRrpv = rr.reduce((a,b) => Mux(a >= b, a, b))
+      PriorityEncoder(rr.map(_ === maxRrpv))
+    } else rand_slot
+
     val alloc_slot = Mux(match_oh.asUInt.orR, PriorityEncoder(match_oh),
-                     Mux(free_oh.asUInt.orR,  PriorityEncoder(free_oh), rand_slot))
+                    Mux(free_oh.asUInt.orR,  PriorityEncoder(free_oh), rrip_victim))
+
     when (b_fire && !b_hit) {
       region_entries(alloc_slot) := region_number
       region_valid(alloc_slot)   := true.B
       rand_counter := rand_counter + 17.U
+      if (regionRRIP) {
+        val rr = region_rrpv.get
+        val age = 3.U - rr.reduce((a,b) => Mux(a >= b, a, b))
+        when (region_full) { rr.foreach(r => r := r + age) }  // age ONLY when evicting
+        rr(alloc_slot) := 2.U                                  // insert value on the actual slot
+      }
+    }
+    if (regionRRIP) {
+      when (b_fire && b_hit && match_oh.asUInt.orR) {
+        region_rrpv.get(PriorityEncoder(match_oh)) := 0.U      // promote on reuse
+      }
     }
     Cat(alloc_slot, b_target(offsetBits-1, 0))
   } else {
@@ -592,8 +628,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
   // Layout: hist | pool | wt | bias | valid|min_ham|sig|fingerprint
-  io.f3_meta := Cat(s3_local_hist, s3_blbp_ghist, s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
-                    snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
+  io.f3_meta := Cat(s3_local_hist, s3_blbp_ghist, s3_pool.asUInt, s3_wt.asUInt,
+    (if (useBias) s3_bia.asUInt else 0.U(0.W)),
+    snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
   // F3 target override: correct predicted_pc when confident (first active change)
   val snip_override = snip_valid && (snip_min_ham <= override_thresh.U)

@@ -89,6 +89,13 @@ case object BoomBlbpTagBits  extends Field[Int](8)
 case object BoomBlbpUseRegion  extends Field[Boolean](false)
 case object BoomBlbpLg2Regions extends Field[Int](7)
 case object BoomBlbpOffsetBits extends Field[Int](20)
+case object BoomBlbpNRegions   extends Field[Int](128)
+case object BoomBlbpRegionRRIP extends Field[Boolean](false)
+case object BoomBlbpUseBias extends Field[Boolean](true)
+
+class WithBlbpNoBias extends Config((site, here, up) => {
+  case BoomBlbpUseBias => false
+})
 case object BoomBlbpUseLocalHist extends Field[Boolean](false)
 case object BoomBlbpNLHist       extends Field[Int](256)
 case object BoomBlbpLHLength     extends Field[Int](10)
@@ -144,7 +151,19 @@ class WithBlbpRegion(lg2Regions: Int = 7, offsetBits: Int = 20)
     case BoomBlbpUseRegion  => true
     case BoomBlbpLg2Regions => lg2Regions
     case BoomBlbpOffsetBits => offsetBits
+    case BoomBlbpNRegions   => 1 << lg2Regions
   })
+
+class WithBlbpRegionSize(n: Int = 128) extends Config((site, here, up) => {
+  case BoomBlbpNRegions => n
+})
+
+class WithBlbpRegionRRIP extends Config((site, here, up) => {
+  case BoomBlbpRegionRRIP => true
+})
+
+class WithBlbpRegion16RRIP extends Config(
+  new WithBlbpRegionRRIP ++ new WithBlbpRegionSize(16))
 
 class WithBlbpLocalHist extends Config((site, here, up) => {
   case BoomBlbpUseLocalHist => true
