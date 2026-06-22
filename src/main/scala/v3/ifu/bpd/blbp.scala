@@ -84,10 +84,23 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val E = 1024
   val nbias = 4096
 
+  // Direction-history fold windows (capped by BOOM global history) — direction only
   val histLens = Seq(0, 2, 4, 8, 12, 18, 28, 42).map(_ min globalHistoryLength)
-  val maxHist = histLens.max   // 42 — largest history folded into weight index
-  require(!useBlbpSpecHist || maxHist == blbpIdhLen,
-    s"BLBP maxHist ($maxHist) must equal BoomBlbpIdhLen ($blbpIdhLen)")
+
+  // idbits history depth: config-driven, DECOUPLED from globalHistoryLength
+  val maxHist = blbpIdhLen                       // was histLens.max; now the config knob (default 42)
+  require(maxHist >= histLens.max,
+    s"maxHist ($maxHist) must be >= direction window max (${histLens.max})")
+  require(histIdBits == blbpIdhShift,
+    s"histIdBits ($histIdBits) must equal blbpIdhShift ($blbpIdhShift) — set both via WithBlbpIdbits")
+  require(histIdBits <= F, s"histIdBits ($histIdBits) cannot exceed fingerprint width F ($F)")
+
+  // idbits fold windows: scale the base pattern to maxHist, NOT capped by globalHistoryLength.
+  // At maxHist==42 (default) this is exactly the old shared histLens => behavior unchanged.
+  private val idhLensBase = Seq(0, 2, 4, 8, 12, 18, 28, 42)
+  val idhLens = idhLensBase.map(l => math.min(l * maxHist / idhLensBase.max, maxHist))
+  require(idhLens.max <= maxHist && idhLens.length == Tbl,
+    s"idhLens must have Tbl entries and max <= maxHist")
 
   // Per-branch local history: shift register of one target fingerprint bit
   val lhist = RegInit(VecInit(Seq.fill(nLHist)(0.U(lhLength.W))))
@@ -157,7 +170,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Hybrid: directions from `ghist`, indirect idbits from `idh`, XOR-mixed
   def tblIdxMix(pc: UInt, ghist: UInt, idh: UInt, t: Int): UInt =
-    (fetchIdx(pc) ^ foldHist(ghist, histLens(t)) ^ foldHist(idh, histLens(t)))(log2Ceil(E) - 1, 0)
+    (fetchIdx(pc) ^ foldHist(ghist, histLens(t)) ^ foldHist(idh, idhLens(t)))(log2Ceil(E) - 1, 0)
 
   // Target fingerprint extraction. Bit-selection (default) or XOR-folded hash.
   def extractFp(target: UInt): UInt = {

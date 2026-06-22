@@ -150,6 +150,19 @@ class WithBlbpLocalHist extends Config((site, here, up) => {
   case BoomBlbpUseLocalHist => true
 })
 
+// idbits sweep: coherent bits-per-indirect + total-depth, mirrors SpecHist core.copy pattern
+class WithBlbpIdbits(bitsPerIndirect: Int = 3, totalBits: Int = 42)
+  extends Config((site, here, up) => {
+    case BoomBlbpHistIdBits => bitsPerIndirect
+    case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+      case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+        blbpIdhShift = bitsPerIndirect,
+        blbpIdhLen   = totalBits
+      )))
+      case other => other
+    }
+  })
+
 class WithBlbpSpecHist extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
