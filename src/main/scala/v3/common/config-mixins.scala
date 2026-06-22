@@ -89,6 +89,10 @@ case object BoomBlbpTagBits  extends Field[Int](8)
 case object BoomBlbpUseRegion  extends Field[Boolean](false)
 case object BoomBlbpLg2Regions extends Field[Int](7)
 case object BoomBlbpOffsetBits extends Field[Int](20)
+case object BoomBlbpUseLocalHist extends Field[Boolean](false)
+case object BoomBlbpNLHist       extends Field[Int](256)
+case object BoomBlbpLHLength     extends Field[Int](10)
+case object BoomBlbpLBit         extends Field[Int](3)
 case object BoomBlbpThetaInit   extends Field[Int](256)
 case object BoomBlbpThetaStep   extends Field[Int](32)
 case object BoomBlbpThetaSpeed  extends Field[Int](4)
@@ -141,6 +145,19 @@ class WithBlbpRegion(lg2Regions: Int = 7, offsetBits: Int = 20)
     case BoomBlbpLg2Regions => lg2Regions
     case BoomBlbpOffsetBits => offsetBits
   })
+
+class WithBlbpLocalHist extends Config((site, here, up) => {
+  case BoomBlbpUseLocalHist => true
+})
+
+class WithBlbpSpecHist extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      blbpSpecHist = true
+    )))
+    case other => other
+  }
+})
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {

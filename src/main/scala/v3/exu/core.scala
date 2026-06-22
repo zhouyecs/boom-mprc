@@ -714,7 +714,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       io.ifu.get_pc(1).pc,
       ftq_entry.cfi_is_call && ftq_entry.cfi_idx.bits === cfi_idx,
       ftq_entry.cfi_is_ret  && ftq_entry.cfi_idx.bits === cfi_idx,
-      ftq_entry.cfi_is_pop_push && ftq_entry.cfi_idx.bits === cfi_idx)
+      ftq_entry.cfi_is_pop_push && ftq_entry.cfi_idx.bits === cfi_idx,
+      cfi_target = mispredict_target,
+      cfi_is_indirect_taken = brupdate.b2.cfi_type === CFI_JALR &&
+                              !(ftq_entry.cfi_is_ret && ftq_entry.cfi_idx.bits === cfi_idx) &&
+                              brupdate.b2.taken)
 
 
     io.ifu.redirect_ghist   := Mux(

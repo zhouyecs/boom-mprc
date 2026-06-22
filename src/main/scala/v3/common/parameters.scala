@@ -73,6 +73,12 @@ case class BoomCoreParams(
   snipPcLoBit:    Int = 2,
   snipPcBits:     Int = 11,
 
+  /* BLBP speculative indirect-target history */
+  blbpSpecHist:  Boolean = false,
+  blbpIdhLen:    Int = 42,
+  blbpIdhShift:  Int = 3,
+  blbpIdhLoBit:  Int = 1,
+
   /* more stuff */
   useCompressed: Boolean = true,
   useFetchMonitor: Boolean = true,
@@ -266,6 +272,12 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val snipPcLoBit    = boomParams.snipPcLoBit
   val snipPcBits     = boomParams.snipPcBits
   val snipPcHiBit    = snipPcLoBit + snipPcBits - 1
+
+  // BLBP speculative indirect-target history
+  val useBlbpSpecHist = boomParams.blbpSpecHist
+  val blbpIdhLen   = boomParams.blbpIdhLen
+  val blbpIdhShift = boomParams.blbpIdhShift
+  val blbpIdhLoBit = boomParams.blbpIdhLoBit
   val useRAS = boomParams.numRasEntries > 0
   val enableRasTopRepair = boomParams.enableRasTopRepair
 

@@ -59,6 +59,9 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
   // SNIP path-address ring: ringEntries × pcBits; 0-width when disabled
   val path_history = UInt((if (useSnipPathRing) snipRingEntries * snipPcBits else 0).W)
 
+  // BLBP speculative indirect-target history; 0-width when disabled
+  val blbp_idh = UInt((if (useBlbpSpecHist) blbpIdhLen else 0).W)
+
   def histories(bank: Int) = {
     if (nBanks == 1) {
       old_history
@@ -84,7 +87,9 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
 
   def update(branches: UInt, cfi_taken: Bool, cfi_is_br: Bool, cfi_idx: UInt,
     cfi_valid: Bool, addr: UInt,
-    cfi_is_call: Bool, cfi_is_ret: Bool, cfi_is_pop_push: Bool): GlobalHistory = {
+    cfi_is_call: Bool, cfi_is_ret: Bool, cfi_is_pop_push: Bool,
+    cfi_target: UInt = 0.U,
+    cfi_is_indirect_taken: Bool = false.B): GlobalHistory = {
     val cfi_idx_fixed = cfi_idx(log2Ceil(fetchWidth)-1,0)
     val cfi_idx_oh = UIntToOH(cfi_idx_fixed)
     val new_history = Wire(new GlobalHistory)
@@ -117,6 +122,11 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
         new_history.path_history := Mux(shift_old_history,
           (path_history << snipPcBits | newpc)((snipRingEntries * snipPcBits) - 1, 0),
           path_history)
+      }
+      if (useBlbpSpecHist) {
+        val idh_bits = cfi_target(blbpIdhLoBit + blbpIdhShift - 1, blbpIdhLoBit)
+        new_history.blbp_idh := Mux(cfi_is_indirect_taken,
+          ((blbp_idh << blbpIdhShift) | idh_bits)(blbpIdhLen - 1, 0), blbp_idh)
       }
     } else {
       // DEAD PATH for nBanks==1 configs (MediumBoomV3Config etc.).
@@ -983,7 +993,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
     f3_fetch_bundle.pc,
     f3_fetch_bundle.cfi_is_call,
     f3_fetch_bundle.cfi_is_ret,
-    f3_fetch_bundle.cfi_is_pop_push
+    f3_fetch_bundle.cfi_is_pop_push,
+    cfi_target = f3_predicted_target,
+    cfi_is_indirect_taken = f3_fetch_bundle.cfi_idx.valid &&
+                            (f3_fetch_bundle.cfi_type === CFI_JALR) &&
+                            !f3_fetch_bundle.cfi_is_ret
   )
 
   if (IN_SIMULATION && useSnipPathRing) {
@@ -1004,9 +1018,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
 
   val f3_pathDiverged_f1 = if (useSnipPathRing) s1_ghist.path_history =/= f3_predicted_ghist.path_history else false.B
-  val f3_correct_f1_ghist = (s1_ghist =/= f3_predicted_ghist || f3_pathDiverged_f1) && enableGHistStallRepair.B
+  val f3_idhDiverged_f1  = if (useBlbpSpecHist) s1_ghist.blbp_idh =/= f3_predicted_ghist.blbp_idh else false.B
+  val f3_correct_f1_ghist = (s1_ghist =/= f3_predicted_ghist || f3_pathDiverged_f1 || f3_idhDiverged_f1) && enableGHistStallRepair.B
   val f3_pathDiverged_f2 = if (useSnipPathRing) s2_ghist.path_history =/= f3_predicted_ghist.path_history else false.B
-  val f3_correct_f2_ghist = (s2_ghist =/= f3_predicted_ghist || f3_pathDiverged_f2) && enableGHistStallRepair.B
+  val f3_idhDiverged_f2  = if (useBlbpSpecHist) s2_ghist.blbp_idh =/= f3_predicted_ghist.blbp_idh else false.B
+  val f3_correct_f2_ghist = (s2_ghist =/= f3_predicted_ghist || f3_pathDiverged_f2 || f3_idhDiverged_f2) && enableGHistStallRepair.B
 
   when (f3.io.deq.valid && f4_ready) {
     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {

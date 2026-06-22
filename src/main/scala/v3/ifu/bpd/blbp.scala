@@ -30,6 +30,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val regionBits = vaddrBitsExtended - offsetBits
   val tgtBits    = if (useRegion) lg2Regions + offsetBits else vaddrBitsExtended
   val usePrivateHist = p(BoomBlbpUsePrivateHist)
+  val useLocalHist   = p(BoomBlbpUseLocalHist)
+  val nLHist         = p(BoomBlbpNLHist)
+  val lhLength       = p(BoomBlbpLHLength)
+  val lbit           = p(BoomBlbpLBit)
   val histIdBits     = p(BoomBlbpHistIdBits)
   val thetaInit   = p(BoomBlbpThetaInit)
   val thetaStep   = p(BoomBlbpThetaStep)
@@ -82,9 +86,19 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val histLens = Seq(0, 2, 4, 8, 12, 18, 28, 42).map(_ min globalHistoryLength)
   val maxHist = histLens.max   // 42 — largest history folded into weight index
+  require(!useBlbpSpecHist || maxHist == blbpIdhLen,
+    s"BLBP maxHist ($maxHist) must equal BoomBlbpIdhLen ($blbpIdhLen)")
+
+  // Per-branch local history: shift register of one target fingerprint bit
+  val lhist = RegInit(VecInit(Seq.fill(nLHist)(0.U(lhLength.W))))
+  def lhIdx(pc: UInt): UInt = {
+    val fi = fetchIdx(pc); val w = log2Ceil(nLHist)
+    (fi(w-1,0) ^ fi(2*w-1, w))
+  }
 
   // Private mixed history: commit-updated, carried in meta (read-row == write-row).
-  val blbp_ghist = RegInit(0.U(maxHist.W))
+  val blbp_ghist = if (!useBlbpSpecHist) RegInit(0.U(maxHist.W)) else 0.U(maxHist.W)
+  val idhPredict = if (useBlbpSpecHist) io.f1_idh else blbp_ghist   // s1-aligned
 
   val coeffBias = 68
   val coeffs = VecInit(Seq(68, 56, 48, 37, 31, 24, 17, 17).map(_.S(8.W)))
@@ -115,8 +129,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val offPool = offWt   + W_WT                     // 710
   val W_HIST  = maxHist                              // carried private history
   val offHist = offPool + W_POOL                     // after pool
+  val W_LHIST  = lhLength                             // carried local history
+  val offLHist = offHist + W_HIST                     // after private hist
 
-  override val metaSz = offHist + W_HIST // hist + pool + wt + bias + valid+min_ham+sig+fp
+  override val metaSz = offLHist + W_LHIST // lhist + hist + pool + wt + bias + valid+min_ham+sig+fp
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++
@@ -174,9 +190,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   //   s3_sum = RegNext(s2_sum); fp_bit = (s3_sum(w) >= 0.S)
   val biasIdx = fetchIdx(s1_pc)(log2Ceil(nbias) - 1, 0)
   val readEn  = s1_valid && wt_init_done
+  val local_hist = lhist(lhIdx(s1_pc))                 // combinational, s1
   val s2_wt = VecInit((0 until Tbl).map { t =>
-    val idx = if (usePrivateHist) tblIdxMix(s1_pc, io.f1_ghist, blbp_ghist, t)
-              else                tblIdx   (s1_pc, io.f1_ghist, t)
+    val idx =
+      if (useLocalHist && t == 0) (fetchIdx(s1_pc) ^ local_hist)(log2Ceil(E)-1, 0)
+      else if (usePrivateHist)    tblIdxMix(s1_pc, io.f1_ghist, idhPredict, t)
+      else                        tblIdx(s1_pc, io.f1_ghist, t)
     weights(t).read(idx, readEn)
   })
   val s2_bia = biasMem.read(biasIdx, readEn)
@@ -189,7 +208,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val s3_sum = RegNext(s2_sum)
   val s3_bia = RegNext(s2_bia)
   val s3_wt  = RegNext(s2_wt)
-  val s3_blbp_ghist = RegNext(RegNext(blbp_ghist))
+  val s3_local_hist = RegNext(RegNext(local_hist))   // s1 → s3
+  val s3_blbp_ghist =
+    if (useBlbpSpecHist) RegNext(RegNext(io.f1_idh))   // s1 -> s3, matches idhPredict vintage
+    else                 RegNext(RegNext(blbp_ghist))
   val s3_fingerprint = VecInit(s3_sum.map(s => (s >= 0.S).asUInt)).asUInt
 
   // ── Commit-side Training RMW ────────────────────────────────────────────────
@@ -202,8 +224,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // commit-side reads DROPPED — weights + ITC carried in meta (TAGE pattern)
   def tblIdxUpd(t: Int): UInt = {
-    if (usePrivateHist) tblIdxMix(u.pc, io.update.bits.ghist, carried_hist, t)
-    else                tblIdx   (u.pc, io.update.bits.ghist, t)
+    if (useLocalHist && t == 0) (fetchIdx(u.pc) ^ carried_lhist)(log2Ceil(E)-1, 0)
+    else if (usePrivateHist)    tblIdxMix(u.pc, io.update.bits.ghist, carried_hist, t)
+    else                        tblIdx(u.pc, io.update.bits.ghist, t)
   }
 
   // 1 cycle later: unpack carried snapshots
@@ -214,14 +237,26 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_carried_wt  = RegNext(io.update.bits.meta(offWt   + W_WT   - 1, offWt  )).asTypeOf(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_carried_pool= RegNext(io.update.bits.meta(offPool + W_POOL - 1, offPool)).asTypeOf(Vec(itc_nWays, new ITCEntry))
   val carried_hist   = RegNext(io.update.bits.meta(offHist + W_HIST - 1, offHist))
+  val carried_lhist  = RegNext(io.update.bits.meta(offLHist + W_LHIST - 1, offLHist))
 
-  // Commit-time private history update: indirect-only idbits (directions from shared ghist)
-  if (usePrivateHist) {
+  // Commit-time private history update: indirect-only idbits (directions from shared ghist).
+  // In speculative mode the shift lives in GlobalHistory.update; this runs only off.
+  if (usePrivateHist && !useBlbpSpecHist) {
     val commitIndir = io.update.valid && u.is_commit_update &&
                       u.cfi_is_jalr && !u.cfi_is_ret && u.cfi_idx.valid
     when (commitIndir) {
       blbp_ghist := ((blbp_ghist << histIdBits) |
                      extractFp(u.target)(histIdBits - 1, 0))(maxHist - 1, 0)
+    }
+  }
+
+  // Commit-time local history update: per-branch, one fingerprint bit per indirect
+  if (useLocalHist) {
+    val commitIndir = io.update.valid && u.is_commit_update &&
+                      u.cfi_is_jalr && !u.cfi_is_ret && u.cfi_idx.valid
+    val li = lhIdx(u.pc)
+    when (commitIndir) {
+      lhist(li) := (Cat(lhist(li), extractFp(u.target)(lbit)))(lhLength-1, 0)
     }
   }
   val tr_b_idx       = RegInit(VecInit(Seq.fill(Tbl)(0.U(log2Ceil(E).W))))
@@ -544,7 +579,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
   // Layout: hist | pool | wt | bias | valid|min_ham|sig|fingerprint
-  io.f3_meta := Cat(s3_blbp_ghist, s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
+  io.f3_meta := Cat(s3_local_hist, s3_blbp_ghist, s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
                     snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
   // F3 target override: correct predicted_pc when confident (first active change)

@@ -147,6 +147,8 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     // Local history not available until end of f1
     val f1_ghist = Input(UInt(globalHistoryLength.W))
     val f1_lhist = Input(UInt(localHistoryLength.W))
+    // BLBP speculative indirect-target history (0-width when disabled)
+    val f1_idh   = Input(UInt((if (useBlbpSpecHist) blbpIdhLen else 0).W))
 
     val resp_in = Input(Vec(nInputs, new BranchPredictionBankResponse))
     val resp = Output(new BranchPredictionBankResponse)
@@ -338,6 +340,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 
     banked_predictors(0).io.f1_ghist := RegNext(io.f0_req.bits.ghist.histories(0))
     banked_predictors(0).io.f1_lhist := banked_lhist_providers(0).io.f1_lhist
+    banked_predictors(0).io.f1_idh   := (if (useBlbpSpecHist) RegNext(io.f0_req.bits.ghist.blbp_idh) else 0.U)
 
     banked_predictors(0).io.resp_in(0)           := (0.U).asTypeOf(new BranchPredictionBankResponse)
     // For RAS
