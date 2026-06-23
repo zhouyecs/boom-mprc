@@ -151,6 +151,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val offLHist = offHist + W_HIST                     // after private hist
 
   override val metaSz = offLHist + W_LHIST // lhist + hist + pool + wt + bias + valid+min_ham+sig+fp
+  require(metaSz <= bpdMaxMetaLength,
+    s"BLBP metaSz ($metaSz) exceeds bpdMaxMetaLength ($bpdMaxMetaLength) " +
+    s"— reduce itc_nWays ($itc_nWays) or increase bpdMaxMetaLength")
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++

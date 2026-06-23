@@ -113,6 +113,26 @@ class WithBlbpSmallITC extends Config((site, here, up) => {
   case BoomBlbpOverrideThresh => 2
 })
 
+// IBTB geometry sweep
+class WithBlbpITC(nSets: Int, nWays: Int) extends Config((site, here, up) => {
+  case BoomBlbpITCSets => nSets
+  case BoomBlbpITCWays => nWays
+})
+
+// starts low, trains aggressively
+class WithBlbpThetaPaper extends Config((site, here, up) => {
+  case BoomBlbpThetaInit  => 1
+  case BoomBlbpThetaStep  => 1
+  case BoomBlbpThetaSpeed => 1
+})
+
+class WithBlbpThetaTuned(init: Int = 4096, step: Int = 32, speed: Int = 4)
+  extends Config((site, here, up) => {
+    case BoomBlbpThetaInit  => init
+    case BoomBlbpThetaStep  => step
+    case BoomBlbpThetaSpeed => speed
+})
+
 class WithBlbpRRIP extends Config((site, here, up) => {
   case BoomBlbpUseRRIP => true
 })
@@ -741,7 +761,7 @@ class WithTAGEBPD extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
     case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
       // tage 56, fau btb 8, bim 8, btb 1, loop 10, snip ~710+8*(2+vaddrBitsExtended)
-      bpdMaxMetaLength = if (site(BoomLoopKey)) 1280 else 1280,
+      bpdMaxMetaLength = if (site(BoomLoopKey)) 3072 else 3072,
       globalHistoryLength = 64,
       localHistoryLength = 1,
       localHistoryNSets = 0,
