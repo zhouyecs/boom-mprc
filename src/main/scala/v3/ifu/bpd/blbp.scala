@@ -593,6 +593,21 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     Cat(!cand_valid(w), ham(w))  // 5-bit key
   })
 
+  // Balanced-tree reduce: same value as linear .reduce (addition is associative),
+  // but ~log2(n) logic depth instead of n. Preserves left-to-right order so the
+  // lower-index element is always the "a" side in pairwise combine (tie-break).
+  def treeReduce[T](xs: Seq[T])(f: (T, T) => T): T = {
+    require(xs.nonEmpty)
+    if (xs.length == 1) xs.head
+    else {
+      val paired = xs.grouped(2).map {
+        case Seq(a, b) => f(a, b)
+        case Seq(a)    => a            // odd tail passes through at its position
+      }.toSeq
+      treeReduce(paired)(f)
+    }
+  }
+
   // Pairwise min-select over itc_nWays ways, tie-break lower way
   def reduceMin(pairs: Seq[(UInt, UInt)]): (UInt, UInt) = {
     if (pairs.length == 1) {
@@ -606,18 +621,30 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       reduceMin(half)
     }
   }
+
   val snip_sel = if (useDotProduct) {
-    // Soft cosine/dot-product: Σ_k s3_sum(k) * (cand_fp(w)(k) ? +1 : -1)
+    // ── dotw: 15-term signed sum, tree instead of linear chain ──
+    // +& never truncates, addition is associative => value identical to .reduce(_ +& _)
     val dotw = VecInit((0 until itc_nWays).map { w =>
-      (0 until F).map { k =>
+      treeReduce((0 until F).map { k =>
         Mux(cand_fp(w)(k).asBool, s3_sum(k), -s3_sum(k))
-      }.reduce(_ +& _)            // signed accumulation, width auto-grown
+      })(_ +& _)
     })
-    // argmax over VALID ways, tie -> lower index (no sentinel needed)
-    (0 until itc_nWays).foldLeft(0.U(log2Ceil(itc_nWays).W)) { (acc, w) =>
-      val wBetter = cand_valid(w) && (!cand_valid(acc) || (dotw(w) > dotw(acc)))
-      Mux(wBetter, w.U, acc)
+
+    // ── argmax over VALID ways, tie -> lower index ──
+    // Pairwise combine reproduces the old foldLeft exactly:
+    //   b wins  iff  b.valid && (!a.valid || b.dot > a.dot)     (strict > => tie keeps a = lower idx)
+    // 'a' is always the lower-index side because treeReduce preserves order.
+    def selBetter(a: (UInt, Bool, SInt), b: (UInt, Bool, SInt)): (UInt, Bool, SInt) = {
+      val (aIdx, aVal, aDot) = a
+      val (bIdx, bVal, bDot) = b
+      val bWins = bVal && (!aVal || (bDot > aDot))
+      (Mux(bWins, bIdx, aIdx), aVal || bVal, Mux(bWins, bDot, aDot))
     }
+    val cands = (0 until itc_nWays).map(w =>
+      (w.U(log2Ceil(itc_nWays).W), cand_valid(w), dotw(w)))
+    val (sel, _, _) = treeReduce(cands)(selBetter)
+    sel
   } else {
     val (sel, _) = reduceMin((0 until itc_nWays).map(w =>
       (w.U(log2Ceil(itc_nWays).W), key(w))))
