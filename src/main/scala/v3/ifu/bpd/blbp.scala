@@ -155,6 +155,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     s"BLBP metaSz ($metaSz) exceeds bpdMaxMetaLength ($bpdMaxMetaLength) " +
     s"— reduce itc_nWays ($itc_nWays) or increase bpdMaxMetaLength")
 
+  println(s"[BLBP cfg] hash=$useTargetHash region=$useRegion dot=$useDotProduct " +
+    s"xfer=$useTransfer adapt=$useAdaptive selbit=$useSelectiveBit ph=$usePrivateHist " +
+    s"lh=$useLocalHist tags=$useTags bias=$useBias rrip=$useRRIP " +
+    s"sets=$itc_nSets ways=$itc_nWays theta=$thetaInit/$thetaStep/$thetaSpeed " +
+    s"maxHist=$maxHist metaSz=$metaSz/$bpdMaxMetaLength")
+
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++
     Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) ++
@@ -310,6 +316,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     anyOne && anyZero
   }
 
+  // Cold-start / single-candidate fallback: if NO bit is discriminative across the
+  // commit-side pool (cold weights, or ≤1 distinct target), SelectiveBit would gate
+  // training to zero forever. Mirror the C++ which_bits behavior: only suppress bits
+  // when there is a real discriminative set to suppress against. Otherwise train all.
+  val anyDiscrim = if (useSelectiveBit) (0 until F).map(w => discriminative(w)).reduce(_ || _) else true.B
+
   for (w <- 0 until F) {
     val sum_w = {
       val wsum = (0 until Tbl).map { t =>
@@ -323,7 +335,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val correct = (pred_bit === target_bit)
     val absSum  = Mux(sum_w < 0.S, -sum_w, sum_w)              // |sum_w|
     val underConf    = if (useAdaptive) (absSum < theta(w)) else false.B
-    val trainBit = if (useSelectiveBit) discriminative(w) else true.B
+    // val trainBit = if (useSelectiveBit) discriminative(w) else true.B
+    val trainBit = if (useSelectiveBit) (discriminative(w) || !anyDiscrim) else true.B
     tr_we(w) := ((pred_bit =/= target_bit) || underConf) && trainBit
 
     if (useAdaptive) {
@@ -415,6 +428,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val b_target = RegNext(u.target)
   val b_ways   = tr_carried_pool
 
+  val wr_dbg_cnt = RegInit(0.U(8.W))
+
   // Decompress carried pool for commit-side hit/sb (identity when off)
   val b_tgt = VecInit(b_ways.map(entryTarget))
 
@@ -469,6 +484,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val flatDepth = itc_nSets * bankWidth
   val init_done = RegInit(false.B)
   val init_idx  = RegInit(0.U(log2Ceil(flatDepth).W))
+  val dbg_cnt   = RegInit(0.U(8.W))
   val init_zero = {
     val e = Wire(new ITCEntry); e.valid := false.B; e.tag := 0.U; e.tgt := 0.U
     e.rpv := (if (useRRIP) 3.U(2.W) else 0.U(2.W))   // RRIP: distant; NRU: 0
@@ -487,6 +503,11 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val victim   = Mux(inval_oh.asUInt.orR, PriorityEncoder(inval_oh),
                    Mux(nru_oh.asUInt.orR,   PriorityEncoder(nru_oh), 0.U))
     val all_used = !inval_oh.asUInt.orR && !nru_oh.asUInt.orR
+
+    when (b_fire && wr_dbg_cnt < 20.U) {
+      wr_dbg_cnt := wr_dbg_cnt + 1.U
+      printf(p"[wr] set=${b_idx} col=${b_col} victim=${victim} hit=${b_hit} tgtfp=0x${Hexadecimal(extractFp(b_target))}\n")
+    }
 
     for (w <- 0 until itc_nWays) {
       val is_victim = !b_hit && (w.U === victim)
@@ -515,6 +536,11 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val max_oh    = VecInit(b_ways.map(w => w.rpv === maxRRPV))
     val victim    = Mux(has_inval, PriorityEncoder(inval_oh), PriorityEncoder(max_oh))
     val age_all   = !b_hit && !has_inval          // age the set only on a full miss
+
+    when (b_fire && wr_dbg_cnt < 20.U) {
+      wr_dbg_cnt := wr_dbg_cnt + 1.U
+      printf(p"[wr] set=${b_idx} col=${b_col} victim=${victim} hit=${b_hit} tgtfp=0x${Hexadecimal(extractFp(b_target))}\n")
+    }
 
     for (w <- 0 until itc_nWays) {
       val is_victim = !b_hit && (w.U === victim)
@@ -555,6 +581,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val snip_col     = RegNext(s2_snip_col)
   val s3_has_jalr  = RegNext(s2_jalr_mask.asUInt.orR)
   val s3_itc_tag   = RegNext(s2_itc_tag)
+  val s3_itc_set   = RegNext(s2_itc_set)
 
   // Decompress pool (identity when useRegion=false)
   val s3_pool_tgt = VecInit(s3_pool.map(entryTarget))
@@ -627,7 +654,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     // +& never truncates, addition is associative => value identical to .reduce(_ +& _)
     val dotw = VecInit((0 until itc_nWays).map { w =>
       treeReduce((0 until F).map { k =>
-        Mux(cand_fp(w)(k).asBool, s3_sum(k), -s3_sum(k))
+        val contrib = Mux(cand_fp(w)(k).asBool, s3_sum(k), -s3_sum(k))
+        Mux(discrimMask(k), contrib, 0.S)   // only discriminative bits vote
       })(_ +& _)
     })
 
@@ -644,6 +672,21 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val cands = (0 until itc_nWays).map(w =>
       (w.U(log2Ceil(itc_nWays).W), cand_valid(w), dotw(w)))
     val (sel, _, _) = treeReduce(cands)(selBetter)
+
+    if (IN_SIMULATION) {
+      val dbg_en = s3_valid && s3_has_jalr && cand_valid.asUInt.orR
+      val dbg_cnt = RegInit(0.U(8.W))
+      when (dbg_en && dbg_cnt < 20.U) {
+        dbg_cnt := dbg_cnt + 1.U
+        printf(p"[dot] sel=$sel fp=0x${Hexadecimal(s3_fingerprint)} mask=0x${Hexadecimal(discrimMask)}\n")
+        printf(p"[rd] set=${s3_itc_set} col=${snip_col}\n")
+        for (w <- 0 until itc_nWays) {
+          when (cand_valid(w)) {
+            printf(p"   way$w cand_fp=0x${Hexadecimal(cand_fp(w))} dot=${dotw(w)}\n")
+          }
+        }
+      }
+    }
     sel
   } else {
     val (sel, _) = reduceMin((0 until itc_nWays).map(w =>
