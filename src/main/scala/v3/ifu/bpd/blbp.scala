@@ -16,6 +16,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def itc_nWays = p(BoomBlbpITCWays)
   def override_thresh = p(BoomBlbpOverrideThresh)
   val useRRIP = p(BoomBlbpUseRRIP)
+  val usePLRU = p(BoomBlbpUsePLRU)
   val useDotProduct = p(BoomBlbpUseDotProduct)
   val useTransfer = p(BoomBlbpUseTransfer)
   val useAdaptive = p(BoomBlbpUseAdaptive)
@@ -29,6 +30,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val nRegions   = p(BoomBlbpNRegions)
   val regionRRIP = p(BoomBlbpRegionRRIP)
   require(isPow2(nRegions), s"BoomBlbpNRegions ($nRegions) must be a power of 2")
+  require(!(usePLRU && useRRIP), "PLRU and RRIP are mutually exclusive")
   val regionIdxW = log2Ceil(nRegions)
   val regionBits = vaddrBitsExtended - offsetBits
   val tgtBits    = if (useRegion) regionIdxW + offsetBits else vaddrBitsExtended
@@ -482,6 +484,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // ── ITC Initialization FSM (flat depth, single-entry writes) ─────────────────
   val flatDepth = itc_nSets * bankWidth
+  // Tree-pLRU replacement state (W-1 bits per set/col, separate from ITCEntry.rpv)
+  val L = log2Ceil(itc_nWays)
+  val nNodes = itc_nWays - 1
+  val itc_plru_state = if (usePLRU) Some(
+    RegInit(VecInit(Seq.fill(flatDepth)(0.U(nNodes.W))))
+  ) else None
   val init_done = RegInit(false.B)
   val init_idx  = RegInit(0.U(log2Ceil(flatDepth).W))
   val dbg_cnt   = RegInit(0.U(8.W))
@@ -496,7 +504,62 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     when (init_idx === (flatDepth - 1).U) { init_done := true.B }
   }
 
-  if (!useRRIP) {
+  if (usePLRU) {
+    // ── Tree-pLRU (invalid-first, tree-walk victim, MRU-update on access) ──
+    val inval_oh  = VecInit(b_ways.map(w => !w.valid))
+    val has_inval = inval_oh.asUInt.orR
+
+    // Tree walk root→leaf → victim
+    val tree_vec = VecInit(itc_plru_state.get(itcAddr(b_idx, b_col)).asBools)
+    val victim_bits = Wire(Vec(L, Bool()))
+    val tnode = Wire(Vec(L + 1, UInt(log2Ceil(nNodes + 1).W)))
+    tnode(0) := 0.U
+    for (l <- 0 until L) {
+      victim_bits(l) := tree_vec(tnode(l))
+      tnode(l + 1) := Mux(tree_vec(tnode(l)),
+        (tnode(l) << 1) + 2.U,   // right child
+        (tnode(l) << 1) + 1.U)   // left child
+    }
+    val plru_victim = Mux(has_inval, PriorityEncoder(inval_oh), victim_bits.asUInt)
+
+    // MRU update: flip path bits to point away from accessed way
+    val acc_way = Mux(b_hit, PriorityEncoder(b_hit_oh), plru_victim)
+    val plru_next = Wire(Vec(nNodes, Bool()))
+    for (i <- 0 until nNodes) {
+      val staticLevel = (0 until L).find(lv =>
+        i >= (1 << lv) - 1 && i < (1 << (lv + 1)) - 1).getOrElse(0)
+      val onPath = VecInit((0 until L).map(l => tnode(l) === i.U)).asUInt.orR
+      plru_next(i) := Mux(onPath, !acc_way(L - 1 - staticLevel), tree_vec(i))
+    }
+
+    // Tree state write-back
+    when (b_fire) {
+      itc_plru_state.get(itcAddr(b_idx, b_col)) := plru_next.asUInt
+    }
+
+    when (b_fire && wr_dbg_cnt < 20.U) {
+      wr_dbg_cnt := wr_dbg_cnt + 1.U
+      printf(p"[wr] set=${b_idx} col=${b_col} victim=${plru_victim} hit=${b_hit} tgtfp=0x${Hexadecimal(extractFp(b_target))}\n")
+    }
+
+    for (w <- 0 until itc_nWays) {
+      val is_victim = !b_hit && (w.U === plru_victim)
+      val is_hitway = b_hit && b_hit_oh(w)
+      val commit_we = b_fire && (is_victim || is_hitway)
+
+      val e = Wire(new ITCEntry)
+      e.valid  := true.B
+      e.tag    := (if (useTags) Mux(is_victim, b_tag, b_ways(w).tag) else 0.U)
+      e.tgt    := (if (useRegion) Mux(is_victim, victim_tgt, b_ways(w).tgt)
+                    else           Mux(is_victim, b_target,   b_ways(w).tgt))
+      e.rpv    := 0.U
+      // Folded write: single call site, Muxed addr/data, no mask → 1R1W → BRAM
+      val we    = init_wr || commit_we
+      val waddr = Mux(init_wr, init_idx, itcAddr(b_idx, b_col))
+      val wdata = Mux(init_wr, init_zero, e)
+      when (we) { itc(w).write(waddr, wdata) }
+    }
+  } else if (!useRRIP) {
     // ── NRU (reproduces Stage 2 exactly, rpv in {0,1}) ──
     val inval_oh = VecInit(b_ways.map(w => !w.valid))
     val nru_oh   = VecInit(b_ways.map(w => w.rpv === 0.U))
@@ -561,6 +624,55 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       val waddr = Mux(init_wr, init_idx, itcAddr(b_idx, b_col))
       val wdata = Mux(init_wr, init_zero, e)
       when (we) { itc(w).write(waddr, wdata) }
+    }
+  }
+
+  // ── Simulation-only evict-then-miss counter ─────────────────────────────
+  if (IN_SIMULATION) {
+    val inval_oh = VecInit(b_ways.map(w => !w.valid))
+    val has_inval = inval_oh.asUInt.orR
+    val dbg_victim = if (usePLRU) {
+      val dbg_tree = VecInit(itc_plru_state.get(itcAddr(b_idx, b_col)).asBools)
+      val dbg_vbits = Wire(Vec(L, Bool()))
+      val dbg_node = Wire(Vec(L + 1, UInt(log2Ceil(nNodes + 1).W)))
+      dbg_node(0) := 0.U
+      for (l <- 0 until L) {
+        dbg_vbits(l) := dbg_tree(dbg_node(l))
+        dbg_node(l + 1) := Mux(dbg_tree(dbg_node(l)),
+          (dbg_node(l) << 1) + 2.U,
+          (dbg_node(l) << 1) + 1.U)
+      }
+      Mux(has_inval, PriorityEncoder(inval_oh), dbg_vbits.asUInt)
+    } else if (!useRRIP) {
+      val nru_oh = VecInit(b_ways.map(w => w.rpv === 0.U))
+      Mux(has_inval, PriorityEncoder(inval_oh),
+      Mux(nru_oh.asUInt.orR, PriorityEncoder(nru_oh), 0.U))
+    } else {
+      val maxRRPV = b_ways.map(_.rpv).reduce((a, b) => Mux(a >= b, a, b))
+      val max_oh  = VecInit(b_ways.map(w => w.rpv === maxRRPV))
+      Mux(has_inval, PriorityEncoder(inval_oh), PriorityEncoder(max_oh))
+    }
+
+    val shadow_set   = RegInit(0.U(log2Ceil(itc_nSets).W))
+    val shadow_col   = RegInit(0.U(log2Ceil(bankWidth).W))
+    val shadow_tgt   = RegInit(0.U(tgtBits.W))
+    val shadow_valid = RegInit(false.B)
+    val evict_miss_cnt = RegInit(0.U(32.W))
+
+    when (b_fire && !b_hit) {
+      shadow_set   := b_idx
+      shadow_col   := b_col
+      shadow_tgt   := b_tgt(dbg_victim)
+      shadow_valid := true.B
+    }
+
+    val same_sc = (b_idx === shadow_set) && (b_col === shadow_col)
+    when (b_fire && shadow_valid && same_sc) {
+      when (!b_hit && (b_target === shadow_tgt)) {
+        evict_miss_cnt := evict_miss_cnt + 1.U
+        printf(p"[evict_then_miss] cnt=${evict_miss_cnt + 1.U} set=${b_idx} col=${b_col} tgt=0x${Hexadecimal(b_target)}\n")
+      }
+      shadow_valid := false.B
     }
   }
 

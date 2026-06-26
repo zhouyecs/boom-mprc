@@ -71,6 +71,12 @@ class WithSnipSmallITC extends Config((site, here, up) => {
   case BoomSnipOverrideThresh => 2
 })
 
+// IBTB geometry sweep
+class WithSnipITC(nSets: Int, nWays: Int) extends Config((site, here, up) => {
+  case BoomSnipITCSets => nSets
+  case BoomSnipITCWays => nWays
+})
+
 // BLBP — behavioral clone of SNIP, separate config keys for side-by-side eval
 case object BoomBlbpKey            extends Field[Boolean](false)
 case object BoomBlbpITCSets        extends Field[Int](256)
@@ -92,6 +98,7 @@ case object BoomBlbpOffsetBits extends Field[Int](20)
 case object BoomBlbpNRegions   extends Field[Int](128)
 case object BoomBlbpRegionRRIP extends Field[Boolean](false)
 case object BoomBlbpUseBias extends Field[Boolean](true)
+case object BoomBlbpUsePLRU extends Field[Boolean](false)
 
 class WithBlbpNoBias extends Config((site, here, up) => {
   case BoomBlbpUseBias => false
@@ -135,6 +142,10 @@ class WithBlbpThetaTuned(init: Int = 4096, step: Int = 32, speed: Int = 4)
 
 class WithBlbpRRIP extends Config((site, here, up) => {
   case BoomBlbpUseRRIP => true
+})
+
+class WithBlbpPLRU extends Config((site, here, up) => {
+  case BoomBlbpUsePLRU => true
 })
 
 class WithBlbpDotProduct extends Config((site, here, up) => {
