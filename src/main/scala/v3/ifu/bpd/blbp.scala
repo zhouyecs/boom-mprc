@@ -506,33 +506,42 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   if (usePLRU) {
     // ── Tree-pLRU (invalid-first, tree-walk victim, MRU-update on access) ──
+    // Shared recurrence: children of node n are 2n+1 (left), 2n+2 (right).
+    // Tree bit = 0 → LRU in left subtree, = 1 → LRU in right subtree.
     val inval_oh  = VecInit(b_ways.map(w => !w.valid))
     val has_inval = inval_oh.asUInt.orR
+    val tree_vec  = VecInit(itc_plru_state.get(itcAddr(b_idx, b_col)).asBools)
 
-    // Tree walk root→leaf → victim
-    val tree_vec = VecInit(itc_plru_state.get(itcAddr(b_idx, b_col)).asBools)
-    val victim_bits = Wire(Vec(L, Bool()))
-    val tnode = Wire(Vec(L + 1, UInt(log2Ceil(nNodes + 1).W)))
-    tnode(0) := 0.U
+    // ── Victim: descend following LRU pointers, building way MSB-first ──
+    val v_node = Wire(Vec(L + 1, UInt(log2Ceil(nNodes + 1).W)))
+    val v_way  = Wire(Vec(L + 1, UInt(L.W)))
+    v_node(0) := 0.U
+    v_way(0)  := 0.U
     for (l <- 0 until L) {
-      victim_bits(l) := tree_vec(tnode(l))
-      tnode(l + 1) := Mux(tree_vec(tnode(l)),
-        (tnode(l) << 1) + 2.U,   // right child
-        (tnode(l) << 1) + 1.U)   // left child
+      val bit = tree_vec(v_node(l))
+      v_way(l + 1)  := (v_way(l) << 1) | bit
+      v_node(l + 1) := (v_node(l) << 1) + 1.U + bit
     }
-    val plru_victim = Mux(has_inval, PriorityEncoder(inval_oh), victim_bits.asUInt)
+    val plru_victim = Mux(has_inval, PriorityEncoder(inval_oh), v_way(L))
 
-    // MRU update: flip path bits to point away from accessed way
+    // ── MRU update: descend to acc_way, flip path bits to point AWAY ──
+    // Uses the IDENTICAL recurrence as the victim walk for node numbering.
     val acc_way = Mux(b_hit, PriorityEncoder(b_hit_oh), plru_victim)
+    val u_node  = Wire(Vec(L + 1, UInt(log2Ceil(nNodes + 1).W)))
+    u_node(0) := 0.U
+    for (l <- 0 until L) {
+      val bit = acc_way(L - 1 - l)  // MSB first
+      u_node(l + 1) := (u_node(l) << 1) + 1.U + bit
+    }
+
     val plru_next = Wire(Vec(nNodes, Bool()))
     for (i <- 0 until nNodes) {
-      val staticLevel = (0 until L).find(lv =>
-        i >= (1 << lv) - 1 && i < (1 << (lv + 1)) - 1).getOrElse(0)
-      val onPath = VecInit((0 until L).map(l => tnode(l) === i.U)).asUInt.orR
-      plru_next(i) := Mux(onPath, !acc_way(L - 1 - staticLevel), tree_vec(i))
+      val onPath  = VecInit((0 until L).map(l => u_node(l) === i.U)).asUInt.orR
+      val levelOf = PriorityEncoder(VecInit((0 until L).map(l => u_node(l) === i.U)))
+      plru_next(i) := Mux(onPath, !acc_way((L - 1).U - levelOf), tree_vec(i))
     }
 
-    // Tree state write-back
+    // Tree state write-back (single call site, combinational read → reg write)
     when (b_fire) {
       itc_plru_state.get(itcAddr(b_idx, b_col)) := plru_next.asUInt
     }
@@ -633,16 +642,16 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val has_inval = inval_oh.asUInt.orR
     val dbg_victim = if (usePLRU) {
       val dbg_tree = VecInit(itc_plru_state.get(itcAddr(b_idx, b_col)).asBools)
-      val dbg_vbits = Wire(Vec(L, Bool()))
       val dbg_node = Wire(Vec(L + 1, UInt(log2Ceil(nNodes + 1).W)))
+      val dbg_way  = Wire(Vec(L + 1, UInt(L.W)))
       dbg_node(0) := 0.U
+      dbg_way(0)  := 0.U
       for (l <- 0 until L) {
-        dbg_vbits(l) := dbg_tree(dbg_node(l))
-        dbg_node(l + 1) := Mux(dbg_tree(dbg_node(l)),
-          (dbg_node(l) << 1) + 2.U,
-          (dbg_node(l) << 1) + 1.U)
+        val bit = dbg_tree(dbg_node(l))
+        dbg_way(l + 1)  := (dbg_way(l) << 1) | bit
+        dbg_node(l + 1) := (dbg_node(l) << 1) + 1.U + bit
       }
-      Mux(has_inval, PriorityEncoder(inval_oh), dbg_vbits.asUInt)
+      Mux(has_inval, PriorityEncoder(inval_oh), dbg_way(L))
     } else if (!useRRIP) {
       val nru_oh = VecInit(b_ways.map(w => w.rpv === 0.U))
       Mux(has_inval, PriorityEncoder(inval_oh),
