@@ -163,6 +163,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     s"sets=$itc_nSets ways=$itc_nWays theta=$thetaInit/$thetaStep/$thetaSpeed " +
     s"maxHist=$maxHist metaSz=$metaSz/$bpdMaxMetaLength")
 
+  println(s"[meta] offHist=$offHist W_HIST=$W_HIST offLHist=$offLHist offPool=$offPool W_POOL=$W_POOL metaSz=$metaSz")
+
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++
     Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) ++
@@ -268,8 +270,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     else VecInit(Seq.fill(F)(0.S(5.W)))
   val tr_carried_wt  = RegNext(io.update.bits.meta(offWt   + W_WT   - 1, offWt  )).asTypeOf(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_carried_pool= RegNext(io.update.bits.meta(offPool + W_POOL - 1, offPool)).asTypeOf(Vec(itc_nWays, new ITCEntry))
-  val carried_hist   = RegNext(io.update.bits.meta(offHist + W_HIST - 1, offHist))
-  val carried_lhist  = RegNext(io.update.bits.meta(offLHist + W_LHIST - 1, offLHist))
+  val carried_hist  = io.update.bits.meta(offHist  + W_HIST  - 1, offHist)
+  val carried_lhist = io.update.bits.meta(offLHist + W_LHIST - 1, offLHist)
 
   // Commit-time private history update: indirect-only idbits (directions from shared ghist).
   // In speculative mode the shift lives in GlobalHistory.update; this runs only off.
@@ -710,6 +712,26 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val s3_resp = io.resp_in(0).f3
   val s3_taken_mask = VecInit((0 until bankWidth).map(w => s3_resp(w).taken))
   val s3_has_taken = s3_taken_mask.asUInt.orR
+
+  // ── Vintage-match diagnostic: compare s3 meta idh vs commit carried_hist ──
+  if (IN_SIMULATION && usePrivateHist) {
+    when (tr_fire) {
+      val carried_idx = tblIdxMix(u.pc, io.update.bits.ghist, carried_hist, 1)
+      printf(p"[vintage] pc=0x${Hexadecimal(fetchIdx(u.pc))} " +
+        p"carried_idh=0x${Hexadecimal(carried_hist)} live_idh=0x${Hexadecimal(blbp_ghist)} " +
+        p"train_idx=${carried_idx} fp_match=${io.tr_exact_event}\n")
+      printf(p"[carry] meta_hist=0x${Hexadecimal(io.update.bits.meta(offHist + W_HIST - 1, offHist))} " +
+        p"carried=0x${Hexadecimal(carried_hist)} " +
+        p"meta_lo=0x${Hexadecimal(io.update.bits.meta(41,0))}\n")
+      printf(p"[carry2] meta_hist=0x${Hexadecimal(io.update.bits.meta(offHist+W_HIST-1, offHist))} " +
+        p"carried_hist=0x${Hexadecimal(carried_hist)} " +
+        p"meta_fp=0x${Hexadecimal(io.update.bits.meta(F-1,0))} " +
+        p"tr_b_fp=0x${Hexadecimal(tr_b_fp)}\n")
+    }
+    when (s3_valid && s3_has_jalr) {
+      printf(p"[pack] blbp_ghist=0x${Hexadecimal(blbp_ghist)} s3_blbp_ghist=0x${Hexadecimal(s3_blbp_ghist)}\n")
+    }
+  }
 
   // Fingerprint observer
   io.fp_computed_event := s3_valid && s3_has_taken
