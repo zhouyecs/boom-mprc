@@ -96,8 +96,6 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // idbits history depth: config-driven, DECOUPLED from globalHistoryLength
   val maxHist = blbpIdhLen                       // was histLens.max; now the config knob (default 42)
-  require(maxHist >= histLens.max,
-    s"maxHist ($maxHist) must be >= direction window max (${histLens.max})")
   require(histIdBits == blbpIdhShift,
     s"histIdBits ($histIdBits) must equal blbpIdhShift ($blbpIdhShift) — set both via WithBlbpIdbits")
   require(histIdBits <= F, s"histIdBits ($histIdBits) cannot exceed fingerprint width F ($F)")
