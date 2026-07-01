@@ -75,14 +75,26 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def itcAddr(set: UInt, col: UInt): UInt = Cat(set, col(log2Ceil(bankWidth)-1, 0))
 
   // Region table: compressed {region_index, offset} → full target reconstruction
-  val region_entries = RegInit(VecInit(Seq.fill(nRegions)(0.U(regionBits.W))))
+  val region_entries = Mem(nRegions, UInt(regionBits.W))
   val region_valid   = RegInit(VecInit(Seq.fill(nRegions)(false.B)))
   // RRIP replacement for region table (2-bit RRPV, opt-in; default random unchanged)
   val region_rrpv = if (regionRRIP) Some(RegInit(VecInit(Seq.fill(nRegions)(3.U(2.W))))) else None
   val rand_counter   = RegInit("hdeadb10c".U(32.W))
+
+  val region_init_done = RegInit(false.B)
+  val region_init_idx  = RegInit(0.U(log2Ceil(nRegions).W))
+
+  when (!region_init_done) {
+    region_entries.write(region_init_idx, 0.U)
+    region_init_idx := region_init_idx + 1.U
+    when (region_init_idx === (nRegions - 1).U) {
+      region_init_done := true.B
+    }
+  }
+
   def entryTarget(e: ITCEntry): UInt =
     if (!useRegion) e.tgt
-    else (region_entries(e.tgt(tgtBits-1, offsetBits)) << offsetBits) |
+    else (region_entries.read(e.tgt(tgtBits-1, offsetBits)) << offsetBits) |
           e.tgt(offsetBits-1, 0)
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
@@ -447,7 +459,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val victim_tgt = if (useRegion) {
     val region_number = b_target(vaddrBitsExtended-1, offsetBits)
     val match_oh = VecInit((0 until nRegions).map(i =>
-      region_valid(i) && (region_entries(i) === region_number)))
+      region_valid(i) && (region_entries.read(i.U) === region_number)))
     val free_oh  = VecInit(region_valid.map(!_))
     val rand_slot = rand_counter(regionIdxW-1, 0)
 
@@ -461,8 +473,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val alloc_slot = Mux(match_oh.asUInt.orR, PriorityEncoder(match_oh),
                     Mux(free_oh.asUInt.orR,  PriorityEncoder(free_oh), rrip_victim))
 
-    when (b_fire && !b_hit) {
-      region_entries(alloc_slot) := region_number
+    when (b_fire && !b_hit && region_init_done) {
+      region_entries.write(alloc_slot, region_number)
       region_valid(alloc_slot)   := true.B
       rand_counter := rand_counter + 17.U
       if (regionRRIP) {
