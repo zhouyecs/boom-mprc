@@ -313,12 +313,47 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Training RMW at tr_b_fire: one write per table, all F bits updated in parallel
   val tr_actual_fp = extractFp(tr_b_target)
 
+  // Wire declarations must precede their use in the debug printf block below.
   // Per-bit train_we and updated rows (combinational, computed at tr_b_fire)
-  // TRAINING-SIDE sum_w formula (must be bit-identical to predict-side s2_sum above):
-  //   sum_w = Σ_t (tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
   val tr_we = Wire(Vec(F, Bool()))
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_updated_bias = if (useBias) Wire(Vec(F, SInt(5.W))) else VecInit(Seq.fill(F)(0.S(5.W)))
+
+  if (IN_SIMULATION && useAdaptive) {
+    when (tr_fire) {
+      val w0 = 0  // sample bit 0
+      val sum_w0 = {
+        val wsum = (0 until Tbl).map { t =>
+          (xfer(tr_carried_wt(t)(w0)) * coeffs(t)).asSInt
+        }.reduce(_ + _)
+        if (useBias) wsum + (xfer(tr_carried_bia(w0)) * coeffBias.S).asSInt
+        else         wsum
+      }
+      val pred_bit0   = (sum_w0 >= 0.S).asUInt
+      val target_bit0 = tr_actual_fp(w0)
+      printf(p"[adapt] sum0=${sum_w0} theta0=${theta(w0)} tc0=${tc(w0)} " +
+        p"underConf=${sum_w0.abs < theta(w0)} we=${tr_we(w0)} correct=${pred_bit0 === target_bit0}\n")
+    }
+  }
+
+  // 在 tr_fire 附近，不依赖 useAdaptive 的打印
+  if (IN_SIMULATION) {
+    when (tr_fire) {
+      val w0 = 0
+      val sum_w0 = {
+        val wsum = (0 until Tbl).map { t =>
+          (xfer(tr_carried_wt(t)(w0)) * coeffs(t)).asSInt
+        }.reduce(_ + _)
+        if (useBias) wsum + (xfer(tr_carried_bia(w0)) * coeffBias.S).asSInt
+        else         wsum
+      }
+      printf(p"[sum0] val=${sum_w0}\n")
+    }
+  }
+
+  // TRAINING-SIDE sum_w formula (must be bit-identical to predict-side s2_sum above):
+  //   sum_w = Σ_t (tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
+  // (tr_we, tr_updated_wt, tr_updated_bias moved above the debug printf block)
 
   // Which-bits mask from carried pool (same pool s3_pool / cand_fp used at predict)
   val sb_fp    = VecInit(tr_carried_pool.map(e => extractFp(entryTarget(e))))

@@ -110,6 +110,7 @@ case object BoomBlbpLBit         extends Field[Int](3)
 case object BoomBlbpThetaInit   extends Field[Int](256)
 case object BoomBlbpThetaStep   extends Field[Int](32)
 case object BoomBlbpThetaSpeed  extends Field[Int](4)
+case object BoomBlbpThetaMax    extends Field[Int](65535)
 
 class WithBlbp extends Config((site, here, up) => {
   case BoomBlbpKey => true
@@ -133,11 +134,12 @@ class WithBlbpThetaPaper extends Config((site, here, up) => {
   case BoomBlbpThetaSpeed => 1
 })
 
-class WithBlbpThetaTuned(init: Int = 4096, step: Int = 32, speed: Int = 4)
+class WithBlbpThetaTuned(init: Int = 4096, step: Int = 32, speed: Int = 4, max: Int = 65535)
   extends Config((site, here, up) => {
     case BoomBlbpThetaInit  => init
     case BoomBlbpThetaStep  => step
     case BoomBlbpThetaSpeed => speed
+    case BoomBlbpThetaMax   => max
 })
 
 class WithBlbpRRIP extends Config((site, here, up) => {
