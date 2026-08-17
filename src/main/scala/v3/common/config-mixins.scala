@@ -77,6 +77,13 @@ class WithSnipITC(nSets: Int, nWays: Int) extends Config((site, here, up) => {
   case BoomSnipITCWays => nWays
 })
 
+// ITTAGE — tagged-table indirect predictor, third comparison point vs SNIP/BLBP
+case object BoomIttageKey extends Field[Boolean](false)
+
+class WithIttage extends Config((site, here, up) => {
+  case BoomIttageKey => true
+})
+
 // BLBP — behavioral clone of SNIP, separate config keys for side-by-side eval
 case object BoomBlbpKey            extends Field[Boolean](false)
 case object BoomBlbpITCSets        extends Field[Int](256)
@@ -805,6 +812,10 @@ class WithTAGEBPD extends Config((site, here, up) => {
             val blbp = Module(new BLBPBranchPredictorBank()(p))
             blbp.io.resp_in(0) := ras.io.resp
             (preds_with_loop :+ blbp, blbp.io.resp)
+          } else if (p(BoomIttageKey)) {
+            val ittage = Module(new IttageBranchPredictorBank()(p))
+            ittage.io.resp_in(0) := ras.io.resp
+            (preds_with_loop :+ ittage, ittage.io.resp)
           } else {
             (preds_with_loop, ras.io.resp)
           }
@@ -818,6 +829,10 @@ class WithTAGEBPD extends Config((site, here, up) => {
             val blbp = Module(new BLBPBranchPredictorBank()(p))
             blbp.io.resp_in(0) := ras.io.resp
             (preds :+ blbp, blbp.io.resp)
+          } else if (p(BoomIttageKey)) {
+            val ittage = Module(new IttageBranchPredictorBank()(p))
+            ittage.io.resp_in(0) := ras.io.resp
+            (preds :+ ittage, ittage.io.resp)
           } else {
             (preds, ras.io.resp)
           }
