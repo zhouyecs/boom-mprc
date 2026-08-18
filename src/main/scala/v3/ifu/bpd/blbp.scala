@@ -104,7 +104,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val nbias = 4096
 
   // Direction-history fold windows (capped by BOOM global history) — direction only
-  val histLens = Seq(0, 2, 4, 8, 12, 18, 28, 42).map(_ min globalHistoryLength)
+  val histLens = Seq(0, 2, 4, 8, 16, 16, 32, 64).map(_ min globalHistoryLength)
 
   // idbits history depth: config-driven, DECOUPLED from globalHistoryLength
   val maxHist = blbpIdhLen                       // was histLens.max; now the config knob (default 42)
@@ -129,6 +129,78 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Private mixed history: commit-updated, carried in meta (read-row == write-row).
   val blbp_ghist = if (!useBlbpSpecHist) RegInit(0.U(maxHist.W)) else 0.U(maxHist.W)
   val idhPredict = if (useBlbpSpecHist) io.f1_idh else blbp_ghist   // s1-aligned
+
+  // ── MPP multi-perspective features (CBP2025 tuned subset) ─────────────────
+  // Each weight table XORs one MPP feature into its ORIGINAL index
+  // (pc ^ ghist/idh/lhist) as an extra aliasing-reduction source:
+  //   t0 MODHIST(5,17) mod7 | t1 MODHIST(3,22) mod5
+  //   t2 GHISTMODPATH(0,19,5) mod2 | t3 GHISTMODPATH(3,14,6) mod5
+  //   t4 MODPATH(1,26,3) mod3 | t5 BACKPATH(22,6)
+  //   t6 RECENCY(10,1) | t7 RECENCYPOS(56)
+  // Registers update on jalr commits only (tr_fire); hashed at s0 for table indexing.
+
+  // Modulo outcome registers (one per maintained modulus; newest bit at index 0)
+  val modHist2 = RegInit(VecInit(Seq.fill(20)(false.B)))   // mod 2, len 20
+  val modHist5 = RegInit(VecInit(Seq.fill(23)(false.B)))   // mod 5, len 23
+  val modHist7 = RegInit(VecInit(Seq.fill(18)(false.B)))   // mod 7, len 18
+
+  // Modulo path registers (16-bit pc2 entries, newest at index 0)
+  val modPath2 = RegInit(VecInit(Seq.fill(20)(0.U(16.W)))) // mod 2, depth 20
+  val modPath3 = RegInit(VecInit(Seq.fill(27)(0.U(16.W)))) // mod 3, depth 27
+  val modPath5 = RegInit(VecInit(Seq.fill(15)(0.U(16.W)))) // mod 5, depth 15
+
+  // Backward-branch path (only taken branches jumping backward are recorded)
+  val backPath = RegInit(VecInit(Seq.fill(22)(0.U(16.W)))) // depth 22
+
+  // Recency stack (move-to-front, deduplicated recent pc2s)
+  val recencyStack = RegInit(VecInit(Seq.fill(56)(0.U(16.W)))) // assoc 56
+
+  def pc2(pc: UInt): UInt = pc(17, 2)                     // C++ pc >> 2 (16-bit)
+  def pcHash16(pc: UInt): UInt =                          // house analog of hash_pc
+    (pc(15, 0) ^ pc(31, 16) ^ pc(39, 32))(15, 0)
+
+  // Fold x into chunkW-wide XOR chunks (10-bit chunks for the table index)
+  def foldBits(x: UInt, chunkW: Int): UInt = {
+    val nChunks = (x.getWidth + chunkW - 1) / chunkW
+    val chunks = (0 until nChunks).map { i =>
+      x(Math.min((i + 1) * chunkW, x.getWidth) - 1, i * chunkW)
+    }
+    chunks.reduce(_ ^ _)
+  }
+
+  // Shift-add hash (C++ x = (x<<shift) + entry): pre-shifted terms, tree-reduced.
+  // Terms with shift*(n-1-i) >= bits are shifted out entirely (block size 30).
+  def shiftAdd(entries: Seq[UInt], shift: Int, bits: Int = 30): UInt = {
+    val n = entries.size
+    val terms = (0 until n).map { i =>
+      val k = shift * (n - 1 - i)
+      if (k >= bits) 0.U(bits.W)
+      else (entries(i) << k).pad(bits)(bits - 1, 0)   // pad: entries are only 16-17 bits
+    }
+    treeReduce(terms)(_ + _)
+  }
+
+  // Feature hash per table (matches the C++ hash_* helpers, block size 30)
+  def mppFeatureHash(t: Int, pc: UInt): UInt = t match {
+    case 0 => modHist7.asUInt                              // MODHIST(5,17) — identity fold (len < 30)
+    case 1 => modHist5.asUInt                              // MODHIST(3,22)
+    case 2 => shiftAdd((0 until 19).map(i => (modPath2(i) << 1) | modHist2(i)), 5)
+    case 3 => shiftAdd((0 until 14).map(i => (modPath5(i) << 1) | modHist5(i)), 6)
+    case 4 => shiftAdd((0 until 26).map(i => modPath3(i)), 3)
+    case 5 => shiftAdd((0 until 22).map(i => backPath(i)), 6)
+    case 6 => shiftAdd((0 until 10).map(i => recencyStack(i)), 1)
+    case 7 => {                                            // RECENCYPOS(56)
+      val match_oh = VecInit((0 until 56).map(i => recencyStack(i) === pc2(pc)))
+      val hit = match_oh.asUInt.orR
+      val pos = PriorityEncoder(match_oh)
+      Mux(hit, (pos * E.U) / 56.U, (E - 1).U)
+    }
+  }
+
+  // Feature hash folded to index width — XORed INTO the original table index
+  // (pc/ghist/idh/lhist), adding the MPP source to reduce aliasing.
+  def mppFold(t: Int, pc: UInt): UInt =
+    foldBits(mppFeatureHash(t, pc), log2Ceil(E))
 
   val useBias   = p(BoomBlbpUseBias)
   val coeffBias = 68
@@ -174,6 +246,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     s"maxHist=$maxHist metaSz=$metaSz/$bpdMaxMetaLength")
 
   println(s"[meta] offHist=$offHist W_HIST=$W_HIST offLHist=$offLHist offPool=$offPool W_POOL=$W_POOL metaSz=$metaSz")
+
+  println(s"[BLBP mpp] t0 MODHIST(5,17) t1 MODHIST(3,22) t2 GHISTMODPATH(0,19,5) " +
+    s"t3 GHISTMODPATH(3,14,6) t4 MODPATH(1,26,3) t5 BACKPATH(22,6) t6 RECENCY(10,1) t7 RECENCYPOS(56)")
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++
@@ -232,12 +307,16 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val biasIdx = if (useBias) fetchIdx(s1_pc)(log2Ceil(nbias) - 1, 0) else 0.U
   val readEn  = s1_valid && wt_init_done
   val local_hist = lhist(lhIdx(s1_pc))                 // combinational, s1
+  // MPP feature folds: hashed at s0 (f0_pc + commit-updated feature regs),
+  // registered to s1 and XORed into the original index — read timing unchanged.
+  val s0_mpp_fold = VecInit((0 until Tbl).map(t => mppFold(t, io.f0_pc)))
+  val s1_mpp_fold = RegNext(s0_mpp_fold)
   val s2_wt = VecInit((0 until Tbl).map { t =>
     val idx =
       if (useLocalHist && t == 0) (fetchIdx(s1_pc) ^ local_hist)(log2Ceil(E)-1, 0)
       else if (usePrivateHist)    tblIdxMix(s1_pc, io.f1_ghist, idhPredict, t)
       else                        tblIdx(s1_pc, io.f1_ghist, t)
-    weights(t).read(idx, readEn)
+    weights(t).read(idx ^ s1_mpp_fold(t), readEn)
   })
   val s2_bia = if (useBias) biasMem.get.read(biasIdx, readEn) else VecInit(Seq.fill(F)(0.S(5.W)))
 
@@ -265,10 +344,15 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val b_tag = RegNext(itcTag(u.pc))
 
   // commit-side reads DROPPED — weights + ITC carried in meta (TAGE pattern)
+  // Training index = original index recomputed at commit, XORed with the MPP
+  // feature fold from the PRE-update registers (same vintage as the predict-time
+  // read; register updates land at the same edge as tr_b_idx).
   def tblIdxUpd(t: Int): UInt = {
-    if (useLocalHist && t == 0) (fetchIdx(u.pc) ^ carried_lhist)(log2Ceil(E)-1, 0)
-    else if (usePrivateHist)    tblIdxMix(u.pc, io.update.bits.ghist, carried_hist, t)
-    else                        tblIdx(u.pc, io.update.bits.ghist, t)
+    val idx =
+      if (useLocalHist && t == 0) (fetchIdx(u.pc) ^ carried_lhist)(log2Ceil(E)-1, 0)
+      else if (usePrivateHist)    tblIdxMix(u.pc, io.update.bits.ghist, carried_hist, t)
+      else                        tblIdx(u.pc, io.update.bits.ghist, t)
+    idx ^ mppFold(t, u.pc)
   }
 
   // 1 cycle later: unpack carried snapshots
@@ -305,9 +389,67 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
   val tr_b_idx       = RegInit(VecInit(Seq.fill(Tbl)(0.U(log2Ceil(E).W))))
   val tr_b_bias_idx  = RegInit(0.U(log2Ceil(nbias).W))
+
+  // MPP commit-side helpers (combinational; shared with the [mpp] diagnostics)
+  val hpc_upd = pcHash16(u.pc)
+  val p2_upd  = pc2(u.pc)
+  val hashed_taken_upd = u.pc(2)     // tr_fire taken=1: taken ^ !(pc & (1<<2)) == pc(2)
+  val rec_match_upd = VecInit((0 until 56).map(i => recencyStack(i) === p2_upd))
+  val rec_hit_upd   = rec_match_upd.asUInt.orR
+  val rec_pos_upd   = PriorityEncoder(rec_match_upd)
+
   when (tr_fire) {
     tr_b_idx      := VecInit((0 until Tbl).map(t => tblIdxUpd(t)))
     if (useBias) { tr_b_bias_idx := fetchIdx(u.pc)(log2Ceil(nbias) - 1, 0) }
+
+    // ── MPP history register updates (jalr commit; C++ spec_update rules) ────
+    // mod 2: modHist2 + modPath2 (GHISTMODPATH(0,19,5))
+    when (hpc_upd % 2.U === 0.U) {
+      modHist2(0) := hashed_taken_upd
+      for (i <- 1 until 20) modHist2(i) := modHist2(i - 1)
+      modPath2(0) := p2_upd
+      for (i <- 1 until 20) modPath2(i) := modPath2(i - 1)
+    }
+    // mod 3: modPath3 (MODPATH(1,26,3))
+    when (hpc_upd % 3.U === 0.U) {
+      modPath3(0) := p2_upd
+      for (i <- 1 until 27) modPath3(i) := modPath3(i - 1)
+    }
+    // mod 5: modHist5 (MODHIST(3,22), GHISTMODPATH(3,14,6)) + modPath5
+    when (hpc_upd % 5.U === 0.U) {
+      modHist5(0) := hashed_taken_upd
+      for (i <- 1 until 23) modHist5(i) := modHist5(i - 1)
+      modPath5(0) := p2_upd
+      for (i <- 1 until 15) modPath5(i) := modPath5(i - 1)
+    }
+    // mod 7: modHist7 (MODHIST(5,17))
+    when (hpc_upd % 7.U === 0.U) {
+      modHist7(0) := hashed_taken_upd
+      for (i <- 1 until 18) modHist7(i) := modHist7(i - 1)
+    }
+    // backward-branch path (taken jalr jumping backward — loop return edge)
+    when (u.target < u.pc) {
+      backPath(0) := p2_upd
+      for (i <- 1 until 22) backPath(i) := backPath(i - 1)
+    }
+    // recency stack move-to-front (C++ insert_recency)
+    recencyStack(0) := Mux(rec_hit_upd, recencyStack(rec_pos_upd), p2_upd)
+    for (i <- 1 until 56) {
+      recencyStack(i) := Mux(rec_hit_upd,
+        Mux(rec_pos_upd >= i.U, recencyStack(i - 1), recencyStack(i)),
+        recencyStack(i - 1))
+    }
+  }
+
+  // ── MPP simulation diagnostics ─────────────────────────────────────────────
+  if (IN_SIMULATION) {
+    val mpp_cnt = RegInit(0.U(8.W))
+    when (tr_fire && mpp_cnt < 32.U) {
+      mpp_cnt := mpp_cnt + 1.U
+      printf(p"[mpp] hpc=${hpc_upd} g2=${hpc_upd % 2.U} g3=${hpc_upd % 3.U} " +
+        p"g5=${hpc_upd % 5.U} g7=${hpc_upd % 7.U} " +
+        p"back=${u.target < u.pc} recHit=${rec_hit_upd} recPos=${rec_pos_upd} pc2=${p2_upd}\n")
+    }
   }
 
   // Training RMW at tr_b_fire: one write per table, all F bits updated in parallel
