@@ -8,9 +8,10 @@ import boom.v3.common._
 // ITTAGE indirect-target predictor (Seznec-style, no base table).
 //   - 4 tagged tables keep the low 20 bits of the target (index = pc ^ folded history,
 //     geometric history lengths; partial tag disambiguates entries).
-//   - 1 fully-associative 128-entry region array keeps the high 20 bits (tree-pLRU).
+//   - 1 128-entry region array keeps the high 20 bits (tree-pLRU); each table entry
+//     carries a region-table POINTER that directly indexes it (paper-faithful).
 // Prediction (s2 read -> s3 resolve): provider = longest-history table with a tag hit;
-// the provider's tag looks up the region array; target = {region_high, table_low};
+// the provider's region pointer reads the region array; target = {region_high, table_low};
 // overrides io.resp.f3(col).predicted_pc exactly like SNIP/BLBP.
 // Training (commit-side, TAGE-pattern): the 4 read entries ride through the fetch
 // pipeline in f3_meta so commit needs no re-read; indices/tags are recomputed from
@@ -38,14 +39,15 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   class TableEntry extends Bundle {
     val valid = Bool()
     val tag   = UInt(tagW.W)
+    val ridx  = UInt(log2Ceil(nRegions).W)       // region-table pointer (paper-faithful)
     val low   = UInt(lowW.W)
     val u     = UInt(2.W)                        // useful counter
   }
-  val W_E = 1 + tagW + lowW + 2                  // 30
+  val W_E = 1 + tagW + log2Ceil(nRegions) + lowW + 2  // 37
 
-  // meta layout (LSB-first): 4 carried table entries, 30 bits each
+  // meta layout (LSB-first): 4 carried table entries, 37 bits each
   val offE = Seq.tabulate(T)(t => t * W_E)
-  override val metaSz = T * W_E                  // 120
+  override val metaSz = T * W_E                  // 148
   require(metaSz <= bpdMaxMetaLength,
     s"ITTAGE metaSz ($metaSz) exceeds bpdMaxMetaLength ($bpdMaxMetaLength)")
 
@@ -54,10 +56,10 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   def foldAddr(idx: UInt, col: UInt): UInt =
     if (bankWidth == 1) idx else Cat(idx(idxW - 1, 0), col(colW - 1, 0))
 
-  // Region array: valid/rtag as regs (CAM), high bits in async Mem (s3 read + commit write)
+  // Region array: the high 20 target bits, indexed by the pointer carried in each
+  // table entry; valid as regs, high bits in async Mem (s3 read + commit write).
   val region_high  = Mem(nRegions, UInt(highW.W))
   val region_valid = RegInit(VecInit(Seq.fill(nRegions)(false.B)))
-  val region_rtag  = RegInit(VecInit(Seq.fill(nRegions)(0.U(tagW.W))))
 
   // Tree-pLRU state (127 nodes, shared tree; invalid-first on allocation)
   val L      = log2Ceil(nRegions)
@@ -133,12 +135,10 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   }
   val provider_hit = hits.asUInt.orR
 
-  // Region lookup: CAM provider tag over regs, async-read high bits
-  val region_match   = VecInit((0 until nRegions).map(i =>
-    region_valid(i) && region_rtag(i) === s3_entries(provider).tag))
-  val region_hit     = region_match.asUInt.orR
-  val region_win     = PriorityEncoder(region_match)
-  val region_high_s3 = region_high.read(region_win)
+  // Region lookup: the provider entry's pointer directly indexes the region array
+  val prov_ridx      = s3_entries(provider).ridx
+  val region_hit     = region_valid(prov_ridx)
+  val region_high_s3 = region_high.read(prov_ridx)
 
   val ittage_target = Cat(region_high_s3, s3_entries(provider).low)
   val snip_override = s3_init_ok && s3_valid && s3_has_jalr && provider_hit && region_hit
@@ -201,36 +201,11 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   val alloc_slot = PriorityEncoder(alloc_mask)
   val alloc_en   = tr_b_fire && tr_b_mispred && alloc_mask.asUInt.orR
 
-  // Per-table write (single muxed port per mem: init || training)
-  for (t <- 0 until T) {
-    val is_prov  = commit_prov_hit && (commit_prov === t.U)
-    val is_alloc = alloc_en && (alloc_slot === t.U)
-    val e = Wire(new TableEntry)
-    e.valid := true.B
-    e.tag   := tr_b_tag_t(t)
-    e.low   := Mux(is_alloc || (is_prov && prov_wrong), actual_low, carriedEntry(t).low)
-    val u_inc = Mux(carriedEntry(t).u === 3.U, 3.U, carriedEntry(t).u + 1.U)
-    val u_dec = Mux(carriedEntry(t).u === 0.U, 0.U, carriedEntry(t).u - 1.U)
-    e.u     := Mux(is_alloc, 0.U, Mux(prov_wrong, u_dec, u_inc))
-
-    val we      = is_prov || is_alloc
-    val init_wr = !init_done
-    when (init_wr || (tr_b_fire && we)) {
-      tables(t).write(
-        Mux(init_wr, init_idx, foldAddr(tr_b_idx_t(t), tr_b_col)),
-        Mux(init_wr, 0.U, e.asUInt))
-    }
-  }
-
-  // ── Region array commit update (tag CAM, in-place high update, tree-pLRU) ──
-  // Key = tag of the table that will provide future predictions (an allocated
-  // longer-history table takes over on mispredict; else the provider).
-  val upd_tag = Mux(alloc_en, tr_b_tag_t(alloc_slot),
-                Mux(commit_prov_hit, tr_b_tag_t(commit_prov), 0.U))
-  val region_upd_en = tr_b_fire && region_init_done && (commit_prov_hit || alloc_en)
-
-  val cmatch    = VecInit((0 until nRegions).map(i =>
-    region_valid(i) && region_rtag(i) === upd_tag))
+  // ── Region slot resolution (commit): CAM actual_high over the region array —
+  // reuse the matching slot (PLRU-promote), else allocate invalid-first then
+  // tree-pLRU victim. The chosen slot becomes the table entry's region pointer.
+  val cmatch = VecInit((0 until nRegions).map(i =>
+    region_valid(i) && region_high.read(i.U) === actual_high))
   val cam_hit   = cmatch.asUInt.orR
   val inval_oh  = VecInit(region_valid.map(!_))
   val has_inval = inval_oh.asUInt.orR
@@ -263,12 +238,36 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
     plru_next(i) := Mux(onPath, !acc_way((L - 1).U - levelOf), plru_state(i))
   }
 
-  // Single call sites: Mem write port + valid/rtag regs muxed with region init
+  val region_upd_en = tr_b_fire && region_init_done && (commit_prov_hit || alloc_en)
+
+  // Per-table write (single muxed port per mem: init || training); the entry's
+  // region pointer (ridx) points at the slot holding this target's high bits.
+  for (t <- 0 until T) {
+    val is_prov  = commit_prov_hit && (commit_prov === t.U)
+    val is_alloc = alloc_en && (alloc_slot === t.U)
+    val e = Wire(new TableEntry)
+    e.valid := true.B
+    e.tag   := tr_b_tag_t(t)
+    e.ridx  := wslot
+    e.low   := Mux(is_alloc || (is_prov && prov_wrong), actual_low, carriedEntry(t).low)
+    val u_inc = Mux(carriedEntry(t).u === 3.U, 3.U, carriedEntry(t).u + 1.U)
+    val u_dec = Mux(carriedEntry(t).u === 0.U, 0.U, carriedEntry(t).u - 1.U)
+    e.u     := Mux(is_alloc, 0.U, Mux(prov_wrong, u_dec, u_inc))
+
+    val we      = (is_prov || is_alloc) && region_init_done
+    val init_wr = !init_done
+    when (init_wr || (tr_b_fire && we)) {
+      tables(t).write(
+        Mux(init_wr, init_idx, foldAddr(tr_b_idx_t(t), tr_b_col)),
+        Mux(init_wr, 0.U, e.asUInt))
+    }
+  }
+
+  // Single call sites: Mem write port + valid reg muxed with region init
   when (!region_init_done || region_upd_en) {
     val wr_idx = Mux(!region_init_done, region_init_idx, wslot)
     region_high.write(wr_idx, Mux(!region_init_done, 0.U, actual_high))
     region_valid(wr_idx) := Mux(!region_init_done, false.B, true.B)
-    region_rtag(wr_idx)  := Mux(!region_init_done, 0.U, upd_tag)
   }
   when (!region_init_done) {
     plru_state.foreach(_ := false.B)
@@ -295,7 +294,7 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
     val ovr_cnt = RegInit(0.U(8.W))
     when (snip_override && ovr_cnt < 32.U) {
       ovr_cnt := ovr_cnt + 1.U
-      printf(p"[ittage] OVR col=${snip_col} prov=${provider} " +
+      printf(p"[ittage] OVR col=${snip_col} prov=${provider} ridx=${prov_ridx} " +
         p"low=0x${Hexadecimal(s3_entries(provider).low)} " +
         p"high=0x${Hexadecimal(region_high_s3)} tgt=0x${Hexadecimal(ittage_target)}\n")
     }
