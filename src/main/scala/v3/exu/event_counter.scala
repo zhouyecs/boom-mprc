@@ -53,9 +53,22 @@ class SubEventCounter(readWidth: Int)(implicit p: Parameters) extends BoomModule
 class EventCounterIO(readWidth: Int, signalnum: Int)(implicit p: Parameters) extends BoomBundle
 {
   val event_signals  = Input(Vec(signalnum, UInt(4.W)))
+  val external_counters = Input(Vec(EventCounter.NumExternalCounters, UInt(64.W)))
   val read_addr = Input(Vec(readWidth, Valid(UInt(7.W))))
   val read_data = Output(Vec(readWidth, UInt(64.W)))
   val reset_counter = Input(Bool())
+}
+
+object EventCounter
+{
+  // Count of committed non-return JALRs included in the distance statistics.
+  val IndirectGapSamples = 53
+  // Sum of the numbers of committed instructions strictly between each
+  // sampled JALR and the retirement boundary seen by its F0 request.
+  val IndirectGapSum = 54
+  // Maximum of those per-JALR instruction distances.
+  val IndirectGapMax = 55
+  val NumExternalCounters = 3
 }
 
 
@@ -93,10 +106,18 @@ class EventCounter(readWidth: Int)(implicit p: Parameters) extends BoomModule
           reg_read_data(i) := ecounters(w).io.read_data(i)
         }
       }
+      when (io.read_addr(i).bits === EventCounter.IndirectGapSamples.U) {
+        reg_read_data(i) := io.external_counters(0)
+      }
+      when (io.read_addr(i).bits === EventCounter.IndirectGapSum.U) {
+        reg_read_data(i) := io.external_counters(1)
+      }
+      when (io.read_addr(i).bits === EventCounter.IndirectGapMax.U) {
+        reg_read_data(i) := io.external_counters(2)
+      }
     }
     .otherwise {
       reg_read_data(i) := 0.U
     }
   }
 }
-

@@ -34,6 +34,8 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   val mask = UInt(fetchWidth.W)
   val xcpt = new FrontendExceptions
   val ghist = new GlobalHistory
+  // Architectural retirement boundary sampled for this F0 request.
+  val prediction_retired_count = UInt(32.W)
 
   // fsrc provides the prediction FROM a branch in this packet
   // tsrc provides the prediction TO this packet
@@ -261,6 +263,8 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val ras_top       = UInt(vaddrBitsExtended.W)
 
   val ftq_idx       = UInt(log2Ceil(ftqSz).W)
+  // Retirement boundary observed when prediction for this packet began in F0.
+  val prediction_retired_count = UInt(32.W)
   val mask          = UInt(fetchWidth.W) // mark which words are valid instructions
 
   val br_mask       = UInt(fetchWidth.W)
@@ -303,6 +307,8 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val get_pc            = Flipped(Vec(2, new GetPCFromFtqIO()))
   val debug_ftq_idx     = Output(Vec(coreWidth, UInt(log2Ceil(ftqSz).W)))
   val debug_fetch_pc    = Input(Vec(coreWidth, UInt(vaddrBitsExtended.W)))
+  val retired_inst_count = Output(UInt(32.W))
+  val debug_pred_retired_count = Input(Vec(coreWidth, UInt(32.W)))
 
   // Breakpoint info
   val status            = Output(new MStatus)
@@ -483,6 +489,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s1_vpc       = RegNext(s0_vpc)
   val s1_valid     = RegNext(s0_valid, false.B)
   val s1_ghist     = RegNext(s0_ghist)
+  val s1_prediction_retired_count = RegNext(io.cpu.retired_inst_count)
   val s1_is_replay = RegNext(s0_is_replay)
   val s1_is_sfence = RegNext(s0_is_sfence)
   val f1_clear     = WireInit(false.B)
@@ -549,6 +556,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s2_vpc   = RegNext(s1_vpc)
   val s2_ghist = Reg(new GlobalHistory)
   s2_ghist := s1_ghist
+  val s2_prediction_retired_count = RegNext(s1_prediction_retired_count)
   val s2_ppc  = RegNext(s1_ppc)
   val s2_tsrc = RegNext(s1_tsrc) // tsrc provides the predictor component which provided the prediction TO this instruction
   val s2_fsrc = WireInit(BSRC_1) // fsrc provides the predictor component which provided the prediction FROM this instruction
@@ -645,6 +653,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
+  f3.io.enq.bits.prediction_retired_count := s2_prediction_retired_count
 
   // RAS takes a cycle to read
   bpd.io.f2_read_idx := f3.io.enq.bits.ghist.ras_idx
@@ -679,6 +688,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.br_mask := f3_br_mask.asUInt
   f3_fetch_bundle.pc := f3_imemresp.pc
   f3_fetch_bundle.ftq_idx := 0.U // This gets assigned later
+  f3_fetch_bundle.prediction_retired_count := f3_imemresp.prediction_retired_count
   f3_fetch_bundle.xcpt_pf_if := f3_imemresp.xcpt.pf.inst
   f3_fetch_bundle.xcpt_ae_if := f3_imemresp.xcpt.ae.inst
   f3_fetch_bundle.fsrc := f3_imemresp.fsrc
@@ -1224,6 +1234,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
 
   ftq.io.debug_ftq_idx := io.cpu.debug_ftq_idx
   io.cpu.debug_fetch_pc := ftq.io.debug_fetch_pc
+  io.cpu.debug_pred_retired_count := ftq.io.debug_pred_retired_count
 
 
   override def toString: String =

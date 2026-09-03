@@ -139,6 +139,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
     // Don't tape this out, this blows up the FTQ
     val debug_ftq_idx  = Input(Vec(coreWidth, UInt(log2Ceil(ftqSz).W)))
     val debug_fetch_pc = Output(Vec(coreWidth, UInt(vaddrBitsExtended.W)))
+    val debug_pred_retired_count = Output(Vec(coreWidth, UInt(32.W)))
 
     val redirect = Input(Valid(UInt(idx_sz.W)))
     // 区分 rob flush 和 mispredict
@@ -162,6 +163,8 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
 
   val pcs      = Reg(Vec(num_entries, UInt(vaddrBitsExtended.W)))
+  // Kept separate from FTQBundle so normal FTQ read ports are not widened.
+  val prediction_retired_counts = Reg(Vec(num_entries, UInt(32.W)))
   val meta     = SyncReadMem(num_entries, Vec(nBanks, UInt(bpdMaxMetaLength.W)))
   val ram      = Reg(Vec(num_entries, new FTQBundle))
   val ghist    = Seq.fill(2) { SyncReadMem(num_entries, new GlobalHistory) }
@@ -181,6 +184,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
   when (do_enq) {
 
     pcs(enq_ptr.value)           := io.enq.bits.pc
+    prediction_retired_counts(enq_ptr.value) := io.enq.bits.prediction_retired_count
 
     val new_entry = Wire(new FTQBundle)
 
@@ -435,6 +439,7 @@ class FetchTargetQueue(implicit p: Parameters) extends BoomModule
 
   for (w <- 0 until coreWidth) {
     io.debug_fetch_pc(w) := RegNext(pcs(io.debug_ftq_idx(w)))
+    io.debug_pred_retired_count(w) := RegNext(prediction_retired_counts(io.debug_ftq_idx(w)))
   }
 
   // Printf

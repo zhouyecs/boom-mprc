@@ -291,7 +291,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   //****************************************
   // Time Stamp Counter & Retired Instruction Counter
-  // (only used for printf and vcd dumps - the actual counters are in the CSRFile)
+  // (used for debug/observability; the architectural counters are in CSRFile)
   val debug_tsc_reg = RegInit(0.U(xLen.W))
   val debug_irt_reg = RegInit(0.U(xLen.W))
   val debug_brs     = Reg(Vec(4, UInt(xLen.W)))
@@ -322,6 +322,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   debug_tsc_reg := debug_tsc_reg + 1.U
   debug_irt_reg := debug_irt_reg + PopCount(rob.io.commit.arch_valids.asUInt)
+  // F0 samples the retirement boundary already visible at the start of its cycle.
+  io.ifu.retired_inst_count := debug_irt_reg(31, 0)
   dontTouch(debug_tsc_reg)
   dontTouch(debug_irt_reg)
 
@@ -417,11 +419,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val event_counters = Module(new EventCounter(exe_units.numIrfReaders))
 
   //reset event counters
-  event_counters.io.reset_counter := false.B
+  val reset_event_counters = WireInit(false.B)
+  event_counters.io.reset_counter := reset_event_counters
   for (w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     when (rob.io.commit.valids(w) && uop.ucsrInst && uop.inst(31, 20) === SpecialInst_RstPFC) { //tag == 1024, reset all counters
-      event_counters.io.reset_counter := true.B
+      reset_event_counters := true.B
     }
   }
 
@@ -432,7 +435,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     when (nowWarmupInsts > warmupInstNum) {
       warmupInstNum := 0.U
       nowWarmupInsts := 0.U
-      event_counters.io.reset_counter := true.B
+      reset_event_counters := true.B
       nowEventNum := 0.U
     }
   }
@@ -537,6 +540,48 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_tage_pwrong(w) := com_is_br(w) && uop.debug_tage_provided && (uop.debug_tage_pred =/= uop.taken)
     com_bim_ok_nott(w) := com_is_br(w) && !uop.debug_tage_provided && (uop.debug_bim_pred === uop.taken)
   }
+
+  // Instruction-distance statistics for committed non-return JALRs. The FTQ
+  // lookup and the commit-side values are both delayed one cycle so each lane
+  // compares against the F0 retirement snapshot belonging to its own packet.
+  val indirect_gap_sample_valids = Wire(Vec(coreWidth, Bool()))
+  val indirect_gap_values = Wire(Vec(coreWidth, UInt(32.W)))
+  for (w <- 0 until coreWidth) {
+    val prior_commits = if (w == 0) 0.U else PopCount(VecInit(rob.io.commit.arch_valids.take(w)))
+    val committed_before_raw = debug_irt_reg(31, 0) +& prior_commits
+    val committed_before = committed_before_raw(31, 0)
+    indirect_gap_sample_valids(w) := RegNext(
+      startCounter && !reset_event_counters && com_is_jalr(w) && !com_is_ret(w),
+      false.B)
+    indirect_gap_values(w) := RegNext(committed_before) - io.ifu.debug_pred_retired_count(w)
+  }
+
+  val indirect_gap_sample_inc = PopCount(indirect_gap_sample_valids)
+  val indirect_gap_sum_inc = indirect_gap_values.zip(indirect_gap_sample_valids).map {
+    case (gap, valid) => Mux(valid, gap, 0.U(32.W))
+  }.reduce(_ +& _)
+  val indirect_gap_cycle_max = indirect_gap_values.zip(indirect_gap_sample_valids).map {
+    case (gap, valid) => Mux(valid, gap, 0.U(32.W))
+  }.reduce((left, right) => Mux(left > right, left, right))
+
+  val indirect_gap_samples = RegInit(0.U(64.W))
+  val indirect_gap_sum = RegInit(0.U(64.W))
+  val indirect_gap_max = RegInit(0.U(64.W))
+  when (reset_event_counters) {
+    indirect_gap_samples := 0.U
+    indirect_gap_sum := 0.U
+    indirect_gap_max := 0.U
+  } .otherwise {
+    indirect_gap_samples := indirect_gap_samples + indirect_gap_sample_inc
+    indirect_gap_sum := indirect_gap_sum + indirect_gap_sum_inc
+    when (indirect_gap_cycle_max > indirect_gap_max) {
+      indirect_gap_max := indirect_gap_cycle_max
+    }
+  }
+
+  event_counters.io.external_counters(0) := indirect_gap_samples
+  event_counters.io.external_counters(1) := indirect_gap_sum
+  event_counters.io.external_counters(2) := indirect_gap_max
 
   when (startCounter) {
     event_counters.io.event_signals(0) :=   1.U  //cycles
@@ -1813,13 +1858,18 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.trace.insns map (t => t.valid := false.B)
   io.trace.custom.get.asInstanceOf[BoomTraceBundle].rob_empty := rob.io.empty
 
+  // These ports also supply the prediction-time retirement snapshots used by
+  // the non-return JALR distance counters, so they are needed without tracing.
+  for (w <- 0 until coreWidth) {
+    io.ifu.debug_ftq_idx(w) := rob.io.commit.uops(w).ftq_idx
+  }
+
   if (trace) {
     for (w <- 0 until coreWidth) {
       // Delay the trace so we have a cycle to pull PCs out of the FTQ
       io.trace.insns(w).valid      := RegNext(rob.io.commit.arch_valids(w))
 
       // Recalculate the PC
-      io.ifu.debug_ftq_idx(w) := rob.io.commit.uops(w).ftq_idx
       val iaddr = (AlignPCToBoundary(io.ifu.debug_fetch_pc(w), icBlockBytes)
                    + RegNext(rob.io.commit.uops(w).pc_lob)
                    - Mux(RegNext(rob.io.commit.uops(w).edge_inst), 2.U, 0.U))(vaddrBits-1,0)
@@ -1858,7 +1908,5 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       io.trace.insns(w).tval       := RegNext(csr.io.tval)
     }
     dontTouch(io.trace)
-  } else {
-    io.ifu.debug_ftq_idx := DontCare
   }
 }
