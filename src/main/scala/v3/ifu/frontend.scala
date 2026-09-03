@@ -360,6 +360,11 @@ class BoomFrontendIO(implicit p: Parameters) extends BoomBundle
   val snip_min_ham_le2_event  = Input(Bool())
   val snip_min_ham_le4_event  = Input(Bool())
   val adapt_train_event        = Input(Bool())
+  // Direct SNIP/BLBP override attribution (committed non-return JALRs).
+  val indirect_override_event    = Input(Bool())
+  val indirect_corrected_event   = Input(Bool())
+  val indirect_harmed_event      = Input(Bool())
+  val indirect_still_wrong_event = Input(Bool())
 }
 
 /**
@@ -424,6 +429,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   io.cpu.snip_min_ham_le2_event  := bpd.io.snip_min_ham_le2_event
   io.cpu.snip_min_ham_le4_event  := bpd.io.snip_min_ham_le4_event
   io.cpu.adapt_train_event := bpd.io.adapt_train_event
+  io.cpu.indirect_override_event    := bpd.io.indirect_override_event
+  io.cpu.indirect_corrected_event   := bpd.io.indirect_corrected_event
+  io.cpu.indirect_harmed_event      := bpd.io.indirect_harmed_event
+  io.cpu.indirect_still_wrong_event := bpd.io.indirect_still_wrong_event
 
   val icache = outer.icache.module
   icache.io.invalidate := io.cpu.flush_icache

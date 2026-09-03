@@ -602,6 +602,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(46) := io.ifu.snip_min_ham_le2_event.asUInt
     event_counters.io.event_signals(47) := io.ifu.snip_min_ham_le4_event.asUInt
     event_counters.io.event_signals(48) := io.ifu.adapt_train_event.asUInt
+    // Direct SNIP/BLBP attribution for committed non-return JALRs.
+    // both-correct = override - corrected - harmed - still-wrong.
+    event_counters.io.event_signals(49) := io.ifu.indirect_override_event.asUInt
+    event_counters.io.event_signals(50) := io.ifu.indirect_corrected_event.asUInt
+    event_counters.io.event_signals(51) := io.ifu.indirect_harmed_event.asUInt
+    event_counters.io.event_signals(52) := io.ifu.indirect_still_wrong_event.asUInt
   }
 
   //-------------------------------------------------------------

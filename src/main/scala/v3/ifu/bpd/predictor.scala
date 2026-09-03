@@ -190,6 +190,11 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val snip_min_ham_le2_event  = Output(Bool())
     val snip_min_ham_le4_event  = Output(Bool())
     val adapt_train_event        = Output(Bool())
+    // Direct attribution for a SNIP/BLBP target override on a non-return JALR.
+    val indirect_override_event    = Output(Bool())
+    val indirect_corrected_event   = Output(Bool())
+    val indirect_harmed_event      = Output(Bool())
+    val indirect_still_wrong_event = Output(Bool())
   })
   io.resp := io.resp_in(0)
 
@@ -211,6 +216,10 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
   io.snip_min_ham_le2_event  := false.B
   io.snip_min_ham_le4_event  := false.B
   io.adapt_train_event := false.B
+  io.indirect_override_event    := false.B
+  io.indirect_corrected_event   := false.B
+  io.indirect_harmed_event      := false.B
+  io.indirect_still_wrong_event := false.B
 
   val s0_idx       = fetchIdx(io.f0_pc)
   val s1_idx       = RegNext(s0_idx)
@@ -292,6 +301,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     val snip_min_ham_le2_event  = Output(Bool())
     val snip_min_ham_le4_event  = Output(Bool())
     val adapt_train_event        = Output(Bool())
+    val indirect_override_event    = Output(Bool())
+    val indirect_corrected_event   = Output(Bool())
+    val indirect_harmed_event      = Output(Bool())
+    val indirect_still_wrong_event = Output(Bool())
   })
 
   var total_memsize = 0
@@ -326,6 +339,10 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
   io.snip_min_ham_le2_event  := banked_predictors.map(_.io.snip_min_ham_le2_event).foldLeft(false.B)(_ || _)
   io.snip_min_ham_le4_event  := banked_predictors.map(_.io.snip_min_ham_le4_event).foldLeft(false.B)(_ || _)
   io.adapt_train_event := banked_predictors.map(_.io.adapt_train_event).foldLeft(false.B)(_ || _)
+  io.indirect_override_event    := banked_predictors.map(_.io.indirect_override_event).foldLeft(false.B)(_ || _)
+  io.indirect_corrected_event   := banked_predictors.map(_.io.indirect_corrected_event).foldLeft(false.B)(_ || _)
+  io.indirect_harmed_event      := banked_predictors.map(_.io.indirect_harmed_event).foldLeft(false.B)(_ || _)
+  io.indirect_still_wrong_event := banked_predictors.map(_.io.indirect_still_wrong_event).foldLeft(false.B)(_ || _)
 
   val banked_lhist_providers = Seq.fill(nBanks) { Module(if (localHistoryNSets > 0) new LocalBranchPredictorBank else new NullLocalBranchPredictorBank) }
 
@@ -594,5 +611,4 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
 class NullBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(p) {
   val mems = Nil
 }
-
 

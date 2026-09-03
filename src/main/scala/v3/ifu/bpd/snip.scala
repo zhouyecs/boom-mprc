@@ -55,8 +55,17 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val offBias = W_BASE                             // 35
   val offWt   = offBias + W_BIAS                   // 110
   val offPool = offWt   + W_WT                     // 710
+  // Attribution fields are appended above the existing layout so the low-bit
+  // fingerprint/signature offsets remain stable.
+  val offOverride   = offPool + W_POOL
+  val offBaseValid  = offOverride + 1
+  val offBaseTarget = offBaseValid + 1
+  val offNewTarget  = offBaseTarget + vaddrBitsExtended
 
-  override val metaSz = offPool + W_POOL // pool + wt + bias + valid+min_ham+sig+fp
+  override val metaSz = offNewTarget + vaddrBitsExtended
+  require(metaSz <= bpdMaxMetaLength,
+    s"SNIP metaSz ($metaSz) exceeds bpdMaxMetaLength ($bpdMaxMetaLength) " +
+    s"— reduce itc_nWays ($itc_nWays) or increase bpdMaxMetaLength")
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", itc_nSets * bankWidth, 1 + vaddrBitsExtended + 1)) ++
@@ -205,6 +214,30 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.snip_min_ham_le2_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 2.U)
   io.snip_min_ham_le4_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 4.U)
 
+  // Compare the predecessor-chain target and the SNIP target against the full
+  // architectural target. These four outcomes attribute only active overrides.
+  val carried_override    = RegNext(io.update.bits.meta(offOverride))
+  val carried_base_valid  = RegNext(io.update.bits.meta(offBaseValid))
+  val carried_base_target = RegNext(io.update.bits.meta(offBaseTarget + vaddrBitsExtended - 1, offBaseTarget))
+  val carried_new_target  = RegNext(io.update.bits.meta(offNewTarget + vaddrBitsExtended - 1, offNewTarget))
+  val actual_target       = tr_b_target
+  val attribution_fire    = tr_b_fire && carried_override
+  val base_correct        = carried_base_valid && (carried_base_target === actual_target)
+  val new_correct         = carried_new_target === actual_target
+  val corrected           = attribution_fire && !base_correct && new_correct
+  val harmed              = attribution_fire && base_correct && !new_correct
+  val still_wrong         = attribution_fire && !base_correct && !new_correct
+  val both_correct        = attribution_fire && base_correct && new_correct
+
+  io.indirect_override_event    := attribution_fire
+  io.indirect_corrected_event   := corrected
+  io.indirect_harmed_event      := harmed
+  io.indirect_still_wrong_event := still_wrong
+
+  when (attribution_fire) {
+    assert(PopCount(VecInit(Seq(corrected, harmed, still_wrong, both_correct))) === 1.U)
+  }
+
   // Shared set-index hash
   def itcSet(pc: UInt): UInt = fetchIdx(pc)(log2Ceil(itc_nSets) - 1, 0)
 
@@ -323,14 +356,16 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val snip_target  = s3_pool(snip_sel).target
   val snip_sig     = snip_target(F - 1, 0)
   val snip_min_ham = ham(snip_sel)
+  val base_prediction = s3_resp(snip_col).predicted_pc
+  val snip_override = snip_valid && (snip_min_ham <= override_thresh.U)
 
   // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
-  // Layout: pool | wt | bias | valid|min_ham|sig|fingerprint
-  io.f3_meta := Cat(s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
+  // Layout: attribution | pool | wt | bias | valid|min_ham|sig|fingerprint
+  io.f3_meta := Cat(snip_target, base_prediction.bits, base_prediction.valid, snip_override,
+                    s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
                     snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
   // F3 target override: correct predicted_pc when confident (first active change)
-  val snip_override = snip_valid && (snip_min_ham <= override_thresh.U)
   when (snip_override) {
     io.resp.f3(snip_col).predicted_pc.valid := true.B
     io.resp.f3(snip_col).predicted_pc.bits  := snip_target
