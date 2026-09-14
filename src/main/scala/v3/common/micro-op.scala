@@ -143,6 +143,11 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
 
   // What prediction structure provides the prediction FROM this op
   val debug_fsrc       = UInt(BSRC_SZ.W)
+  // Frozen attempt record: which stage issued this op's redirect. Never
+  // overwritten on a backend correction (unlike debug_fsrc), so a mispredicted
+  // indirect jump can still be attributed to the stage that attempted it.
+  // BSRC_C = no frontend redirect was issued for this fetch packet.
+  val debug_fsrc_pred  = UInt(BSRC_SZ.W)
   // What prediction structure provides the prediction TO this op
   val debug_tsrc       = UInt(BSRC_SZ.W)
   // TAGE/BIM prediction observability (Layer 2 counters)

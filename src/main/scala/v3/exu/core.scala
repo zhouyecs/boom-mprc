@@ -496,6 +496,27 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val com_tage_pwrong = Wire(Vec(coreWidth, Bool()))
   val com_bim_ok_nott = Wire(Vec(coreWidth, Bool()))
 
+  // Indirect-target prediction accuracy for committed non-return JALRs — the exact
+  // population SNIP/BLBP/ITTAGE train on (cfi_is_jalr && !cfi_is_ret).
+  //   att_fN = stage N made the prediction the frontend committed to.
+  //            From debug_fsrc_pred, frozen at fetch time: the ROB's BSRC_C
+  //            rewrite of debug_fsrc leaves it untouched, so a JALR that F2
+  //            attempted and got wrong stays distinguishable from one F2 never
+  //            attempted (which carries BSRC_3 from the F3 decode redirect).
+  //   ok_fN  = ...and that target was neither superseded by F3 nor corrected by
+  //            the backend — i.e. it was the final, correct target.
+  // accuracy(FN) = ok_fN / att_fN. att_fN && !ok_fN = superseded-or-wrong, which
+  // is NOT the same as "wrong": F3 may have replaced a correct F2 target.
+  // att_f1+att_f2+att_f3 should equal ind_total (a JALR always ends up labelled,
+  // since the F3 decode redirect catches whatever F1/F2 missed).
+  val com_ind_total  = Wire(Vec(coreWidth, Bool()))
+  val com_ind_att_f1 = Wire(Vec(coreWidth, Bool()))
+  val com_ind_ok_f1  = Wire(Vec(coreWidth, Bool()))
+  val com_ind_att_f2 = Wire(Vec(coreWidth, Bool()))
+  val com_ind_ok_f2  = Wire(Vec(coreWidth, Bool()))
+  val com_ind_att_f3 = Wire(Vec(coreWidth, Bool()))
+  val com_ind_ok_f3  = Wire(Vec(coreWidth, Bool()))
+
   for(w <- 0 until coreWidth) {
     val uop = rob.io.commit.uops(w)
     val valid = rob.io.commit.arch_valids(w)
@@ -539,6 +560,19 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     com_tage_prov(w)   := com_is_br(w) && uop.debug_tage_provided
     com_tage_pwrong(w) := com_is_br(w) && uop.debug_tage_provided && (uop.debug_tage_pred =/= uop.taken)
     com_bim_ok_nott(w) := com_is_br(w) && !uop.debug_tage_provided && (uop.debug_bim_pred === uop.taken)
+
+    // Indirect-target accuracy, partitioned by the stage that issued the redirect.
+    // debug_fsrc_pred is frozen at fetch time, so a JALR that F2 attempted but got
+    // wrong (fsrc_pred=BSRC_2, fsrc=BSRC_C) stays distinct from one F2 never
+    // attempted (fsrc_pred=BSRC_3 after the F3 decode redirect).
+    val ind_jalr = valid && uop.is_jalr && !com_is_ret(w)
+    com_ind_total(w)  := ind_jalr
+    com_ind_att_f1(w) := ind_jalr && uop.debug_fsrc_pred === BSRC_1
+    com_ind_ok_f1(w)  := com_ind_att_f1(w) && uop.debug_fsrc === BSRC_1
+    com_ind_att_f2(w) := ind_jalr && uop.debug_fsrc_pred === BSRC_2
+    com_ind_ok_f2(w)  := com_ind_att_f2(w) && uop.debug_fsrc === BSRC_2
+    com_ind_att_f3(w) := ind_jalr && uop.debug_fsrc_pred === BSRC_3
+    com_ind_ok_f3(w)  := com_ind_att_f3(w) && uop.debug_fsrc === BSRC_3
   }
 
   // Instruction-distance statistics for committed non-return JALRs. The FTQ
@@ -653,6 +687,18 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     event_counters.io.event_signals(50) := io.ifu.indirect_corrected_event.asUInt
     event_counters.io.event_signals(51) := io.ifu.indirect_harmed_event.asUInt
     event_counters.io.event_signals(52) := io.ifu.indirect_still_wrong_event.asUInt
+
+    // Indirect-target accuracy by attempted stage (non-return JALRs).
+    // NOTE: 53/54/55 are NOT free — event_counter.scala maps those read addresses
+    // to external_counters (indirect_gap_samples/sum/max) and shadows any
+    // event_signals placed there. 56..63 are the usable remainder.
+    event_counters.io.event_signals(56) := PopCount(com_ind_att_f2.asUInt) // F2 issued the redirect
+    event_counters.io.event_signals(57) := PopCount(com_ind_ok_f2.asUInt)  // ...and it was final + correct
+    event_counters.io.event_signals(58) := PopCount(com_ind_att_f1.asUInt) // F1 issued the redirect
+    event_counters.io.event_signals(59) := PopCount(com_ind_ok_f1.asUInt)
+    event_counters.io.event_signals(60) := PopCount(com_ind_att_f3.asUInt) // F1/F2 missed; F3 decode issued it
+    event_counters.io.event_signals(61) := PopCount(com_ind_ok_f3.asUInt)
+    event_counters.io.event_signals(62) := PopCount(com_ind_total.asUInt)  // denominator / sum check
   }
 
   //-------------------------------------------------------------

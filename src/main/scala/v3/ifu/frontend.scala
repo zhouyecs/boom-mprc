@@ -41,6 +41,10 @@ class FrontendResp(implicit p: Parameters) extends BoomBundle()(p) {
   // tsrc provides the prediction TO this packet
   val fsrc = UInt(BSRC_SZ.W)
   val tsrc = UInt(BSRC_SZ.W)
+  // Frozen record of which frontend stage issued THIS packet's redirect. Unlike
+  // fsrc it is never rewritten on a backend correction, so the stage that was
+  // actually *attempted* stays visible at commit. BSRC_C = no frontend redirect.
+  val fsrc_pred = UInt(BSRC_SZ.W)
 }
 
 class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
@@ -291,6 +295,9 @@ class FetchBundle(implicit p: Parameters) extends BoomBundle
   val fsrc    = UInt(BSRC_SZ.W)
   // Source of the prediction to this bundle
   val tsrc    = UInt(BSRC_SZ.W)
+  // Frozen attempt record: which stage issued this bundle's redirect, never
+  // overwritten by the backend. BSRC_C = no frontend redirect was issued.
+  val fsrc_pred = UInt(BSRC_SZ.W)
 }
 
 
@@ -560,6 +567,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   val s2_ppc  = RegNext(s1_ppc)
   val s2_tsrc = RegNext(s1_tsrc) // tsrc provides the predictor component which provided the prediction TO this instruction
   val s2_fsrc = WireInit(BSRC_1) // fsrc provides the predictor component which provided the prediction FROM this instruction
+  // Frozen twin of s2_fsrc: which stage actually ISSUED this packet's redirect.
+  // fsrc's BSRC_1 default cannot distinguish "f1 predicted it" from "nobody
+  // predicted it", so f1's decision is registered one cycle to line up with the
+  // s2 packet. f3 sets its own value on re-steer (see below).
+  val s2_fsrc_pred = WireInit(BSRC_C)
+  when (RegNext(f1_do_redirect, false.B)) { s2_fsrc_pred := BSRC_1 }
   val f2_clear = WireInit(false.B)
   val s2_tlb_resp = RegNext(s1_tlb_resp)
   val s2_tlb_miss = RegNext(s1_tlb_miss)
@@ -620,6 +633,11 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_ghist     := f2_predicted_ghist
       s2_fsrc      := BSRC_2
       s0_tsrc      := BSRC_2
+      // Label F2 only where it actually decided. fsrc_pred must follow the SAME
+      // write site as s2_fsrc above (so the two agree when F1 and F2 predict the
+      // same target and this branch never fires), but this branch also triggers
+      // on pipeline bubbles — gating on f2_do_redirect keeps those out.
+      when (f2_do_redirect) { s2_fsrc_pred := BSRC_2 }
     }
   }
   s0_replay_bpd_resp := f2_bpd_resp
@@ -653,6 +671,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3.io.enq.bits.xcpt := s2_tlb_resp
   f3.io.enq.bits.fsrc := s2_fsrc
   f3.io.enq.bits.tsrc := s2_tsrc
+  f3.io.enq.bits.fsrc_pred := s2_fsrc_pred
   f3.io.enq.bits.prediction_retired_count := s2_prediction_retired_count
 
   // RAS takes a cycle to read
@@ -692,6 +711,7 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
   f3_fetch_bundle.xcpt_pf_if := f3_imemresp.xcpt.pf.inst
   f3_fetch_bundle.xcpt_ae_if := f3_imemresp.xcpt.ae.inst
   f3_fetch_bundle.fsrc := f3_imemresp.fsrc
+  f3_fetch_bundle.fsrc_pred := f3_imemresp.fsrc_pred
   f3_fetch_bundle.tsrc := f3_imemresp.tsrc
   f3_fetch_bundle.shadowed_mask := f3_shadowed_mask
 
@@ -1074,6 +1094,12 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
       s0_tsrc      := BSRC_3
 
       f3_fetch_bundle.fsrc := BSRC_3
+      // Only claim F3 as the deciding predictor when no F1/F2 prediction was made.
+      // When F3 merely *overrides* an existing F1/F2 target, that stage keeps the
+      // label so its attempt stays attributable (and shows up as att_fN && !ok_fN).
+      // Test the QUEUE OUTPUT, not f3_fetch_bundle.fsrc_pred: the latter is the wire
+      // being assigned here, and reading it in the guard closes a combinational loop.
+      when (f3_imemresp.fsrc_pred === BSRC_C) { f3_fetch_bundle.fsrc_pred := BSRC_3 }
     }
   }
 
