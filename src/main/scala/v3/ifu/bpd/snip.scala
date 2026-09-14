@@ -22,9 +22,15 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val nru    = Bool()
   }
 
-  // Folded Cat(set,col) index — full-entry write (no mask) → BRAM-compatible
+  // PC-addressed index — full-entry write (no mask) → BRAM-compatible.
+  // The instruction COLUMN is deliberately NOT part of the address: a fetch packet
+  // holds at most one executed JALR, so the column is redundant with the PC, and
+  // sourcing it from the L2 prediction made the read row depend on the L2 being
+  // right. Widening the set index by log2(bankWidth) keeps the entry count (and
+  // the mems declaration) identical.
+  val itcIdxW = log2Ceil(itc_nSets * bankWidth)
   val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets * bankWidth, new ITCEntry) }
-  def itcAddr(set: UInt, col: UInt): UInt = Cat(set, col(log2Ceil(bankWidth)-1, 0))
+  def itcAddr(idx: UInt): UInt = idx(itcIdxW - 1, 0)
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
   val F = 15
@@ -57,10 +63,14 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val offPool = offWt   + W_WT                     // 710
   // Attribution fields are appended above the existing layout so the low-bit
   // fingerprint/signature offsets remain stable.
-  val offOverride   = offPool + W_POOL
-  val offBaseValid  = offOverride + 1
-  val offBaseTarget = offBaseValid + 1
-  val offNewTarget  = offBaseTarget + vaddrBitsExtended
+  // Step-2: the override is unconditional, so the baseline — what the frontend
+  // would have consumed without us — is the earlier banks' prediction at the
+  // committed CFI's column. That column is known only at commit, so carry the
+  // pre-override prediction for every column.
+  val offConf      = offPool + W_POOL
+  val offBaseOH    = offConf + 1
+  val offBaseTgt   = offBaseOH + bankWidth
+  val offNewTarget = offBaseTgt + bankWidth * vaddrBitsExtended
 
   override val metaSz = offNewTarget + vaddrBitsExtended
   require(metaSz <= bpdMaxMetaLength,
@@ -214,16 +224,20 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.snip_min_ham_le2_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 2.U)
   io.snip_min_ham_le4_event  := tr_b_fire && carried_snip_valid && (carried_min_ham <= 4.U)
 
-  // Compare the predecessor-chain target and the SNIP target against the full
-  // architectural target. These four outcomes attribute only active overrides.
-  val carried_override    = RegNext(io.update.bits.meta(offOverride))
-  val carried_base_valid  = RegNext(io.update.bits.meta(offBaseValid))
-  val carried_base_target = RegNext(io.update.bits.meta(offBaseTarget + vaddrBitsExtended - 1, offBaseTarget))
+  // Compare the SNIP target against the full architectural target, and against the
+  // baseline the frontend would have consumed without us — the earlier banks'
+  // prediction at the committed CFI's column.
+  val carried_conf     = RegNext(io.update.bits.meta(offConf))
+  val carried_base_oh  = RegNext(io.update.bits.meta(offBaseOH + bankWidth - 1, offBaseOH))
+  val carried_base_all = RegNext(io.update.bits.meta(offBaseTgt + bankWidth * vaddrBitsExtended - 1, offBaseTgt))
+  val carried_base_tgt = VecInit((0 until bankWidth).map(w =>
+    carried_base_all((w + 1) * vaddrBitsExtended - 1, w * vaddrBitsExtended)))
   val carried_new_target  = RegNext(io.update.bits.meta(offNewTarget + vaddrBitsExtended - 1, offNewTarget))
   val actual_target       = tr_b_target
-  val attribution_fire    = tr_b_fire && carried_override
-  val base_correct        = carried_base_valid && (carried_base_target === actual_target)
+  val attr_sel            = u.cfi_idx.bits
+  val attribution_fire    = tr_b_fire && carried_conf
   val new_correct         = carried_new_target === actual_target
+  val base_correct        = carried_base_oh(attr_sel) && (carried_base_tgt(attr_sel) === actual_target)
   val corrected           = attribution_fire && !base_correct && new_correct
   val harmed              = attribution_fire && base_correct && !new_correct
   val still_wrong         = attribution_fire && !base_correct && !new_correct
@@ -239,19 +253,18 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
 
   // Shared set-index hash
-  def itcSet(pc: UInt): UInt = fetchIdx(pc)(log2Ceil(itc_nSets) - 1, 0)
+  def itcSet(pc: UInt): UInt = fetchIdx(pc)(itcIdxW - 1, 0)
 
   // ── Commit-side ITC Update RMW ─────────────────────────────────────────────
   val upd_fire = io.update.valid && u.is_commit_update &&
                  u.cfi_is_jalr && !u.cfi_is_ret && u.cfi_taken && u.cfi_idx.valid
   val upd_idx  = itcSet(u.pc)
-  val upd_col  = u.cfi_idx.bits
 
   // ITC commit read DROPPED — carried in meta (TAGE pattern). Unpacked as tr_carried_pool.
+  // The column index is gone with the address: the write is PC-addressed like the read.
 
   val b_fire   = RegNext(upd_fire, false.B)
   val b_idx    = RegNext(upd_idx)
-  val b_col    = RegNext(upd_col)
   val b_target = RegNext(u.target)
   val b_ways   = tr_carried_pool
 
@@ -292,29 +305,21 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     e.target := Mux(is_victim, b_target, b_ways(w).target)
     e.nru    := !clear_nru
 
-    // Folded write: single call site, Muxed addr/data, no mask → 1R1W → BRAM
+    // Single write call site, Muxed addr/data, no mask → 1R1W → BRAM
     val we    = init_wr || commit_we
-    val waddr = Mux(init_wr, init_idx, itcAddr(b_idx, b_col))
+    val waddr = Mux(init_wr, init_idx, itcAddr(b_idx))
     val wdata = Mux(init_wr, init_zero, e)
     when (we) { itc(w).write(waddr, wdata) }
   }
 
-  // ── Predict-side ITC Read — folded: single-column pool directly ────────────
+  // ── Predict-side ITC Read — one pool for the whole packet ─────────────────
+  // The read address comes from io.f0_pc alone: no dependency on any earlier
+  // bank's prediction. s3 consumers (below) resolve the column themselves.
   val s3_resp = io.resp_in(0).f3
-  // Derive snip_col at s2 from f2 response (is_jal stable s1→s3; taken stable
-  // for non-BR entries). Read address = Cat(set, s2_snip_col) → single column.
-  val s2_resp = io.resp_in(0).f2
-  val s2_jalr_mask = VecInit((0 until bankWidth).map(w =>
-    s2_resp(w).is_jal && s2_resp(w).taken))
-  val s2_snip_col   = PriorityEncoder(s2_jalr_mask)
   val s2_itc_set    = RegNext(RegNext(itcSet(io.f0_pc)))  // double RegNext → s2 stage
-  val s2_read_addr  = itcAddr(s2_itc_set, s2_snip_col)
+  val s2_read_addr  = itcAddr(s2_itc_set)
   val s3_pool = VecInit((0 until itc_nWays).map(w =>
     itc(w).read(s2_read_addr, s2_valid)))
-
-  // Carry s2_snip_col to s3 — one source, used for both read and override
-  val snip_col     = RegNext(s2_snip_col)
-  val s3_has_jalr  = RegNext(s2_jalr_mask.asUInt.orR)  // registered, aligned with snip_col
 
   val s3_taken_mask = VecInit((0 until bankWidth).map(w => s3_resp(w).taken))
   val s3_has_taken = s3_taken_mask.asUInt.orR
@@ -352,26 +357,40 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val (snip_sel, _) = reduceMin((0 until itc_nWays).map(w =>
     (w.U(log2Ceil(itc_nWays).W), key(w))))
 
-  val snip_valid   = cand_valid.asUInt.orR && s3_has_jalr
+  val snip_valid   = cand_valid.asUInt.orR && s3_valid
   val snip_target  = s3_pool(snip_sel).target
   val snip_sig     = snip_target(F - 1, 0)
   val snip_min_ham = ham(snip_sel)
-  val base_prediction = s3_resp(snip_col).predicted_pc
-  val snip_override = snip_valid && (snip_min_ham <= override_thresh.U)
+  val snip_conf    = snip_valid && (snip_min_ham <= override_thresh.U)
+
+  // Step-2: unconditional override of every column. The frontend only consumes
+  // predicted_pc.bits on a column its own decode proves is a JALR (JAL/BR/CFI_X
+  // columns take brsigs.target or never redirect), so writing all columns is safe
+  // and lets the L3 correct a *wrong* earlier-bank target, not merely fill a hole.
+  // Precondition: RAS enabled — a ret column's target is taken from ras_top.
+  // NOTE: this also makes frontend f3_btb_mispredicts fire on JAL columns; that
+  // path is currently hardwired off (f4_btb_corrections.io.enq.valid := false.B).
+  val base_valid_oh = VecInit((0 until bankWidth).map(w =>
+    io.resp_in(0).f3(w).predicted_pc.valid))
+  val base_tgt_vec  = VecInit((0 until bankWidth).map(w =>
+    io.resp_in(0).f3(w).predicted_pc.bits))
 
   // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
-  // Layout: attribution | pool | wt | bias | valid|min_ham|sig|fingerprint
-  io.f3_meta := Cat(snip_target, base_prediction.bits, base_prediction.valid, snip_override,
+  // Layout: new_target | base targets | base_valid | conf | pool | wt | bias |
+  //         valid|min_ham|sig|fingerprint
+  io.f3_meta := Cat(snip_target, base_tgt_vec.asUInt, base_valid_oh.asUInt, snip_conf,
                     s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
                     snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
-  // F3 target override: correct predicted_pc when confident (first active change)
-  when (snip_override) {
-    io.resp.f3(snip_col).predicted_pc.valid := true.B
-    io.resp.f3(snip_col).predicted_pc.bits  := snip_target
+  // F3 target override: every column, whenever the L3 is confident.
+  when (snip_conf) {
+    for (w <- 0 until bankWidth) {
+      io.resp.f3(w).predicted_pc.valid := true.B
+      io.resp.f3(w).predicted_pc.bits  := snip_target
+    }
   }
 
-  // All-column observers dropped (folded read provides single column only)
+  // All-column observers still dropped (the read yields one pool, not a per-column view)
   io.pred_taken_event          := s3_valid && s3_has_taken
   io.pred_pool_nonempty_event  := false.B
   io.pred_target_in_pool_event := false.B

@@ -22,15 +22,12 @@ import boom.v3.common._
 class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(p) {
   // ── Geometry ──────────────────────────────────────────────────────────────
   val T        = 4                               // tagged tables, increasing histLens
-  val nEnt     = 8192                            // entries per table (folded depth: nRows x bankWidth cols)
+  val nEnt     = 8192                            // entries per table
   val tagW     = 7                               // partial tag bits
   val lowW     = 20                              // low target bits kept in tables
   val highW    = 20                              // high target bits kept in region array
   val nRegions = 128                             // region array entries (fully associative)
-  require(nEnt % bankWidth == 0, s"nEnt ($nEnt) must be a multiple of bankWidth ($bankWidth)")
-  val nRows = nEnt / bankWidth                   // hashed rows per table
-  val idxW  = log2Ceil(nRows)                    // hash index width
-  val colW  = log2Ceil(bankWidth)
+  val idxW     = log2Ceil(nEnt)                  // hash index width (PC-addressed, no column)
 
   val histLens = Seq(8, 16, 32, 64).map(_ min globalHistoryLength)
   require(histLens.length == T)
@@ -45,16 +42,25 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   }
   val W_E = 1 + tagW + log2Ceil(nRegions) + lowW + 2  // 37
 
-  // meta layout (LSB-first): 4 carried table entries, 37 bits each
+  // meta layout (LSB-first): 4 carried table entries (W_E bits each), then the
+  // Step-2 attribution block: new_target | base targets | base_valid | conf
   val offE = Seq.tabulate(T)(t => t * W_E)
-  override val metaSz = T * W_E                  // 148
+  val W_ENTRIES    = T * W_E
+  val offConf      = W_ENTRIES
+  val offBaseOH    = offConf + 1
+  val offBaseTgt   = offBaseOH + bankWidth
+  val offNewTarget = offBaseTgt + bankWidth * vaddrBitsExtended
+  override val metaSz = offNewTarget + vaddrBitsExtended
   require(metaSz <= bpdMaxMetaLength,
     s"ITTAGE metaSz ($metaSz) exceeds bpdMaxMetaLength ($bpdMaxMetaLength)")
 
-  // Folded Cat(row,col) index — full-entry write (no mask) → BRAM-compatible
+  // PC-addressed index — full-entry write (no mask) → BRAM-compatible.
+  // The instruction COLUMN is deliberately NOT part of the address: a fetch packet
+  // holds at most one executed JALR, so the column is redundant with the PC, and
+  // sourcing it from the L2 prediction made the read row depend on the L2 being
+  // right. nEnt is unchanged — only the index composition is.
   val tables = Seq.fill(T) { SyncReadMem(nEnt, UInt(W_E.W)) }
-  def foldAddr(idx: UInt, col: UInt): UInt =
-    if (bankWidth == 1) idx else Cat(idx(idxW - 1, 0), col(colW - 1, 0))
+  def foldAddr(idx: UInt): UInt = idx(idxW - 1, 0)
 
   // Region array: the high 20 target bits, indexed by the pointer carried in each
   // table entry; valid as regs, high bits in async Mem (s3 read + commit write).
@@ -66,7 +72,7 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   val nNodes = nRegions - 1
   val plru_state = RegInit(VecInit(Seq.fill(nNodes)(false.B)))
 
-  println(s"[ITTAGE cfg] T=$T nEnt=$nEnt nRows=$nRows idxW=$idxW tagW=$tagW lowW=$lowW " +
+  println(s"[ITTAGE cfg] T=$T nEnt=$nEnt idxW=$idxW tagW=$tagW lowW=$lowW " +
     s"nRegions=$nRegions histLens=${histLens.mkString(",")} " +
     s"metaSz=$metaSz/$bpdMaxMetaLength bankWidth=$bankWidth")
 
@@ -103,22 +109,17 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   }
 
   // ── Predict side (s2 read → s3 provider + region CAM) ─────────────────────
-  val s2_resp = io.resp_in(0).f2
-  val s2_jalr_mask = VecInit((0 until bankWidth).map(w =>
-    s2_resp(w).is_jal && s2_resp(w).taken))
-  val s2_snip_col  = PriorityEncoder(s2_jalr_mask)
-
+  // The read address comes from io.f0_pc alone: no dependency on any earlier
+  // bank's prediction. s3 consumers (below) resolve the column themselves.
   val s2_ghist = RegNext(io.f1_ghist)            // f1 → s2
   val s2_idx_t = VecInit((0 until T).map(t => hashIdx(s2_idx, s2_ghist, t)))
   val s2_tag_t = VecInit((0 until T).map(t => hashTag(s2_idx, s2_ghist, t)))
 
   val readEn = s2_valid && init_done
   val s3_entries = VecInit((0 until T).map(t =>
-    tables(t).read(foldAddr(s2_idx_t(t), s2_snip_col), readEn).asTypeOf(new TableEntry)))
+    tables(t).read(foldAddr(s2_idx_t(t)), readEn).asTypeOf(new TableEntry)))
 
-  // Carry s2 col/jalr/tag info to s3
-  val snip_col    = RegNext(s2_snip_col)
-  val s3_has_jalr = RegNext(s2_jalr_mask.asUInt.orR)
+  // Carry s2 tag info to s3
   val s3_tag_t    = RegNext(s2_tag_t)
   val s3_init_ok  = RegNext(init_done)           // sampled at s2 (readEn vintage)
 
@@ -141,14 +142,32 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   val region_high_s3 = region_high.read(prov_ridx)
 
   val ittage_target = Cat(region_high_s3, s3_entries(provider).low)
-  val snip_override = s3_init_ok && s3_valid && s3_has_jalr && provider_hit && region_hit
-  when (snip_override) {
-    io.resp.f3(snip_col).predicted_pc.valid := true.B
-    io.resp.f3(snip_col).predicted_pc.bits  := ittage_target
+  val ittage_conf   = s3_init_ok && s3_valid && provider_hit && region_hit
+
+  // Step-2: unconditional override of every column. The frontend only consumes
+  // predicted_pc.bits on a column its own decode proves is a JALR (JAL/BR/CFI_X
+  // columns take brsigs.target or never redirect), so writing all columns is safe
+  // and lets the L3 correct a *wrong* earlier-bank target, not merely fill a hole.
+  // Precondition: RAS enabled — a ret column's target is taken from ras_top.
+  // NOTE: this also makes frontend f3_btb_mispredicts fire on JAL columns; that
+  // path is currently hardwired off (f4_btb_corrections.io.enq.valid := false.B).
+  val base_valid_oh = VecInit((0 until bankWidth).map(w =>
+    io.resp_in(0).f3(w).predicted_pc.valid))
+  val base_tgt_vec  = VecInit((0 until bankWidth).map(w =>
+    io.resp_in(0).f3(w).predicted_pc.bits))
+  when (ittage_conf) {
+    for (w <- 0 until bankWidth) {
+      io.resp.f3(w).predicted_pc.valid := true.B
+      io.resp.f3(w).predicted_pc.bits  := ittage_target
+    }
   }
 
   // ── f3_meta carry (TAGE pattern; commit unpacks, no re-read) ──────────────
-  io.f3_meta := Cat((0 until T).reverse.map(t => s3_entries(t).asUInt))
+  // Layout: new_target | base targets | base_valid | conf | entries
+  // Single Seq argument: Cat's varargs and Seq overloads cannot be mixed.
+  io.f3_meta := Cat(
+    Seq[Bits](ittage_target, base_tgt_vec.asUInt, base_valid_oh.asUInt, ittage_conf) ++
+      (0 until T).reverse.map(t => s3_entries(t).asUInt))
 
   // ── Commit-side training ──────────────────────────────────────────────────
   val u       = io.update.bits
@@ -158,10 +177,9 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   val tr_b_fire    = RegNext(tr_fire, false.B)
   val tr_b_target  = RegNext(u.target)
   val tr_b_mispred = RegNext(u.cfi_mispredicted)
-  val tr_b_col     = RegNext(u.cfi_idx.bits)
   val tr_b_idx_t   = RegInit(VecInit(Seq.fill(T)(0.U(idxW.W))))
   val tr_b_tag_t   = RegInit(VecInit(Seq.fill(T)(0.U(tagW.W))))
-  val tr_b_entries = RegNext(io.update.bits.meta(metaSz - 1, 0))
+  val tr_b_entries = RegNext(io.update.bits.meta(W_ENTRIES - 1, 0))
 
   when (tr_fire) {
     tr_b_idx_t := VecInit((0 until T).map(t => hashIdx(fetchIdx(u.pc), u.ghist, t)))
@@ -258,7 +276,7 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
     val init_wr = !init_done
     when (init_wr || (tr_b_fire && we)) {
       tables(t).write(
-        Mux(init_wr, init_idx, foldAddr(tr_b_idx_t(t), tr_b_col)),
+        Mux(init_wr, init_idx, foldAddr(tr_b_idx_t(t))),
         Mux(init_wr, 0.U, e.asUInt))
     }
   }
@@ -275,14 +293,43 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
     plru_state := plru_next
   }
 
+  // ── Step-2 attribution ────────────────────────────────────────────────────
+  // The override is unconditional, so the value the frontend would have consumed
+  // without us is whatever the earlier banks put at the committed CFI's column.
+  // That column is only known here (u.cfi_idx), hence the per-column baseline.
+  val carried_conf     = RegNext(io.update.bits.meta(offConf))
+  val carried_base_oh  = RegNext(io.update.bits.meta(offBaseOH + bankWidth - 1, offBaseOH))
+  val carried_base_all = RegNext(io.update.bits.meta(offBaseTgt + bankWidth * vaddrBitsExtended - 1, offBaseTgt))
+  val carried_base_tgt = VecInit((0 until bankWidth).map(w =>
+    carried_base_all((w + 1) * vaddrBitsExtended - 1, w * vaddrBitsExtended)))
+  val carried_new_target = RegNext(io.update.bits.meta(offNewTarget + vaddrBitsExtended - 1, offNewTarget))
+  val attr_sel         = u.cfi_idx.bits
+  val actual_target    = tr_b_target
+  val attribution_fire = tr_b_fire && carried_conf
+  val new_correct      = carried_new_target === actual_target
+  val base_correct     = carried_base_oh(attr_sel) && (carried_base_tgt(attr_sel) === actual_target)
+  val corrected        = attribution_fire && !base_correct && new_correct
+  val harmed           = attribution_fire && base_correct && !new_correct
+  val still_wrong      = attribution_fire && !base_correct && !new_correct
+  val both_correct     = attribution_fire && base_correct && new_correct
+
+  io.indirect_override_event    := attribution_fire
+  io.indirect_corrected_event   := corrected
+  io.indirect_harmed_event      := harmed
+  io.indirect_still_wrong_event := still_wrong
+
+  when (attribution_fire) {
+    assert(PopCount(VecInit(Seq(corrected, harmed, still_wrong, both_correct))) === 1.U)
+  }
+
   // ── Observers (BranchPredictorBank event conventions) ─────────────────────
   io.itc_total_event := tr_b_fire
   io.itc_hit_event   := tr_b_fire && commit_prov_hit
   io.tr_event        := tr_b_fire
   io.tr_exact_event  := tr_b_fire && prov_correct
   io.pred_taken_event          := s3_valid && s3_has_taken
-  io.pred_pool_nonempty_event  := s3_valid && s3_has_jalr && provider_hit
-  io.pred_target_in_pool_event := s3_valid && s3_has_jalr && provider_hit && region_hit
+  io.pred_pool_nonempty_event  := s3_valid && provider_hit
+  io.pred_target_in_pool_event := s3_valid && provider_hit && region_hit
   io.pred_pool_saturated_event := false.B
 
   override val mems =
@@ -292,9 +339,9 @@ class IttageBranchPredictorBank(implicit p: Parameters) extends BranchPredictorB
   // ── Simulation-only diagnostics ───────────────────────────────────────────
   if (IN_SIMULATION) {
     val ovr_cnt = RegInit(0.U(8.W))
-    when (snip_override && ovr_cnt < 32.U) {
+    when (ittage_conf && ovr_cnt < 32.U) {
       ovr_cnt := ovr_cnt + 1.U
-      printf(p"[ittage] OVR col=${snip_col} prov=${provider} ridx=${prov_ridx} " +
+      printf(p"[ittage] OVR prov=${provider} ridx=${prov_ridx} " +
         p"low=0x${Hexadecimal(s3_entries(provider).low)} " +
         p"high=0x${Hexadecimal(region_high_s3)} tgt=0x${Hexadecimal(ittage_target)}\n")
     }
