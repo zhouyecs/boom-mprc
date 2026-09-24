@@ -6,11 +6,6 @@ import org.chipsalliance.cde.config.Parameters
 import boom.v3.common._
 
 class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(p) {
-  // Stage 3a: inert pass-through — io.resp := io.resp_in(0) inherited.
-  // Stage 3b: ITC population + candidate-pool observer.
-  // Stage 4a: predict-side ITC read + 4 observer counters.
-  // Stage 4b: fingerprint compute datapath (observer-only).
-  // Stage 4c: training + f3_meta carry + convergence observer.
 
   def itc_nSets = p(BoomSnipITCSets)
   def itc_nWays = p(BoomSnipITCWays)
@@ -19,7 +14,6 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   class ITCEntry extends Bundle {
     val valid  = Bool()
     val target = UInt(vaddrBitsExtended.W)
-    val nru    = Bool()
   }
 
   // PC-addressed index — full-entry write (no mask) → BRAM-compatible.
@@ -29,8 +23,66 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // right. Widening the set index by log2(bankWidth) keeps the entry count (and
   // the mems declaration) identical.
   val itcIdxW = log2Ceil(itc_nSets * bankWidth)
-  val itc = Seq.fill(itc_nWays) { SyncReadMem(itc_nSets * bankWidth, new ITCEntry) }
+  val flatDepth = itc_nSets * bankWidth
+  val itc = Seq.fill(itc_nWays) { SyncReadMem(flatDepth, new ITCEntry) }
   def itcAddr(idx: UInt): UInt = idx(itcIdxW - 1, 0)
+
+  // ── Tree-pLRU replacement state ─────────────────────────────────────────────
+  // One tree per indexed row (flatDepth rows), itc_nWays - 1 bits per tree.
+  // A node's bit names the side that holds the LRU half (0 → left, 1 → right),
+  // so descending from the root lands on the least-recently-used way, and an
+  // access flips every node on its path to point away from it.
+  //
+  // The tree is built by recursive halving, so ANY itc_nWays >= 2 works — not
+  // just powers of two — while collapsing to the usual heap-numbered tree when
+  // itc_nWays is a power of two. Leaves self-loop (both children = self), so
+  // the unrolled descent always terminates on a leaf even though an early leaf
+  // is less deep than the tree's nominal height.
+  require(itc_nWays >= 2, s"ITC tree-pLRU needs at least 2 ways, got $itc_nWays")
+  val plruL     = log2Ceil(itc_nWays)   // tree height = levels of decisions
+  val plruNodes = itc_nWays - 1         // internal nodes = state bits per row
+  val plruWayW  = math.max(1, log2Ceil(itc_nWays))      // way indices, 0..nWays-1
+  val plruCmpW  = math.max(1, log2Ceil(itc_nWays + 1))  // node bounds, 0..nWays
+  val plruBitW  = math.max(1, log2Ceil(plruNodes))
+
+  import scala.collection.mutable.ArrayBuffer
+  val pLo  = ArrayBuffer[Int]()   // node → way range [lo, hi) it covers
+  val pHi  = ArrayBuffer[Int]()
+  val pMid = ArrayBuffer[Int]()   // internal node → split point
+  val pBit = ArrayBuffer[Int]()   // internal node → state bit (leaves: unused)
+  val pL   = ArrayBuffer[Int]()   // node → children (leaves: self-loop)
+  val pR   = ArrayBuffer[Int]()
+  val pWay = ArrayBuffer[Int]()   // leaf → way index (-1 for internal nodes)
+
+  def buildPlru(lo: Int, hi: Int): Int = {
+    val me = pLo.length
+    pLo += lo; pHi += hi; pMid += -1; pBit += 0
+    pL += me; pR += me; pWay += -1
+    if (hi - lo == 1) {
+      pWay(me) = lo
+    } else {
+      val mid = (lo + hi) / 2
+      pMid(me) = mid
+      pL(me) = buildPlru(lo, mid)
+      pR(me) = buildPlru(mid, hi)
+    }
+    me
+  }
+  val plruRoot = buildPlru(0, itc_nWays)
+  // Bit indices follow node (pre-order) order; internal nodes only.
+  var plruBitCursor = 0
+  for (i <- pLo.indices) {
+    if (pWay(i) < 0) { pBit(i) = plruBitCursor; plruBitCursor += 1 }
+  }
+  require(plruBitCursor == plruNodes)
+  // Internal nodes in bit-index order — the reverse map the update walk needs.
+  val plruBitNode = pLo.indices.filter(i => pWay(i) < 0)
+
+  val plruNodeIdxW  = log2Ceil(pLo.length)
+  val plruBitIdxVec = VecInit(pLo.indices.map(i => pBit(i).U(plruBitW.W)))
+  val plruLeftVec   = VecInit(pLo.indices.map(i => pL(i).U(plruNodeIdxW.W)))
+  val plruRightVec  = VecInit(pLo.indices.map(i => pR(i).U(plruNodeIdxW.W)))
+  val plruWayVec    = VecInit(pLo.indices.map(i => math.max(0, pWay(i)).U(plruWayW.W)))
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
   val F = 15
@@ -56,7 +108,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
   val W_BIAS  = F * 5                              // 75
   val W_WT    = Tbl * F * 5                        // 600
-  val W_ITC_ENTRY = 2 + vaddrBitsExtended   // valid(1) + target + nru(1)
+  val W_ITC_ENTRY = 1 + vaddrBitsExtended   // valid(1) + target (replacement lives in the tree)
   val W_POOL  = itc_nWays * W_ITC_ENTRY
   val offBias = W_BASE                             // 35
   val offWt   = offBias + W_BIAS                   // 110
@@ -78,7 +130,8 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     s"— reduce itc_nWays ($itc_nWays) or increase bpdMaxMetaLength")
 
   override val mems =
-    Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", itc_nSets * bankWidth, 1 + vaddrBitsExtended + 1)) ++
+    Seq.tabulate(itc_nWays)(w => (s"snip_itc_way$w", flatDepth, 1 + vaddrBitsExtended)) ++
+    Seq(("snip_itc_plru", flatDepth, plruNodes)) ++
     Seq.tabulate(Tbl)(t => (s"snip_weight$t", E, F * 5)) :+
     ("snip_bias", nbias, F * 5)
 
@@ -262,6 +315,9 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // ITC commit read DROPPED — carried in meta (TAGE pattern). Unpacked as tr_carried_pool.
   // The column index is gone with the address: the write is PC-addressed like the read.
+  // The tree-pLRU state is the one exception: it is a pure function of the commit
+  // stream, so it is read and written in place at commit rather than riding a
+  // predict-time snapshot that a later commit to the same row may have obsoleted.
 
   val b_fire   = RegNext(upd_fire, false.B)
   val b_idx    = RegNext(upd_idx)
@@ -274,18 +330,44 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.itc_total_event := b_fire
   io.itc_hit_event   := b_fire && b_hit
 
-  val inval_oh = VecInit(b_ways.map(w => !w.valid))
-  val nru_oh   = VecInit(b_ways.map(w => !w.nru))
-  val victim   = Mux(inval_oh.asUInt.orR, PriorityEncoder(inval_oh),
-                 Mux(nru_oh.asUInt.orR,   PriorityEncoder(nru_oh), 0.U))
-  val all_used = !inval_oh.asUInt.orR && !nru_oh.asUInt.orR
+  // Invalid-first, else the tree walk: a free way always wins, so a set that
+  // still has one never lets the tree pick the victim (the MRU update still runs).
+  val inval_oh  = VecInit(b_ways.map(w => !w.valid))
+  val has_inval = inval_oh.asUInt.orR
+
+  val plru_state = RegInit(VecInit(Seq.fill(flatDepth)(0.U(plruNodes.W))))
+  val plru_tree  = VecInit(plru_state(itcAddr(b_idx)).asBools)
+
+  // Victim walk: descend the LRU pointers. A node already at a leaf self-loops,
+  // so its (unused) bit read is a don't-care.
+  val v_node = Wire(Vec(plruL + 1, UInt(plruNodeIdxW.W)))
+  v_node(0) := plruRoot.U
+  for (l <- 0 until plruL) {
+    val bit = plru_tree(plruBitIdxVec(v_node(l)))
+    v_node(l + 1) := Mux(bit, plruRightVec(v_node(l)), plruLeftVec(v_node(l)))
+  }
+  val plru_victim = plruWayVec(v_node(plruL))
+  val victim      = Mux(has_inval, PriorityEncoder(inval_oh), plru_victim)
+
+  // MRU update: every node containing the accessed way points away from it,
+  // i.e. bit := "the access went left". Nodes off the path keep their bit.
+  val acc_way = Mux(b_hit, PriorityEncoder(b_hit_oh), victim)
+  // Node bounds reach itc_nWays (the root spans [0, nWays)), so the range tests
+  // run one bit wider than the way index itself.
+  val acc_cmp = if (plruCmpW > plruWayW) Cat(0.U((plruCmpW - plruWayW).W), acc_way) else acc_way
+  val plru_next = Wire(Vec(plruNodes, Bool()))
+  for (i <- 0 until plruNodes) {
+    val node   = plruBitNode(i)
+    val onPath = (acc_cmp >= pLo(node).U(plruCmpW.W)) && (acc_cmp < pHi(node).U(plruCmpW.W))
+    plru_next(i) := Mux(onPath, acc_cmp < pMid(node).U(plruCmpW.W), plru_tree(i))
+  }
+  when (b_fire) { plru_state(itcAddr(b_idx)) := plru_next.asUInt }
 
   // ── ITC Initialization FSM ─────────────────────────────────────────────────
-  val flatDepth = itc_nSets * bankWidth
   val init_done = RegInit(false.B)
   val init_idx  = RegInit(0.U(log2Ceil(flatDepth).W))
   val init_zero = {
-    val e = Wire(new ITCEntry); e.valid := false.B; e.target := 0.U; e.nru := false.B; e
+    val e = Wire(new ITCEntry); e.valid := false.B; e.target := 0.U; e
   }
   val init_wr = !init_done
 
@@ -297,13 +379,11 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   for (w <- 0 until itc_nWays) {
     val is_victim = !b_hit && (w.U === victim)
     val is_hitway = b_hit && b_hit_oh(w)
-    val clear_nru = all_used && !is_victim
-    val commit_we = b_fire && (is_victim || is_hitway || clear_nru)
+    val commit_we = b_fire && (is_victim || is_hitway)
 
     val e = Wire(new ITCEntry)
     e.valid  := true.B
     e.target := Mux(is_victim, b_target, b_ways(w).target)
-    e.nru    := !clear_nru
 
     // Single write call site, Muxed addr/data, no mask → 1R1W → BRAM
     val we    = init_wr || commit_we

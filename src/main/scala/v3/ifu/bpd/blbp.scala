@@ -6,11 +6,6 @@ import org.chipsalliance.cde.config.Parameters
 import boom.v3.common._
 
 class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(p) {
-  // Stage 3a: inert pass-through — io.resp := io.resp_in(0) inherited.
-  // Stage 3b: ITC population + candidate-pool observer.
-  // Stage 4a: predict-side ITC read + 4 observer counters.
-  // Stage 4b: fingerprint compute datapath (observer-only).
-  // Stage 4c: training + f3_meta carry + convergence observer.
 
   def itc_nSets = p(BoomBlbpITCSets)
   def itc_nWays = p(BoomBlbpITCWays)
