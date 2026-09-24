@@ -87,8 +87,8 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // ── Fingerprint datapath constants ──────────────────────────────────────────
   val F = 15
   val Tbl = 8
-  val E = 1024
-  val nbias = 4096
+  val E = 512
+  val nbias = 1024
 
   val histLens = Seq(0, 2, 4, 8, 12, 18, 28, 42).map(_ min globalHistoryLength)
 
