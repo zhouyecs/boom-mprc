@@ -23,8 +23,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val lg2Regions = p(BoomBlbpLg2Regions)
   val offsetBits = p(BoomBlbpOffsetBits)
   val nRegions   = p(BoomBlbpNRegions)
-  val regionRRIP = p(BoomBlbpRegionRRIP)
   require(isPow2(nRegions), s"BoomBlbpNRegions ($nRegions) must be a power of 2")
+  require(nRegions >= 2, s"BoomBlbpNRegions ($nRegions) must be at least 2")
   require(!(usePLRU && useRRIP), "PLRU and RRIP are mutually exclusive")
   val regionIdxW = log2Ceil(nRegions)
   val regionBits = vaddrBitsExtended - offsetBits
@@ -78,9 +78,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Region table: compressed {region_index, offset} → full target reconstruction
   val region_entries = Mem(nRegions, UInt(regionBits.W))
   val region_valid   = RegInit(VecInit(Seq.fill(nRegions)(false.B)))
-  // RRIP replacement for region table (2-bit RRPV, opt-in; default random unchanged)
-  val region_rrpv = if (regionRRIP) Some(RegInit(VecInit(Seq.fill(nRegions)(3.U(2.W))))) else None
-  val rand_counter   = RegInit("hdeadb10c".U(32.W))
+  // Replacement state: tree-pLRU, nRegions-1 bits, using the same heap recurrence
+  // as the ITC's tree below.
+  val region_plru = RegInit(0.U((nRegions - 1).W))
 
   val region_init_done = RegInit(false.B)
   val region_init_idx  = RegInit(0.U(log2Ceil(nRegions).W))
@@ -679,34 +679,56 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val match_oh = VecInit((0 until nRegions).map(i =>
       region_valid(i) && (region_entries.read(i.U) === region_number)))
     val free_oh  = VecInit(region_valid.map(!_))
-    val rand_slot = rand_counter(regionIdxW-1, 0)
 
-    val region_full = !free_oh.asUInt.orR
-    val rrip_victim = if (regionRRIP) {
-      val rr = region_rrpv.get
-      val maxRrpv = rr.reduce((a,b) => Mux(a >= b, a, b))
-      PriorityEncoder(rr.map(_ === maxRrpv))
-    } else rand_slot
+    // ── Victim: tree-pLRU ─────────────────────────────────────────────────────
+    // Same heap recurrence as the ITC's tree below: the children of node n are
+    // 2n+1 (left) and 2n+2 (right), and a node's bit names the half holding the
+    // LRU side, so descending the bits lands on the least recently used region.
+    // nRegions is a power of two, so the tree is complete over nRegions leaves.
+    val regionL     = log2Ceil(nRegions)
+    val regionNodes = nRegions - 1
+    val plru_victim = {
+      val tree = VecInit(region_plru.asBools)
+      val v_node = Wire(Vec(regionL + 1, UInt(log2Ceil(nRegions).W)))
+      val v_way  = Wire(Vec(regionL + 1, UInt(regionL.W)))
+      v_node(0) := 0.U
+      v_way(0)  := 0.U
+      for (l <- 0 until regionL) {
+        val bit = tree(v_node(l))
+        v_way(l + 1)  := (v_way(l) << 1) | bit
+        v_node(l + 1) := (v_node(l) << 1) + 1.U + bit
+      }
+      v_way(regionL)
+    }
 
     val alloc_slot = Mux(match_oh.asUInt.orR, PriorityEncoder(match_oh),
-                    Mux(free_oh.asUInt.orR,  PriorityEncoder(free_oh), rrip_victim))
+                    Mux(free_oh.asUInt.orR,  PriorityEncoder(free_oh), plru_victim))
 
     when (b_fire && !b_hit && region_init_done) {
       region_entries.write(alloc_slot, region_number)
       region_valid(alloc_slot)   := true.B
-      rand_counter := rand_counter + 17.U
-      if (regionRRIP) {
-        val rr = region_rrpv.get
-        val age = 3.U - rr.reduce((a,b) => Mux(a >= b, a, b))
-        when (region_full) { rr.foreach(r => r := r + age) }  // age ONLY when evicting
-        rr(alloc_slot) := 2.U                                  // insert value on the actual slot
-      }
     }
-    if (regionRRIP) {
-      when (b_fire && b_hit && match_oh.asUInt.orR) {
-        region_rrpv.get(PriorityEncoder(match_oh)) := 0.U      // promote on reuse
-      }
+
+    // MRU update: mark the region this commit touched. On an ITC miss that is the
+    // slot just allocated; on an ITC hit it is the region the hitting entry points
+    // at, provided that region is still resident.
+    val region_use  = b_fire && region_init_done &&
+                      Mux(b_hit, match_oh.asUInt.orR, true.B)
+    val region_used = Mux(b_hit, PriorityEncoder(match_oh), alloc_slot)
+    val tree = VecInit(region_plru.asBools)
+    val u_node = Wire(Vec(regionL + 1, UInt(log2Ceil(nRegions).W)))
+    u_node(0) := 0.U
+    for (l <- 0 until regionL) {
+      val bit = region_used(regionL - 1 - l)       // MSB first
+      u_node(l + 1) := (u_node(l) << 1) + 1.U + bit
     }
+    val plru_next = Wire(Vec(regionNodes, Bool()))
+    for (i <- 0 until regionNodes) {
+      val onPath  = VecInit((0 until regionL).map(l => u_node(l) === i.U)).asUInt.orR
+      val levelOf = PriorityEncoder(VecInit((0 until regionL).map(l => u_node(l) === i.U)))
+      plru_next(i) := Mux(onPath, !region_used((regionL - 1).U - levelOf), tree(i))
+    }
+    when (region_use) { region_plru := plru_next.asUInt }
     Cat(alloc_slot, b_target(offsetBits-1, 0))
   } else {
     0.U(tgtBits.W)
