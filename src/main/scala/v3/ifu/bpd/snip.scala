@@ -9,7 +9,6 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   def itc_nSets = p(BoomSnipITCSets)
   def itc_nWays = p(BoomSnipITCWays)
-  def override_thresh = p(BoomSnipOverrideThresh)
   val useSnipAdaptCoeff = p(BoomSnipAdaptCoeff)
   val coeffShift = p(BoomSnipCoeffShift)
   val useSnipAdaptTheta = p(BoomSnipAdaptTheta)
@@ -193,8 +192,9 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // would have consumed without us — is the earlier banks' prediction at the
   // committed CFI's column. That column is known only at commit, so carry the
   // pre-override prediction for every column.
-  val offConf      = offPool + W_POOL
-  val offBaseOH    = offConf + 1
+  // The override enable is not carried separately: with the Hamming gate gone it
+  // is bit-for-bit snip_valid, which already sits in the base field below.
+  val offBaseOH    = offPool + W_POOL
   val offBaseTgt   = offBaseOH + bankWidth
   val offNewTarget = offBaseTgt + bankWidth * vaddrBitsExtended
   // Path-ring slice the weight-table index needs, carried so the commit side can
@@ -495,7 +495,6 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Compare the SNIP target against the full architectural target, and against the
   // baseline the frontend would have consumed without us — the earlier banks'
   // prediction at the committed CFI's column.
-  val carried_conf     = RegNext(io.update.bits.meta(offConf))
   val carried_base_oh  = RegNext(io.update.bits.meta(offBaseOH + bankWidth - 1, offBaseOH))
   val carried_base_all = RegNext(io.update.bits.meta(offBaseTgt + bankWidth * vaddrBitsExtended - 1, offBaseTgt))
   val carried_base_tgt = VecInit((0 until bankWidth).map(w =>
@@ -503,7 +502,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val carried_new_target  = RegNext(io.update.bits.meta(offNewTarget + vaddrBitsExtended - 1, offNewTarget))
   val actual_target       = tr_b_target
   val attr_sel            = u.cfi_idx.bits
-  val attribution_fire    = tr_b_fire && carried_conf
+  val attribution_fire    = tr_b_fire && carried_snip_valid
   val new_correct         = carried_new_target === actual_target
   val base_correct        = carried_base_oh(attr_sel) && (carried_base_tgt(attr_sel) === actual_target)
   val corrected           = attribution_fire && !base_correct && new_correct
@@ -656,12 +655,19 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val snip_target  = s3_pool(snip_sel).target
   val snip_sig     = snip_target(F - 1, 0)
   val snip_min_ham = ham(snip_sel)
-  val snip_conf    = snip_valid && (snip_min_ham <= override_thresh.U)
+  // The override fires whenever the candidate pool has a valid way (snip_valid):
+  // the Hamming-distance confidence gate that used to sit here (snip_min_ham <=
+  // a configurable threshold, default 2) has been removed, so there is no
+  // separate enable signal left. snip_min_ham is still carried in the meta and
+  // observable, so what the gate would have rejected can be counted at commit
+  // (snip_min_ham_le2/le4); the attribution counters (indirect_*) now measure the
+  // ungated override.
 
-  // Step-2: unconditional override of every column. The frontend only consumes
-  // predicted_pc.bits on a column its own decode proves is a JALR (JAL/BR/CFI_X
-  // columns take brsigs.target or never redirect), so writing all columns is safe
-  // and lets the L3 correct a *wrong* earlier-bank target, not merely fill a hole.
+  // Step-2: unconditional override of every column, now also unconditional on the
+  // prediction's confidence. The frontend only consumes predicted_pc.bits on a
+  // column its own decode proves is a JALR (JAL/BR/CFI_X columns take
+  // brsigs.target or never redirect), so writing all columns is safe and lets the
+  // L3 correct a *wrong* earlier-bank target, not merely fill a hole.
   // Precondition: RAS enabled — a ret column's target is taken from ras_top.
   // NOTE: this also makes frontend f3_btb_mispredicts fire on JAL columns; that
   // path is currently hardwired off (f4_btb_corrections.io.enq.valid := false.B).
@@ -671,7 +677,7 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     io.resp_in(0).f3(w).predicted_pc.bits))
 
   // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
-  // Layout: under | path_slice | new_target | base targets | base_valid | conf |
+  // Layout: under | path_slice | new_target | base targets | base_valid |
   //         pool | wt | bias | valid|min_ham|sig|fingerprint
   // The ring slice is re-aligned s1 → s3 so it is the value the s1-stage index used.
   val s3_path = if (useSnipPathRing) Some(RegNext(RegNext(io.f1_path(W_PATH - 1, 0)))) else None
@@ -681,13 +687,13 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val metaFields: Seq[Bits] =
     (if (useSnipAdaptTheta) Seq(s3_under.get.asUInt) else Nil) ++
     (if (useSnipPathRing)  Seq(s3_path.get)             else Nil) ++
-    Seq(snip_target, base_tgt_vec.asUInt, base_valid_oh.asUInt, snip_conf,
+    Seq(snip_target, base_tgt_vec.asUInt, base_valid_oh.asUInt,
         s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
         snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
   io.f3_meta := metaFields.reduceLeft((a, b) => Cat(a, b))
 
-  // F3 target override: every column, whenever the L3 is confident.
-  when (snip_conf) {
+  // F3 target override: every column, whenever the candidate pool is non-empty.
+  when (snip_valid) {
     for (w <- 0 until bankWidth) {
       io.resp.f3(w).predicted_pc.valid := true.B
       io.resp.f3(w).predicted_pc.bits  := snip_target

@@ -59,7 +59,6 @@ case object BoomSnipKey extends Field[Boolean](false)
 
 case object BoomSnipITCSets extends Field[Int](256)
 case object BoomSnipITCWays extends Field[Int](8)
-case object BoomSnipOverrideThresh extends Field[Int](2)
 case object BoomSnipAdaptCoeff extends Field[Boolean](false)
 // log2 of the relative step size: the coefficient moves by coeff >> shift per
 // vote. 18 -> 3.8e-6, close to the reference simulator's factor = 1.00000455.
@@ -77,7 +76,6 @@ class WithSnip extends Config((site, here, up) => {
 class WithSnipSmallITC extends Config((site, here, up) => {
   case BoomSnipITCSets => 64
   case BoomSnipITCWays => 4
-  case BoomSnipOverrideThresh => 2
 })
 
 // IBTB geometry sweep
