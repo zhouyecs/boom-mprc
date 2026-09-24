@@ -60,6 +60,10 @@ case object BoomSnipKey extends Field[Boolean](false)
 case object BoomSnipITCSets extends Field[Int](256)
 case object BoomSnipITCWays extends Field[Int](8)
 case object BoomSnipOverrideThresh extends Field[Int](2)
+case object BoomSnipAdaptCoeff extends Field[Boolean](false)
+// log2 of the relative step size: the coefficient moves by coeff >> shift per
+// vote. 18 -> 3.8e-6, close to the reference simulator's factor = 1.00000455.
+case object BoomSnipCoeffShift extends Field[Int](18)
 
 class WithSnip extends Config((site, here, up) => {
   case BoomSnipKey => true
@@ -75,6 +79,15 @@ class WithSnipSmallITC extends Config((site, here, up) => {
 class WithSnipITC(nSets: Int, nWays: Int) extends Config((site, here, up) => {
   case BoomSnipITCSets => nSets
   case BoomSnipITCWays => nWays
+})
+
+// Adaptive coefficient vector: the reference SNIP scales each learner's
+// coefficient by `factor` (or 1/factor) whenever that learner's own vote was
+// right (or wrong). Fixed-point equivalent: the coefficient is kept in Q16 and
+// moves by coeff >> coeffShift, i.e. a constant *relative* step of 2^-coeffShift.
+class WithSnipAdaptCoeff(coeffShift: Int = 18) extends Config((site, here, up) => {
+  case BoomSnipAdaptCoeff => true
+  case BoomSnipCoeffShift => coeffShift
 })
 
 // SNIP path-address ring: the frontend shifts conditional-branch PC bits into a

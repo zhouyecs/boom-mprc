@@ -10,6 +10,8 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def itc_nSets = p(BoomSnipITCSets)
   def itc_nWays = p(BoomSnipITCWays)
   def override_thresh = p(BoomSnipOverrideThresh)
+  val useSnipAdaptCoeff = p(BoomSnipAdaptCoeff)
+  val coeffShift = p(BoomSnipCoeffShift)
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
@@ -116,8 +118,43 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       s"path depth ${pathDepths.max} exceeds globalHistoryLength ($globalHistoryLength)")
   }
 
-  val coeffBias = 68
-  val coeffs = VecInit(Seq(68, 56, 48, 37, 31, 24, 17, 17).map(_.S(8.W)))
+  // Reference SNIP starts its coefficients at max(1/(0.059+0.006*d), 4.3) and
+  // adapts them online. The port keeps that schedule sampled at its own window
+  // depths d = histLens(t) = 0/2/4/8/12/18/28/42, scaled x4 and rounded to
+  // 68/56/48/37/31/24/17/17 (the two trailing 17s both sit on the 4.3 floor).
+  // With useSnipAdaptCoeff the coefficients become registers, read at predict and
+  // updated in place at commit like the tree-pLRU state — no meta snapshot,
+  // because the commit side never reads them (the error signal comes from the
+  // carried fingerprint).
+  // Unlike the pLRU state their *updates* do consume carried predict-time state,
+  // which is why the votes below are taken from the carried weights.
+  val coeffs_init = Seq(68, 56, 48, 37, 31, 24, 17, 17)
+  val coeffBias_init = 68
+  // Constant path (useSnipAdaptCoeff = false), exactly as before.
+  val coeffs    = VecInit(coeffs_init.map(_.S(8.W)))
+  val coeffBias = coeffBias_init.S(8.W)
+  // Adaptive path: the coefficients live in Q(CQ_W-CQ_FRAC).CQ_FRAC and move by
+  // `coeff_q >> coeffShift` per vote, i.e. a *relative* step of 2^-coeffShift —
+  // the fixed-point analogue of the reference's `coeff *= factor` / `/= factor`
+  // (factor = 1.00000455 -> 2^-17.8, so the default shift of 18 matches it).
+  // The step truncates to zero below coeff_q = 2^coeffShift, i.e. below an
+  // effective coefficient of 2^(coeffShift - CQ_FRAC) = 4.0 at the defaults; that
+  // is why CQ_FRAC is 16 and not tighter — at CQ_FRAC = 12 the floor would sit at
+  // 64 and every coefficient but the first would freeze immediately. At the
+  // starting values every product has CQ_FRAC zero low bits, so
+  // (w * coeff_q) >> CQ_FRAC stays bit-identical to the integer path below.
+  val CQ_FRAC = 16
+  val CQ_W    = 25                 // sign + 24 bits; ceiling 255 << CQ_FRAC fits
+  val CQ_MIN  = 1 << CQ_FRAC
+  val CQ_MAX  = 255 << CQ_FRAC
+  require(coeffShift < CQ_W, s"coeffShift ($coeffShift) must be below CQ_W ($CQ_W)")
+  require((coeffs_init.min << CQ_FRAC) >= (1 << coeffShift),
+    s"coeffShift ($coeffShift) would freeze every coefficient at or below " +
+    s"${1 << (coeffShift - CQ_FRAC)}; the smallest starting value is ${coeffs_init.min}")
+  val coeffs_q    = if (useSnipAdaptCoeff) Some(
+    RegInit(VecInit(coeffs_init.map(c => (c << CQ_FRAC).S(CQ_W.W))))) else None
+  val coeffBias_q = if (useSnipAdaptCoeff) Some(
+    RegInit((coeffBias_init << CQ_FRAC).S(CQ_W.W))) else None
 
   val weights = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(5.W))))
   val biasMem = SyncReadMem(nbias, Vec(F, SInt(5.W)))
@@ -200,10 +237,13 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
 
   // ── Fingerprint dot-product (s1→s3) ─────────────────────────────────────────
-  // PREDICT-SIDE sum_w formula (for bit-identity check with training):
   //   s2_sum(w) = Σ_t (±1_t * s2_wt(t)(w) * coeffs(t)) + (s2_bia(w) * coeffBias)
   //   s3_sum = RegNext(s2_sum); fp_bit = (s3_sum(w) >= 0.S)
   // ±1_t is the depth-aligned direction bit; it is always +1 when path mode is off.
+  // The commit side never recomputes this sum: the fingerprint it produces is
+  // carried in f3_meta. That is cheaper, and since the coefficients below move
+  // with the commit stream a recomputation could no longer reproduce the
+  // prediction anyway — the carried fingerprint IS what was predicted.
   val biasIdx = fetchIdx(s1_pc)(log2Ceil(nbias) - 1, 0)
   val readEn  = s1_valid && wt_init_done
 
@@ -219,11 +259,25 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }))) else None
 
   val s2_sum = VecInit((0 until F).map { w =>
-    val wt = (0 until Tbl).map { t =>
-      val p = (s2_wt(t)(w) * coeffs(t)).asSInt
-      if (useSnipPathRing) Mux(s2_sign.get(t), p, -p) else p
-    }.reduce(_ + _)
-    (wt + (s2_bia(w) * coeffBias.S).asSInt).asSInt
+    // `+&` (width-growing), not `+`: Chisel's `+` wraps at the wider operand's
+    // width, so a wrapping adder would silently truncate the fingerprint sum —
+    // the constant vector's worst case alone is 16*298 = 4768, past the SInt(13)
+    // that a 5x8 product chain would otherwise land in.
+    if (useSnipAdaptCoeff) {
+      // Q path: multiply by the full-precision coefficient and shift once after
+      // the sum, so the fraction is not lost term by term.
+      val qterms = (0 until Tbl).map { t =>
+        val p = s2_wt(t)(w) * coeffs_q.get(t)
+        if (useSnipPathRing) Mux(s2_sign.get(t), p, -p) else p
+      }
+      (qterms.reduce(_ +& _) +& (s2_bia(w) * coeffBias_q.get)) >> CQ_FRAC
+    } else {
+      val terms = (0 until Tbl).map { t =>
+        val p = (s2_wt(t)(w) * coeffs(t)).asSInt
+        if (useSnipPathRing) Mux(s2_sign.get(t), p, -p) else p
+      }
+      (terms.reduce(_ +& _) +& (s2_bia(w) * coeffBias).asSInt).asSInt
+    }
   })
 
   val s3_sum = RegNext(s2_sum)
@@ -263,21 +317,17 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Training RMW at tr_b_fire: one write per table, all F bits updated in parallel
   val tr_actual_fp = extractFp(tr_b_target)
 
-  // Per-bit train_we and updated rows (combinational, computed at tr_b_fire)
-  // TRAINING-SIDE sum_w formula (must be bit-identical to predict-side s2_sum above):
-  //   sum_w = Σ_t (±1_t * tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
+  // Per-bit train_we and updated rows (combinational, computed at tr_b_fire).
+  // tr_we comes straight from the carried fingerprint — that IS what this packet
+  // predicted — so the commit side needs neither a dot product nor the
+  // coefficients to know which bits went wrong.
   val tr_we = Wire(Vec(F, Bool()))
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
 
   for (w <- 0 until F) {
-    val sum_w = (0 until Tbl).map { t =>
-      val p = (tr_carried_wt(t)(w) * coeffs(t)).asSInt
-      if (useSnipPathRing) Mux(tr_b_sign.get(t), p, -p) else p
-    }.reduce(_ + _) + (tr_carried_bia(w) * coeffBias.S).asSInt
-    val pred_bit   = (sum_w >= 0.S).asUInt
     val target_bit = tr_actual_fp(w)
-    tr_we(w) := (pred_bit =/= target_bit)
+    tr_we(w) := (tr_b_fp(w) =/= target_bit)
 
     for (t <- 0 until Tbl) {
       val delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
@@ -286,13 +336,72 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       // Its contribution to sum_w is sign_t * w, so a learner currently seeing -1
       // must be driven opposite to the target bit.
       val delta_t = if (useSnipPathRing) Mux(tr_b_sign.get(t), delta, -delta) else delta
-      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) + delta_t, tr_carried_wt(t)(w))
+      // `+&`, not `+`: Chisel's `+` is a wrapping add, so at SInt(5.W) a weight of
+      // +15 stepped by +1 would wrap straight to -16 and the saturation below
+      // would be dead code. The reference really does clamp at
+      // max_weight/min_weight, so the sum has to be one bit wide enough to see it.
+      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) +& delta_t, tr_carried_wt(t)(w))
       tr_updated_wt(t)(w) := Mux(raw > 15.S, 15.S, Mux(raw < -16.S, -16.S, raw))
     }
     val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-    val b_raw   = Mux(tr_we(w), tr_carried_bia(w) + b_delta, tr_carried_bia(w))
+    val b_raw   = Mux(tr_we(w), tr_carried_bia(w) +& b_delta, tr_carried_bia(w))
     tr_updated_bias(w) := Mux(b_raw > 15.S, 15.S, Mux(b_raw < -16.S, -16.S, b_raw))
   }
+
+  // ── Adaptive coefficients ──
+  // The reference moves each learner's coefficient one multiplicative step per
+  // trained bit, according to whether that learner's own vote agreed with the
+  // target bit:
+  //   int sum = h * weights[idx][i];
+  //   if ((sum >= 0) == address_bit) coeff *= factor; else coeff /= factor;
+  // The step is `coeff_q >> coeffShift` — a *relative*, scale-free step of
+  // 2^-18 by default, against the reference's factor = 1.00000455 = 2^-17.8 —
+  // summed over whatever bits this event trains and applied to the live register.
+  // (Chisel's `+` wraps at the wider operand's width, hence `+&` throughout: a
+  // wrapping accumulator would fold the per-bit votes together and a wrapping
+  // register add would send a coefficient at the ceiling down to the floor.)
+  // Votes come from the carried weights — the ones that scored this prediction,
+  // matching the reference's `h * weights[idx][i]`; the reference reads that
+  // weight *after* stepping it, which differs from the port only when the
+  // pre-update weight is exactly 0, where the port (like the reference's own bias
+  // path) counts a zero weight as a positive vote. The bias has no ±1 feature, so
+  // its vote is the weight's own sign, exactly as in the reference. Gated on
+  // tr_b_fire — the cycle where the tr_b_* snapshots are the ones this packet
+  // trained with — and on the weight-table init FSM having finished, since an
+  // early commit would otherwise latch an X read out of the uninitialized mems
+  // into the coefficients, which nothing ever re-initializes.
+  val adapt_train = if (useSnipAdaptCoeff) {
+    val adapt_en = tr_b_fire && wt_init_done
+    val dCoeff = (0 until Tbl).map { t =>
+      val step = coeffs_q.get(t) >> coeffShift
+      (0 until F).map { w =>
+        val sign_t = if (useSnipPathRing) tr_b_sign.get(t) else true.B
+        // (h * w >= 0), i.e. the learner's contribution to sum_w was non-negative.
+        val votePos = Mux(sign_t, tr_carried_wt(t)(w) >= 0.S, tr_carried_wt(t)(w) <= 0.S)
+        Mux(tr_we(w), Mux(votePos === tr_actual_fp(w).asBool, step, -step), 0.S)
+      }.reduce(_ +& _)
+    }
+    val dBias = {
+      val step = coeffBias_q.get >> coeffShift
+      (0 until F).map { w =>
+        val votePos = tr_carried_bia(w) >= 0.S
+        Mux(tr_we(w), Mux(votePos === tr_actual_fp(w).asBool, step, -step), 0.S)
+      }.reduce(_ +& _)
+    }
+
+    when (adapt_en) {
+      for (t <- 0 until Tbl) {
+        val raw = coeffs_q.get(t) +& dCoeff(t)
+        coeffs_q.get(t) := Mux(raw > CQ_MAX.S, CQ_MAX.S, Mux(raw < CQ_MIN.S, CQ_MIN.S, raw))
+      }
+      val braw = coeffBias_q.get +& dBias
+      coeffBias_q.get := Mux(braw > CQ_MAX.S, CQ_MAX.S, Mux(braw < CQ_MIN.S, CQ_MIN.S, braw))
+    }
+
+    // Single-cycle event: this training event actually moved a coefficient.
+    adapt_en && (dCoeff.map(_ =/= 0.S).reduce(_ || _) || dBias =/= 0.S)
+  } else false.B
+  io.adapt_train_event := adapt_train
 
   val tr_any_we = tr_we.asUInt.orR
   // val tr_any_we = false.B  // disable training for now, to save power and avoid interference with ITC testing
