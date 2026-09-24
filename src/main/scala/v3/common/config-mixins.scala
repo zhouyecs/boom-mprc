@@ -64,6 +64,11 @@ case object BoomSnipAdaptCoeff extends Field[Boolean](false)
 // log2 of the relative step size: the coefficient moves by coeff >> shift per
 // vote. 18 -> 3.8e-6, close to the reference simulator's factor = 1.00000455.
 case object BoomSnipCoeffShift extends Field[Int](18)
+// Adaptive training threshold (reference SNIP's O-GEHL-style theta): a bit is
+// only trained when it was mispredicted or when |y| < theta, and theta itself
+// walks up on mispredicted bits and down on correct-but-under-confident ones.
+case object BoomSnipAdaptTheta extends Field[Boolean](false)
+case object BoomSnipThetaInit extends Field[Int](240)
 
 class WithSnip extends Config((site, here, up) => {
   case BoomSnipKey => true
@@ -88,6 +93,13 @@ class WithSnipITC(nSets: Int, nWays: Int) extends Config((site, here, up) => {
 class WithSnipAdaptCoeff(coeffShift: Int = 18) extends Config((site, here, up) => {
   case BoomSnipAdaptCoeff => true
   case BoomSnipCoeffShift => coeffShift
+})
+
+// Adaptive training threshold: widens training to correct-but-under-confident
+// bits and adapts the threshold itself, as the reference SNIP does.
+class WithSnipAdaptTheta(thetaInit: Int = 240) extends Config((site, here, up) => {
+  case BoomSnipAdaptTheta => true
+  case BoomSnipThetaInit  => thetaInit
 })
 
 // SNIP path-address ring: the frontend shifts conditional-branch PC bits into a

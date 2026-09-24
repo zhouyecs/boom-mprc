@@ -12,6 +12,8 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   def override_thresh = p(BoomSnipOverrideThresh)
   val useSnipAdaptCoeff = p(BoomSnipAdaptCoeff)
   val coeffShift = p(BoomSnipCoeffShift)
+  val useSnipAdaptTheta = p(BoomSnipAdaptTheta)
+  val thetaInit = p(BoomSnipThetaInit)
 
   class ITCEntry extends Bundle {
     val valid  = Bool()
@@ -156,6 +158,17 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val coeffBias_q = if (useSnipAdaptCoeff) Some(
     RegInit((coeffBias_init << CQ_FRAC).S(CQ_W.W))) else None
 
+  // Adaptive training threshold (reference predictor.cc:296-315). The reference's
+  // |yout| reaches ~16*Σcoeff ≈ 4768, so its initial 240 lands in the same range
+  // as this port's |sum_w| and carries over unchanged. Its `tc` counter is reset
+  // on every step it takes, so it never accumulates: theta simply walks by
+  // (mispredicted bits - correct-but-under-confident bits) per training event,
+  // clamped to the reference's 0..4095.
+  val THETA_W = 13                    // 0..4095 with a sign bit
+  val theta = if (useSnipAdaptTheta) Some(RegInit(thetaInit.S(THETA_W.W))) else None
+  require(!useSnipAdaptTheta || (thetaInit >= 0 && thetaInit <= 4095),
+    s"thetaInit ($thetaInit) is outside the reference's 0..4095 range")
+
   val weights = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(5.W))))
   val biasMem = SyncReadMem(nbias, Vec(F, SInt(5.W)))
 
@@ -189,8 +202,14 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // history, and the ring is not part of it.
   val W_PATH  = if (useSnipPathRing) pathLens.max else 0
   val offPath = offNewTarget + vaddrBitsExtended
+  // Per-bit "was this bit under-confident?" flags for the adaptive-threshold
+  // gate. They are evaluated at prediction time against the live theta, because
+  // the commit side no longer computes the sums that |y| comes from; theta moves
+  // by at most F per training event, so the vintage difference is negligible.
+  val W_UNDER  = if (useSnipAdaptTheta) F else 0
+  val offUnder = offPath + W_PATH
 
-  override val metaSz = offPath + W_PATH
+  override val metaSz = offUnder + W_UNDER
   require(metaSz <= bpdMaxMetaLength,
     s"SNIP metaSz ($metaSz) exceeds bpdMaxMetaLength ($bpdMaxMetaLength) " +
     s"— reduce itc_nWays ($itc_nWays) or increase bpdMaxMetaLength")
@@ -284,6 +303,11 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val s3_bia = RegNext(s2_bia)
   val s3_wt  = RegNext(s2_wt)
   val s3_fingerprint = VecInit(s3_sum.map(s => (s >= 0.S).asUInt)).asUInt
+  // |sum_w| < theta, per bit: the reference's under-confident test, evaluated at
+  // prediction vintage (see W_UNDER above).
+  val s3_under = if (useSnipAdaptTheta) Some(VecInit(s3_sum.map { s =>
+    Mux(s >= 0.S, s, 0.S -& s) < theta.get
+  })) else None
 
   // ── Commit-side Training RMW ────────────────────────────────────────────────
   val u        = io.update.bits
@@ -307,6 +331,11 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_b_sign      = if (useSnipPathRing) Some(RegNext(VecInit((0 until Tbl).map { t =>
     if (pathDepths(t) == 0) true.B else io.update.bits.ghist(pathDepths(t) - 1)
   }))) else None
+  // Carried per-bit under-confidence flags (see W_UNDER): with the adaptive
+  // threshold, a bit is skipped only when it was predicted correctly AND
+  // confidently, |y| >= theta (reference predictor.cc:315).
+  val tr_b_under     = if (useSnipAdaptTheta) Some(
+    RegNext(io.update.bits.meta(offUnder + W_UNDER - 1, offUnder))) else None
   val tr_b_idx       = RegInit(VecInit(Seq.fill(Tbl)(0.U(log2Ceil(E).W))))
   val tr_b_bias_idx  = RegInit(0.U(log2Ceil(nbias).W))
   when (tr_fire) {
@@ -321,13 +350,16 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // tr_we comes straight from the carried fingerprint — that IS what this packet
   // predicted — so the commit side needs neither a dot product nor the
   // coefficients to know which bits went wrong.
-  val tr_we = Wire(Vec(F, Bool()))
+  val tr_we    = Wire(Vec(F, Bool()))   // the bit was predicted wrong
+  val tr_train = Wire(Vec(F, Bool()))   // ... and this is the bit's train gate
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
 
   for (w <- 0 until F) {
     val target_bit = tr_actual_fp(w)
-    tr_we(w) := (tr_b_fp(w) =/= target_bit)
+    val under_bit  = if (useSnipAdaptTheta) tr_b_under.get(w).asBool else false.B
+    tr_we(w)    := (tr_b_fp(w) =/= target_bit)
+    tr_train(w) := tr_we(w) || under_bit
 
     for (t <- 0 until Tbl) {
       val delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
@@ -340,11 +372,11 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       // +15 stepped by +1 would wrap straight to -16 and the saturation below
       // would be dead code. The reference really does clamp at
       // max_weight/min_weight, so the sum has to be one bit wide enough to see it.
-      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) +& delta_t, tr_carried_wt(t)(w))
+      val raw   = Mux(tr_train(w), tr_carried_wt(t)(w) +& delta_t, tr_carried_wt(t)(w))
       tr_updated_wt(t)(w) := Mux(raw > 15.S, 15.S, Mux(raw < -16.S, -16.S, raw))
     }
     val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-    val b_raw   = Mux(tr_we(w), tr_carried_bia(w) +& b_delta, tr_carried_bia(w))
+    val b_raw   = Mux(tr_train(w), tr_carried_bia(w) +& b_delta, tr_carried_bia(w))
     tr_updated_bias(w) := Mux(b_raw > 15.S, 15.S, Mux(b_raw < -16.S, -16.S, b_raw))
   }
 
@@ -378,14 +410,14 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
         val sign_t = if (useSnipPathRing) tr_b_sign.get(t) else true.B
         // (h * w >= 0), i.e. the learner's contribution to sum_w was non-negative.
         val votePos = Mux(sign_t, tr_carried_wt(t)(w) >= 0.S, tr_carried_wt(t)(w) <= 0.S)
-        Mux(tr_we(w), Mux(votePos === tr_actual_fp(w).asBool, step, -step), 0.S)
+        Mux(tr_train(w), Mux(votePos === tr_actual_fp(w).asBool, step, -step), 0.S)
       }.reduce(_ +& _)
     }
     val dBias = {
       val step = coeffBias_q.get >> coeffShift
       (0 until F).map { w =>
         val votePos = tr_carried_bia(w) >= 0.S
-        Mux(tr_we(w), Mux(votePos === tr_actual_fp(w).asBool, step, -step), 0.S)
+        Mux(tr_train(w), Mux(votePos === tr_actual_fp(w).asBool, step, -step), 0.S)
       }.reduce(_ +& _)
     }
 
@@ -403,7 +435,25 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   } else false.B
   io.adapt_train_event := adapt_train
 
-  val tr_any_we = tr_we.asUInt.orR
+  // The write enables follow the train gate, not just the mispredictions: with
+  // the adaptive threshold a correct-but-under-confident bit is trained too.
+  val tr_any_we = tr_train.asUInt.orR
+
+  // ── Adaptive training threshold (reference predictor.cc:296-315) ────────────
+  // theta walks up on mispredicted bits and down on correct-but-under-confident
+  // ones, clamped to the reference's 0..4095. The reference's `tc` counter is
+  // reset on every step it takes, so it never accumulates and drops out of the
+  // aggregate. Gated with the same init check as the rest of training, since
+  // tr_we/per-bit flags are derived from the (uninitialized) weight mems.
+  if (useSnipAdaptTheta) {
+    val nBad   = PopCount(tr_we)
+    val nUnder = PopCount(VecInit((0 until F).map { w => !tr_we(w) && tr_b_under.get(w).asBool }))
+    val dTheta = Cat(0.U(1.W), nBad).asSInt -& Cat(0.U(1.W), nUnder).asSInt
+    when (tr_b_fire && wt_init_done) {
+      val raw = theta.get +& dTheta
+      theta.get := Mux(raw > 4095.S, 4095.S, Mux(raw < 0.S, 0.S, raw))
+    }
+  }
   // val tr_any_we = false.B  // disable training for now, to save power and avoid interference with ITC testing
 
   // ── ONE muxed write port per mem (init || training), exactly ONE .write() call site each ──
@@ -621,13 +671,20 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     io.resp_in(0).f3(w).predicted_pc.bits))
 
   // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
-  // Layout: path_slice | new_target | base targets | base_valid | conf | pool | wt | bias |
-  //         valid|min_ham|sig|fingerprint
+  // Layout: under | path_slice | new_target | base targets | base_valid | conf |
+  //         pool | wt | bias | valid|min_ham|sig|fingerprint
   // The ring slice is re-aligned s1 → s3 so it is the value the s1-stage index used.
-  val s3_path = if (useSnipPathRing) RegNext(RegNext(io.f1_path(W_PATH - 1, 0))) else 0.U
-  io.f3_meta := Cat(s3_path, snip_target, base_tgt_vec.asUInt, base_valid_oh.asUInt, snip_conf,
-                    s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
-                    snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
+  val s3_path = if (useSnipPathRing) Some(RegNext(RegNext(io.f1_path(W_PATH - 1, 0)))) else None
+  // Fields are concatenated MSB-first in offset order, and disabled ones are left
+  // out entirely rather than padded: a one-bit zero placeholder between two live
+  // fields would shift everything above it out of the slice the composer reads.
+  val metaFields: Seq[Bits] =
+    (if (useSnipAdaptTheta) Seq(s3_under.get.asUInt) else Nil) ++
+    (if (useSnipPathRing)  Seq(s3_path.get)             else Nil) ++
+    Seq(snip_target, base_tgt_vec.asUInt, base_valid_oh.asUInt, snip_conf,
+        s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
+        snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
+  io.f3_meta := metaFields.reduceLeft((a, b) => Cat(a, b))
 
   // F3 target override: every column, whenever the L3 is confident.
   when (snip_conf) {
