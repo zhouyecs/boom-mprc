@@ -944,6 +944,14 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val base_tgt_vec  = VecInit((0 until bankWidth).map(w =>
     io.resp_in(0).f3(w).predicted_pc.bits))
 
+  // Hoisted above the diagnostic block below, which reads it: a Scala val
+  // referenced before its definition is null, so the guarded printfs would only
+  // trip elaboration on the config combinations that reach them. All its inputs
+  // (s3_pool, s3_itc_tag) are defined above.
+  val cand_valid = VecInit(s3_pool.map { e =>
+    e.valid && (if (useTags) (e.tag === s3_itc_tag) else true.B)
+  })
+
   // ── Vintage-match diagnostic: compare s3 meta idh vs commit carried_hist ──
   if (IN_SIMULATION && usePrivateHist) {
     when (tr_fire) {
@@ -971,9 +979,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // ── Hamming-match + min-select (s3) ────────────────────────────────────────
   // JALR proxy: is_jal && taken. Already computed at s2, carried via RegNext.
   val cand_fp    = VecInit(s3_pool_tgt.map(t => extractFp(t)))
-  val cand_valid = VecInit(s3_pool.map { e =>
-    e.valid && (if (useTags) (e.tag === s3_itc_tag) else true.B)
-  })
+  // cand_valid is defined above the diagnostic block (it is read there).
 
   // Predict-side which-bits mask: only discriminative bits count toward the gate.
   // Mirrors training-side suppression so the confidence gate ignores untrained bits.
