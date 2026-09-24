@@ -149,6 +149,9 @@ abstract class BranchPredictorBank(implicit p: Parameters) extends BoomModule()(
     val f1_lhist = Input(UInt(localHistoryLength.W))
     // BLBP speculative indirect-target history (0-width when disabled)
     val f1_idh   = Input(UInt((if (useBlbpSpecHist) blbpIdhLen else 0).W))
+    // SNIP path-address ring: conditional-branch PC bits, newest entry low
+    // (0-width when disabled)
+    val f1_path  = Input(UInt((if (useSnipPathRing) snipRingEntries * snipPcBits else 0).W))
 
     val resp_in = Input(Vec(nInputs, new BranchPredictionBankResponse))
     val resp = Output(new BranchPredictionBankResponse)
@@ -358,6 +361,7 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
     banked_predictors(0).io.f1_ghist := RegNext(io.f0_req.bits.ghist.histories(0))
     banked_predictors(0).io.f1_lhist := banked_lhist_providers(0).io.f1_lhist
     banked_predictors(0).io.f1_idh   := (if (useBlbpSpecHist) RegNext(io.f0_req.bits.ghist.blbp_idh) else 0.U)
+    banked_predictors(0).io.f1_path  := (if (useSnipPathRing) RegNext(io.f0_req.bits.ghist.path_history) else 0.U)
 
     banked_predictors(0).io.resp_in(0)           := (0.U).asTypeOf(new BranchPredictionBankResponse)
     // For RAS
@@ -410,6 +414,11 @@ class BranchPredictor(implicit p: Parameters) extends BoomModule()(p)
       banked_predictors(0).io.f1_ghist  := RegNext(io.f0_req.bits.ghist.histories(1))
       banked_predictors(1).io.f1_ghist  := RegNext(io.f0_req.bits.ghist.histories(0))
     }
+    // The path ring is packet-level — unlike histories(bank) it is not sliced per
+    // bank, so both banks index with the same value.
+    val f1_path_next = if (useSnipPathRing) RegNext(io.f0_req.bits.ghist.path_history) else 0.U
+    banked_predictors(0).io.f1_path := f1_path_next
+    banked_predictors(1).io.f1_path := f1_path_next
   }
 
 

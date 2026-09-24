@@ -77,6 +77,23 @@ class WithSnipITC(nSets: Int, nWays: Int) extends Config((site, here, up) => {
   case BoomSnipITCWays => nWays
 })
 
+// SNIP path-address ring: the frontend shifts conditional-branch PC bits into a
+// ring (GlobalHistory.path_history), and SNIP folds that ring — not the direction
+// history — into its weight-table index, using the direction history only as the
+// per-learner ±1 feature. This is the reference SNIP's index/feature split.
+class WithSnipPathRing(entries: Int = 16, pcBits: Int = 11, pcLoBit: Int = 2)
+  extends Config((site, here, up) => {
+    case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+      case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+        useSnipPathRing = true,
+        snipRingEntries = entries,
+        snipPcBits      = pcBits,
+        snipPcLoBit     = pcLoBit
+      )))
+      case other => other
+    }
+  })
+
 // ITTAGE — tagged-table indirect predictor, third comparison point vs SNIP/BLBP
 case object BoomIttageKey extends Field[Boolean](false)
 

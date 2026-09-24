@@ -27,6 +27,7 @@ class ComposedBranchPredictorBank(implicit p: Parameters) extends BranchPredicto
     c.io.f1_ghist  := io.f1_ghist
     c.io.f1_lhist  := io.f1_lhist
     c.io.f1_idh    := io.f1_idh
+    c.io.f1_path   := io.f1_path
     c.io.f3_fire   := io.f3_fire
     // For RAS
     c.io.f2_read_idx := io.f2_read_idx

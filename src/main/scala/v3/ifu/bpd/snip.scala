@@ -92,6 +92,30 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val histLens = Seq(0, 2, 4, 8, 12, 18, 28, 42).map(_ min globalHistoryLength)
 
+  // ── Path-history windows (reference SNIP indexing) ──────────────────────────
+  // Jimenez's SNIP builds the weight-table index from the PC and the *addresses*
+  // of recent branches, and feeds the direction history into the dot product as a
+  // ±1 feature. GlobalHistory.path_history is exactly that ring (snipRingEntries
+  // entries of snipPcBits branch-PC bits, newest entry at the low end), so with
+  // useSnipPathRing the index folds the ring and the direction history becomes
+  // the per-learner ±1. With the flag off the index keeps folding the direction
+  // history, as before.
+  val pathLens = Seq(0, 2, 4, 8, 12, 18, 28, 42)
+  // Branch depth each window reaches — the direction bit that learner pairs with,
+  // mirroring the reference's "learner i sees direction bit i".
+  val pathDepths = pathLens.map(l => if (l == 0) 0 else (l + snipPcBits - 1) / snipPcBits)
+  if (useSnipPathRing) {
+    // GlobalHistory.update only advances the ring in its single-bank branch; with
+    // two banks path_history is never written and would index as X.
+    require(nBanks == 1,
+      s"useSnipPathRing needs nBanks == 1 (got $nBanks): the two-bank history path " +
+      s"does not maintain path_history")
+    require(pathLens.max <= snipRingEntries * snipPcBits,
+      s"pathLens.max (${pathLens.max}) exceeds the path ring (${snipRingEntries * snipPcBits} bits)")
+    require(pathDepths.max <= globalHistoryLength,
+      s"path depth ${pathDepths.max} exceeds globalHistoryLength ($globalHistoryLength)")
+  }
+
   val coeffBias = 68
   val coeffs = VecInit(Seq(68, 56, 48, 37, 31, 24, 17, 17).map(_.S(8.W)))
 
@@ -123,8 +147,13 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val offBaseOH    = offConf + 1
   val offBaseTgt   = offBaseOH + bankWidth
   val offNewTarget = offBaseTgt + bankWidth * vaddrBitsExtended
+  // Path-ring slice the weight-table index needs, carried so the commit side can
+  // recompute the very same rows: the bank update port only carries the direction
+  // history, and the ring is not part of it.
+  val W_PATH  = if (useSnipPathRing) pathLens.max else 0
+  val offPath = offNewTarget + vaddrBitsExtended
 
-  override val metaSz = offNewTarget + vaddrBitsExtended
+  override val metaSz = offPath + W_PATH
   require(metaSz <= bpdMaxMetaLength,
     s"SNIP metaSz ($metaSz) exceeds bpdMaxMetaLength ($bpdMaxMetaLength) " +
     s"— reduce itc_nWays ($itc_nWays) or increase bpdMaxMetaLength")
@@ -148,8 +177,10 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       chunks.reduce(_ ^ _)
     }
   }
-  def tblIdx(pc: UInt, ghist: UInt, t: Int): UInt =
-    (fetchIdx(pc) ^ foldHist(ghist, histLens(t)))(log2Ceil(E) - 1, 0)
+  def tblIdx(pc: UInt, ghist: UInt, path: UInt, t: Int): UInt = {
+    val fold = if (useSnipPathRing) foldHist(path, pathLens(t)) else foldHist(ghist, histLens(t))
+    (fetchIdx(pc) ^ fold)(log2Ceil(E) - 1, 0)
+  }
 
   // Target fingerprint extraction: 0xb5ffa skip bits → compacted 15-bit value
   def extractFp(target: UInt): UInt = {
@@ -170,16 +201,28 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // ── Fingerprint dot-product (s1→s3) ─────────────────────────────────────────
   // PREDICT-SIDE sum_w formula (for bit-identity check with training):
-  //   s2_sum(w) = Σ_t (s2_wt(t)(w) * coeffs(t)) + (s2_bia(w) * coeffBias)
+  //   s2_sum(w) = Σ_t (±1_t * s2_wt(t)(w) * coeffs(t)) + (s2_bia(w) * coeffBias)
   //   s3_sum = RegNext(s2_sum); fp_bit = (s3_sum(w) >= 0.S)
+  // ±1_t is the depth-aligned direction bit; it is always +1 when path mode is off.
   val biasIdx = fetchIdx(s1_pc)(log2Ceil(nbias) - 1, 0)
   val readEn  = s1_valid && wt_init_done
 
-  val s2_wt  = VecInit((0 until Tbl).map { t => weights(t).read(tblIdx(s1_pc, io.f1_ghist, t), readEn) })
+  val pred_path = if (useSnipPathRing) io.f1_path else 0.U
+  val s2_wt  = VecInit((0 until Tbl).map { t => weights(t).read(tblIdx(s1_pc, io.f1_ghist, pred_path, t), readEn) })
   val s2_bia = biasMem.read(biasIdx, readEn)
 
+  // Per-learner ±1, registered so it pairs with the s2 weight read of the same
+  // packet. Negation happens after the coefficient product: -(-16) does not fit
+  // in SInt(5.W), the product is wide enough.
+  val s2_sign = if (useSnipPathRing) Some(RegNext(VecInit((0 until Tbl).map { t =>
+    if (pathDepths(t) == 0) true.B else io.f1_ghist(pathDepths(t) - 1)
+  }))) else None
+
   val s2_sum = VecInit((0 until F).map { w =>
-    val wt = (0 until Tbl).map { t => (s2_wt(t)(w) * coeffs(t)).asSInt }.reduce(_ + _)
+    val wt = (0 until Tbl).map { t =>
+      val p = (s2_wt(t)(w) * coeffs(t)).asSInt
+      if (useSnipPathRing) Mux(s2_sign.get(t), p, -p) else p
+    }.reduce(_ + _)
     (wt + (s2_bia(w) * coeffBias.S).asSInt).asSInt
   })
 
@@ -193,8 +236,10 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_fire  = io.update.valid && u.is_commit_update &&
                  u.cfi_is_jalr && !u.cfi_is_ret && u.cfi_taken && u.cfi_idx.valid
 
-  // commit-side reads DROPPED — weights + ITC carried in meta (TAGE pattern)
-  def tblIdxUpd(t: Int): UInt = tblIdx(u.pc, io.update.bits.ghist, t)
+  // commit-side reads DROPPED — weights + ITC carried in meta (TAGE pattern).
+  // The path ring rides the meta too, so the commit side recomputes the same rows.
+  val upd_path = if (useSnipPathRing) io.update.bits.meta(offPath + W_PATH - 1, offPath) else 0.U
+  def tblIdxUpd(t: Int): UInt = tblIdx(u.pc, io.update.bits.ghist, upd_path, t)
 
   // 1 cycle later: unpack carried snapshots
   val tr_b_fire      = RegNext(tr_fire, false.B)
@@ -203,6 +248,11 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_carried_bia = RegNext(io.update.bits.meta(offBias + W_BIAS - 1, offBias)).asTypeOf(Vec(F, SInt(5.W)))
   val tr_carried_wt  = RegNext(io.update.bits.meta(offWt   + W_WT   - 1, offWt  )).asTypeOf(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_carried_pool= RegNext(io.update.bits.meta(offPool + W_POOL - 1, offPool)).asTypeOf(Vec(itc_nWays, new ITCEntry))
+  // Same ±1 vintage as the predict side: io.update.bits.ghist is the fetch-time
+  // snapshot the prediction was made with, so both sides agree bit-for-bit.
+  val tr_b_sign      = if (useSnipPathRing) Some(RegNext(VecInit((0 until Tbl).map { t =>
+    if (pathDepths(t) == 0) true.B else io.update.bits.ghist(pathDepths(t) - 1)
+  }))) else None
   val tr_b_idx       = RegInit(VecInit(Seq.fill(Tbl)(0.U(log2Ceil(E).W))))
   val tr_b_bias_idx  = RegInit(0.U(log2Ceil(nbias).W))
   when (tr_fire) {
@@ -215,14 +265,15 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Per-bit train_we and updated rows (combinational, computed at tr_b_fire)
   // TRAINING-SIDE sum_w formula (must be bit-identical to predict-side s2_sum above):
-  //   sum_w = Σ_t (tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
+  //   sum_w = Σ_t (±1_t * tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
   val tr_we = Wire(Vec(F, Bool()))
   val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
   val tr_updated_bias = Wire(Vec(F, SInt(5.W)))
 
   for (w <- 0 until F) {
     val sum_w = (0 until Tbl).map { t =>
-      (tr_carried_wt(t)(w) * coeffs(t)).asSInt
+      val p = (tr_carried_wt(t)(w) * coeffs(t)).asSInt
+      if (useSnipPathRing) Mux(tr_b_sign.get(t), p, -p) else p
     }.reduce(_ + _) + (tr_carried_bia(w) * coeffBias.S).asSInt
     val pred_bit   = (sum_w >= 0.S).asUInt
     val target_bit = tr_actual_fp(w)
@@ -230,7 +281,12 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
     for (t <- 0 until Tbl) {
       val delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) + delta, tr_carried_wt(t)(w))
+      // The ±1 feature multiplies the gradient too: the reference trains
+      // `w += (history_bit == target_bit) ? +1 : -1`, i.e. sign_t * sign(target).
+      // Its contribution to sum_w is sign_t * w, so a learner currently seeing -1
+      // must be driven opposite to the target bit.
+      val delta_t = if (useSnipPathRing) Mux(tr_b_sign.get(t), delta, -delta) else delta
+      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) + delta_t, tr_carried_wt(t)(w))
       tr_updated_wt(t)(w) := Mux(raw > 15.S, 15.S, Mux(raw < -16.S, -16.S, raw))
     }
     val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
@@ -456,9 +512,11 @@ class SNIPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     io.resp_in(0).f3(w).predicted_pc.bits))
 
   // Carry predict bias + weights + ITC pool + snip fields through f3_meta (TAGE pattern)
-  // Layout: new_target | base targets | base_valid | conf | pool | wt | bias |
+  // Layout: path_slice | new_target | base targets | base_valid | conf | pool | wt | bias |
   //         valid|min_ham|sig|fingerprint
-  io.f3_meta := Cat(snip_target, base_tgt_vec.asUInt, base_valid_oh.asUInt, snip_conf,
+  // The ring slice is re-aligned s1 → s3 so it is the value the s1-stage index used.
+  val s3_path = if (useSnipPathRing) RegNext(RegNext(io.f1_path(W_PATH - 1, 0))) else 0.U
+  io.f3_meta := Cat(s3_path, snip_target, base_tgt_vec.asUInt, base_valid_oh.asUInt, snip_conf,
                     s3_pool.asUInt, s3_wt.asUInt, s3_bia.asUInt,
                     snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
