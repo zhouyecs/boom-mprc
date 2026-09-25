@@ -153,13 +153,15 @@ case object BoomBlbpUseLocalHist extends Field[Boolean](false)
 case object BoomBlbpNLHist       extends Field[Int](256)
 case object BoomBlbpLHLength     extends Field[Int](10)
 case object BoomBlbpLBit         extends Field[Int](3)
-// Adaptive threshold on the training gate, expressed in the coefficient scale:
-// the coefficients are Q4, so 16 is one unit. A bit is trained when it was
-// mispredicted or when its output magnitude is below theta; theta walks up by
-// ThetaStep every ThetaSpeed such events and back down on correct-but-low-
-// magnitude ones, floored at 0 and unbounded above.
-case object BoomBlbpThetaInit   extends Field[Int](16)
-case object BoomBlbpThetaStep   extends Field[Int](16)
+// Adaptive threshold on the training gate, in units of transferred weight: the
+// magnitude transfer maps weight 7 to 24 and the per-bit sum is the plain sum of
+// the transferred weights (at most 216), so one unit of theta is one transferred
+// weight and there is no fixed-point scale left to divide out. A bit is trained
+// when it was mispredicted or when its output magnitude is below theta; theta
+// walks up by ThetaStep every ThetaSpeed such events and back down on correct-
+// but-low-magnitude ones, floored at 0 and unbounded above.
+case object BoomBlbpThetaInit   extends Field[Int](1)
+case object BoomBlbpThetaStep   extends Field[Int](1)
 case object BoomBlbpThetaSpeed  extends Field[Int](1)
 case object BoomBlbpThetaMax    extends Field[Int](65535)
 

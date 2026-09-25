@@ -38,12 +38,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val thetaInit   = p(BoomBlbpThetaInit)
   val thetaStep   = p(BoomBlbpThetaStep)
   val thetaSpeed  = p(BoomBlbpThetaSpeed)
-  // |sum| reaches ~13 bits with the transfer (8 tables x 24 x 26, plus the bias)
+  // The sum is the plain sum of the transferred weights, so |sum| tops out at
+  // Tbl * 24 + 24 = 216, i.e. 9 signed bits. The threshold register is kept
+  // wider than that on purpose: nothing clamps theta, and a step must not be
+  // able to wrap it.
   val THETA_W = 20
 
-  // Convex, monotonic transfer on |weight|. 5-bit signed weights => |w| in 0..16,
-  // so 17 entries. xlat[0] = 0 (zero weight contributes nothing). Increasing
-  // first differences => convex (amplifies confident weights). SPEC-tunable.
   // Magnitude transfer applied on the read path: weights are 4-bit, so |w| is in
   // 0..7 and the table has 8 entries. It is affine at the bottom (a zero-magnitude
   // weight still contributes 2, so the table is not anchored at the origin) and
@@ -104,7 +104,11 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
           e.tgt(offsetBits-1, 0)
 
   // ── Fingerprint datapath constants ──────────────────────────────────────────
-  val F = 15
+  // F: how many target bits the predictor carries and predicts, one learned
+  // weight per bit per table. Wider F tells more targets of the same branch
+  // apart, but it widens every weight row, the meta carry, and the per-bit
+  // datapath, and it makes more bits compete for the same training events.
+  val F = 12
   val Tbl = 8
   val E = 1024
   val nbias = 4096
@@ -145,12 +149,11 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val idhPredict = if (useBlbpSpecHist) io.f1_idh else blbp_ghist   // s1-aligned
 
   val useBias   = p(BoomBlbpUseBias)
-  // Per-table coefficients on the transferred weight, in Q4 fixed point (x16):
-  // 1.3, 1.6, 1.6, 1.5, 1.4, 1.3, 1.1, 1.0 -> 21, 26, 26, 24, 22, 21, 18, 16.
-  // They peak over the short-history tables and fall off towards the long ones.
-  // The bias has no per-table share of that curve; it is kept at 1.0.
-  val coeffBias = 16
-  val coeffs = VecInit(Seq(21, 26, 26, 24, 22, 21, 18, 16).map(_.S(8.W)))
+  // No per-table coefficient multiplies the transferred weight: a weight of +-7
+  // is worth the same whoever supplied it, and the sum is the plain sum of the
+  // transferred weights, so |sum| tops out at Tbl * 24 + 24 = 216. The only
+  // per-table shaping left is the transfer table itself, which is applied to
+  // every table alike.
 
   // Per-bit adaptive threshold (Seznec/O-GEHL). Module Regs, commit-updated.
   val theta = RegInit(VecInit(Seq.fill(F)(thetaInit.S(THETA_W.W))))
@@ -165,18 +168,18 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val fp_untrained = ((1 << F) - 1).U(F.W)
 
   // ── Meta layout constants (LSB-first) ─────────────────────────────────────
-  // [W_FP-1:0] fp (15) | [W_SIG+W_FP-1:W_FP] sig (15) |
+  // [W_FP-1:0] fp (12) | [W_SIG+W_FP-1:W_FP] sig (12) |
   // [W_HAM+W_SIG+W_FP-1:W_SIG+W_FP] min_ham (4) |
-  // [W_BASE-1:W_HAM+W_SIG+W_FP] valid (1) → W_BASE = 35
+  // [W_BASE-1:W_HAM+W_SIG+W_FP] valid (1) → W_BASE = 29
   val W_FP = F; val W_SIG = F; val W_HAM = 4; val W_VALID = 1
-  val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
-  val W_BIAS  = if (useBias) F * 4 else 0            // 60 or 0 (gated)
-  val W_WT    = Tbl * F * 4                        // 480
+  val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 29
+  val W_BIAS  = if (useBias) F * 4 else 0            // 48 or 0 (gated)
+  val W_WT    = Tbl * F * 4                        // 384
   val W_ITC_ENTRY = 1 + blbpTagBits + tgtBits + 2   // valid(1) + tag + tgt + rpv(2)
   val W_POOL  = itc_nWays * W_ITC_ENTRY
-  val offBias = W_BASE                             // 35
-  val offWt   = offBias + W_BIAS                   // 110 (bias on) or 35 (bias off)
-  val offPool = offWt   + W_WT                     // 710
+  val offBias = W_BASE                             // 29
+  val offWt   = offBias + W_BIAS                   // 77 (bias on) or 29 (bias off)
+  val offPool = offWt   + W_WT                     // 461 (bias on) or 413 (bias off)
   val W_HIST  = maxHist                              // carried private history
   val offHist = offPool + W_POOL                     // after pool
   val W_LHIST  = lhLength                             // carried local history
@@ -234,11 +237,17 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     (fetchIdx(pc) ^ foldHist(ghist, histRanges(t)._1, histRanges(t)._2) ^
       foldHist(idh, 0, idhLens(t)))(log2Ceil(E) - 1, 0)
 
-  // Target fingerprint extraction. Bit-selection (default) or XOR-folded hash.
+  // Target fingerprint extraction: F bits of the target address.
+  // Default: the low F bits of the light fold t ^ (t >> 4). The fold is what
+  // makes the bottom of the fingerprint useful — a target is at least
+  // instruction-aligned, so its lowest address bit (and, at 4-byte alignment,
+  // its second one) is a constant zero that can never tell two targets of the
+  // same branch apart. Folding bit i with bit i+4 puts target bits 4..F+3 into
+  // the window instead. The opt-in `useTargetHash` spreads the whole address
+  // into F bits.
   def extractFp(target: UInt): UInt = {
     if (!useTargetHash) {
-      val bits = Seq(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 17, 19)
-      VecInit(bits.map(b => target(b))).asUInt
+      (target ^ (target >> 4))(F - 1, 0)
     } else {
       // XOR-fold the full target into F bits (all bits contribute)
       val tw = vaddrBitsExtended
@@ -261,8 +270,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // ── Fingerprint dot-product (s1→s3) ─────────────────────────────────────────
   // PREDICT-SIDE sum_w formula (for bit-identity check with training):
-  //   s2_sum(w) = Σ_t (s2_wt(t)(w) * coeffs(t)) + (s2_bia(w) * coeffBias)
+  //   s2_sum(w) = Σ_t xfer(s2_wt(t)(w)) + xfer(s2_bia(w))
   //   s3_sum = RegNext(s2_sum); fp_bit = (s3_sum(w) >= 0.S)
+  // The adds are +& (width-growing): a plain + would wrap at the 8-bit term
+  // width, and Tbl * 24 needs 9 bits.
   val biasIdx = if (useBias) fetchIdx(s1_pc)(log2Ceil(nbias) - 1, 0) else 0.U
   val readEn  = s1_valid && wt_init_done
   val local_hist = lhist(lhIdx(s1_pc))                 // combinational, s1
@@ -276,8 +287,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val s2_bia = if (useBias) biasMem.get.read(biasIdx, readEn) else VecInit(Seq.fill(F)(0.S(4.W)))
 
   val s2_sum = VecInit((0 until F).map { w =>
-    val wt = (0 until Tbl).map { t => (xfer(s2_wt(t)(w)) * coeffs(t)).asSInt }.reduce(_ + _)
-    if (useBias) (wt + (xfer(s2_bia(w)) * coeffBias.S).asSInt).asSInt
+    val wt = (0 until Tbl).map { t => xfer(s2_wt(t)(w)) }.reduce(_ +& _)
+    if (useBias) wt +& xfer(s2_bia(w))
     else         wt
   })
 
@@ -357,10 +368,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     when (tr_fire) {
       val w0 = 0  // sample bit 0
       val sum_w0 = {
-        val wsum = (0 until Tbl).map { t =>
-          (xfer(tr_carried_wt(t)(w0)) * coeffs(t)).asSInt
-        }.reduce(_ + _)
-        if (useBias) wsum + (xfer(tr_carried_bia(w0)) * coeffBias.S).asSInt
+        val wsum = (0 until Tbl).map { t => xfer(tr_carried_wt(t)(w0)) }.reduce(_ +& _)
+        if (useBias) wsum +& xfer(tr_carried_bia(w0))
         else         wsum
       }
       val pred_bit0   = (sum_w0 >= 0.S).asUInt
@@ -375,10 +384,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     when (tr_fire) {
       val w0 = 0
       val sum_w0 = {
-        val wsum = (0 until Tbl).map { t =>
-          (xfer(tr_carried_wt(t)(w0)) * coeffs(t)).asSInt
-        }.reduce(_ + _)
-        if (useBias) wsum + (xfer(tr_carried_bia(w0)) * coeffBias.S).asSInt
+        val wsum = (0 until Tbl).map { t => xfer(tr_carried_wt(t)(w0)) }.reduce(_ +& _)
+        if (useBias) wsum +& xfer(tr_carried_bia(w0))
         else         wsum
       }
       printf(p"[sum0] val=${sum_w0}\n")
@@ -386,7 +393,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
 
   // TRAINING-SIDE sum_w formula (must be bit-identical to predict-side s2_sum above):
-  //   sum_w = Σ_t (tr_carried_wt(t)(w) * coeffs(t)) + (tr_carried_bia(w) * coeffBias)
+  //   sum_w = Σ_t xfer(tr_carried_wt(t)(w)) + xfer(tr_carried_bia(w))
   // (tr_we, tr_updated_wt, tr_updated_bias moved above the debug printf block)
 
   // Which-bits mask from carried pool (same pool s3_pool / cand_fp used at predict)
@@ -401,16 +408,14 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   // Cold-start / single-candidate fallback: if NO bit is discriminative across the
   // commit-side pool (cold weights, or ≤1 distinct target), SelectiveBit would gate
-  // training to zero forever. Mirror the C++ which_bits behavior: only suppress bits
-  // when there is a real discriminative set to suppress against. Otherwise train all.
+  // training to zero forever. So only suppress bits when there is a real
+  // discriminative set to suppress against; otherwise train all of them.
   val anyDiscrim = if (useSelectiveBit) (0 until F).map(w => discriminative(w)).reduce(_ || _) else true.B
 
   for (w <- 0 until F) {
     val sum_w = {
-      val wsum = (0 until Tbl).map { t =>
-        (xfer(tr_carried_wt(t)(w)) * coeffs(t)).asSInt
-      }.reduce(_ + _)
-      if (useBias) wsum + (xfer(tr_carried_bia(w)) * coeffBias.S).asSInt
+      val wsum = (0 until Tbl).map { t => xfer(tr_carried_wt(t)(w)) }.reduce(_ +& _)
+      if (useBias) wsum +& xfer(tr_carried_bia(w))
       else         wsum
     }
     val pred_bit   = (sum_w >= 0.S).asUInt
@@ -484,10 +489,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   io.tr_ham_le4 := tr_b_fire && (tr_ham <= 4.U)
 
   // 4d meta unpack + accuracy/confidence observer (commit-side)
-  // Layout: meta(34)=valid, meta(33,30)=min_ham, meta(29,15)=sig, meta(14,0)=fingerprint(4c)
-  val carried_snip_valid = RegNext(io.update.bits.meta(34))
-  val carried_min_ham    = RegNext(io.update.bits.meta(33, 30))
-  val carried_sig        = RegNext(io.update.bits.meta(29, 15))
+  // Layout (LSB-first, see W_BASE above): fingerprint | sig | min_ham | valid
+  val carried_snip_valid = RegNext(io.update.bits.meta(W_BASE - 1))
+  val carried_min_ham    = RegNext(io.update.bits.meta(W_FP + W_SIG + W_HAM - 1, W_FP + W_SIG))
+  val carried_sig        = RegNext(io.update.bits.meta(W_FP + W_SIG - 1, W_FP))
   val actual_sig         = RegNext(u.target(F - 1, 0))
 
   io.snip_has_cand_event     := tr_b_fire && carried_snip_valid
@@ -936,7 +941,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   }
 
   val snip_sel = if (useDotProduct) {
-    // ── dotw: 15-term signed sum, tree instead of linear chain ──
+    // ── dotw: F-term signed sum, tree instead of linear chain ──
     // +& never truncates, addition is associative => value identical to .reduce(_ +& _)
     val dotw = VecInit((0 until itc_nWays).map { w =>
       treeReduce((0 until F).map { k =>
