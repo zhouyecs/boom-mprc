@@ -38,21 +38,26 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val thetaInit   = p(BoomBlbpThetaInit)
   val thetaStep   = p(BoomBlbpThetaStep)
   val thetaSpeed  = p(BoomBlbpThetaSpeed)
-  val THETA_W = 20   // |sum| reaches ~16 bits with transfer; +headroom for theta
+  // |sum| reaches ~13 bits with the transfer (8 tables x 24 x 26, plus the bias)
+  val THETA_W = 20
 
   // Convex, monotonic transfer on |weight|. 5-bit signed weights => |w| in 0..16,
   // so 17 entries. xlat[0] = 0 (zero weight contributes nothing). Increasing
   // first differences => convex (amplifies confident weights). SPEC-tunable.
-  val xlatRom = VecInit(
-    Seq(0, 1, 2, 4, 6, 8, 11, 14, 18, 22, 27, 32, 38, 44, 51, 58, 66).map(_.S(8.W)))
-  // val xlatRom = VecInit(Seq.fill(17)(0.S(8.W)))   // PROBE ONLY — revert after
+  // Magnitude transfer applied on the read path: weights are 4-bit, so |w| is in
+  // 0..7 and the table has 8 entries. It is affine at the bottom (a zero-magnitude
+  // weight still contributes 2, so the table is not anchored at the origin) and
+  // convex above (increasing first differences), which lets confident weights
+  // count for disproportionately more than half-hearted ones.
+  val xlatRom = VecInit(Seq(2, 4, 6, 8, 11, 14, 18, 24).map(_.S(8.W)))
+  // val xlatRom = VecInit(Seq.fill(8)(0.S(8.W)))   // PROBE ONLY — revert after
 
   // Read-side magnitude transfer. Pure function => identical HW at every call site.
   def xfer(wt: SInt): SInt = {
     if (!useTransfer) {
       wt
     } else {
-      val mag = Mux(wt < 0.S, -wt, wt).asUInt   // 0..16
+      val mag = Mux(wt < 0.S, -wt, wt).asUInt   // 0..7
       val m   = xlatRom(mag)                      // SInt(8.W), >= 0
       Mux(wt < 0.S, -m, m)
     }
@@ -140,8 +145,12 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val idhPredict = if (useBlbpSpecHist) io.f1_idh else blbp_ghist   // s1-aligned
 
   val useBias   = p(BoomBlbpUseBias)
-  val coeffBias = 68
-  val coeffs = VecInit(Seq(68, 56, 48, 37, 31, 24, 17, 17).map(_.S(8.W)))
+  // Per-table coefficients on the transferred weight, in Q4 fixed point (x16):
+  // 1.3, 1.6, 1.6, 1.5, 1.4, 1.3, 1.1, 1.0 -> 21, 26, 26, 24, 22, 21, 18, 16.
+  // They peak over the short-history tables and fall off towards the long ones.
+  // The bias has no per-table share of that curve; it is kept at 1.0.
+  val coeffBias = 16
+  val coeffs = VecInit(Seq(21, 26, 26, 24, 22, 21, 18, 16).map(_.S(8.W)))
 
   // Per-bit adaptive threshold (Seznec/O-GEHL). Module Regs, commit-updated.
   val theta = RegInit(VecInit(Seq.fill(F)(thetaInit.S(THETA_W.W))))
@@ -149,8 +158,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   val adapt_train = WireDefault(false.B)
 
-  val weights = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(5.W))))
-  val biasMem = if (useBias) Some(SyncReadMem(nbias, Vec(F, SInt(5.W)))) else None
+  // 4-bit signed weights, magnitude capped at 7 (see the clamp in the trainer):
+  // that is what the magnitude transfer table is sized for.
+  val weights = Seq.fill(Tbl)(SyncReadMem(E, Vec(F, SInt(4.W))))
+  val biasMem = if (useBias) Some(SyncReadMem(nbias, Vec(F, SInt(4.W)))) else None
   val fp_untrained = ((1 << F) - 1).U(F.W)
 
   // ── Meta layout constants (LSB-first) ─────────────────────────────────────
@@ -159,8 +170,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // [W_BASE-1:W_HAM+W_SIG+W_FP] valid (1) → W_BASE = 35
   val W_FP = F; val W_SIG = F; val W_HAM = 4; val W_VALID = 1
   val W_BASE = W_FP + W_SIG + W_HAM + W_VALID  // 35
-  val W_BIAS  = if (useBias) F * 5 else 0            // 75 or 0 (gated)
-  val W_WT    = Tbl * F * 5                        // 600
+  val W_BIAS  = if (useBias) F * 4 else 0            // 60 or 0 (gated)
+  val W_WT    = Tbl * F * 4                        // 480
   val W_ITC_ENTRY = 1 + blbpTagBits + tgtBits + 2   // valid(1) + tag + tgt + rpv(2)
   val W_POOL  = itc_nWays * W_ITC_ENTRY
   val offBias = W_BASE                             // 35
@@ -196,8 +207,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   override val mems =
     Seq.tabulate(itc_nWays)(w => (s"blbp_itc_way$w", itc_nSets * bankWidth, 1 + blbpTagBits + tgtBits + 2)) ++
-    Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) ++
-    (if (useBias) Seq(("blbp_bias", nbias, F * 5)) else Nil)
+    Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 4)) ++
+    (if (useBias) Seq(("blbp_bias", nbias, F * 4)) else Nil)
 
   // Index helpers. foldHist XOR-folds the history bits [lo, hi) into
   // log2Ceil(E)-wide chunks; an empty range contributes nothing.
@@ -240,8 +251,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // ── Weight/bias init FSM ────────────────────────────────────────────────────
   val wt_init_done = RegInit(false.B)
   val wt_init_idx  = RegInit(0.U(log2Ceil(nbias).W))
-  val INIT_VAL = 0.S(5.W)
-  val initRow = Wire(Vec(F, SInt(5.W))); initRow := VecInit(Seq.fill(F)(INIT_VAL))
+  val INIT_VAL = 0.S(4.W)
+  val initRow = Wire(Vec(F, SInt(4.W))); initRow := VecInit(Seq.fill(F)(INIT_VAL))
 
   when (!wt_init_done) {
     wt_init_idx := wt_init_idx + 1.U
@@ -262,7 +273,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       else                        tblIdx(s1_pc, io.f1_ghist, t)
     weights(t).read(idx, readEn)
   })
-  val s2_bia = if (useBias) biasMem.get.read(biasIdx, readEn) else VecInit(Seq.fill(F)(0.S(5.W)))
+  val s2_bia = if (useBias) biasMem.get.read(biasIdx, readEn) else VecInit(Seq.fill(F)(0.S(4.W)))
 
   val s2_sum = VecInit((0 until F).map { w =>
     val wt = (0 until Tbl).map { t => (xfer(s2_wt(t)(w)) * coeffs(t)).asSInt }.reduce(_ + _)
@@ -271,7 +282,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   })
 
   val s3_sum = RegNext(s2_sum)
-  val s3_bia = if (useBias) RegNext(s2_bia) else 0.U.asTypeOf(Vec(F, SInt(5.W)))
+  val s3_bia = if (useBias) RegNext(s2_bia) else 0.U.asTypeOf(Vec(F, SInt(4.W)))
   val s3_wt  = RegNext(s2_wt)
   val s3_local_hist = RegNext(RegNext(local_hist))   // s1 → s3
   val s3_blbp_ghist =
@@ -298,9 +309,9 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_b_target    = RegNext(u.target)
   val tr_b_fp        = RegNext(io.update.bits.meta(F - 1, 0))
   val tr_carried_bia = if (useBias)
-    RegNext(io.update.bits.meta(offBias + W_BIAS - 1, offBias)).asTypeOf(Vec(F, SInt(5.W)))
-    else VecInit(Seq.fill(F)(0.S(5.W)))
-  val tr_carried_wt  = RegNext(io.update.bits.meta(offWt   + W_WT   - 1, offWt  )).asTypeOf(Vec(Tbl, Vec(F, SInt(5.W))))
+    RegNext(io.update.bits.meta(offBias + W_BIAS - 1, offBias)).asTypeOf(Vec(F, SInt(4.W)))
+    else VecInit(Seq.fill(F)(0.S(4.W)))
+  val tr_carried_wt  = RegNext(io.update.bits.meta(offWt   + W_WT   - 1, offWt  )).asTypeOf(Vec(Tbl, Vec(F, SInt(4.W))))
   val tr_carried_pool= RegNext(io.update.bits.meta(offPool + W_POOL - 1, offPool)).asTypeOf(Vec(itc_nWays, new ITCEntry))
   val carried_hist  = io.update.bits.meta(offHist  + W_HIST  - 1, offHist)
   val carried_lhist = io.update.bits.meta(offLHist + W_LHIST - 1, offLHist)
@@ -339,8 +350,8 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // Wire declarations must precede their use in the debug printf block below.
   // Per-bit train_we and updated rows (combinational, computed at tr_b_fire)
   val tr_we = Wire(Vec(F, Bool()))
-  val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(5.W))))
-  val tr_updated_bias = if (useBias) Wire(Vec(F, SInt(5.W))) else VecInit(Seq.fill(F)(0.S(5.W)))
+  val tr_updated_wt = Wire(Vec(Tbl, Vec(F, SInt(4.W))))
+  val tr_updated_bias = if (useBias) Wire(Vec(F, SInt(4.W))) else VecInit(Seq.fill(F)(0.S(4.W)))
 
   if (IN_SIMULATION && useAdaptive) {
     when (tr_fire) {
@@ -428,15 +439,18 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       }
     }
 
+    // `+&`, not `+`: the add has to be one bit wide enough for the saturation
+    // below to see the overflow. With a wrapping add a weight at +7 would land on
+    // -8, whose magnitude of 8 is off the end of the transfer table.
     for (t <- 0 until Tbl) {
-      val delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) + delta, tr_carried_wt(t)(w))
-      tr_updated_wt(t)(w) := Mux(raw > 15.S, 15.S, Mux(raw < -16.S, -16.S, raw))
+      val delta = Mux(target_bit.asBool, 1.S(4.W), -1.S(4.W))
+      val raw   = Mux(tr_we(w), tr_carried_wt(t)(w) +& delta, tr_carried_wt(t)(w))
+      tr_updated_wt(t)(w) := Mux(raw > 7.S, 7.S, Mux(raw < -7.S, -7.S, raw))
     }
     if (useBias) {
-      val b_delta = Mux(target_bit.asBool, 1.S(5.W), -1.S(5.W))
-      val b_raw   = Mux(tr_we(w), tr_carried_bia(w) + b_delta, tr_carried_bia(w))
-      tr_updated_bias(w) := Mux(b_raw > 15.S, 15.S, Mux(b_raw < -16.S, -16.S, b_raw))
+      val b_delta = Mux(target_bit.asBool, 1.S(4.W), -1.S(4.W))
+      val b_raw   = Mux(tr_we(w), tr_carried_bia(w) +& b_delta, tr_carried_bia(w))
+      tr_updated_bias(w) := Mux(b_raw > 7.S, 7.S, Mux(b_raw < -7.S, -7.S, b_raw))
     }
   }
 
