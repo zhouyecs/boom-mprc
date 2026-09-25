@@ -153,9 +153,14 @@ case object BoomBlbpUseLocalHist extends Field[Boolean](false)
 case object BoomBlbpNLHist       extends Field[Int](256)
 case object BoomBlbpLHLength     extends Field[Int](10)
 case object BoomBlbpLBit         extends Field[Int](3)
-case object BoomBlbpThetaInit   extends Field[Int](256)
-case object BoomBlbpThetaStep   extends Field[Int](32)
-case object BoomBlbpThetaSpeed  extends Field[Int](4)
+// Adaptive threshold on the training gate, expressed in the coefficient scale:
+// the coefficients are Q4, so 16 is one unit. A bit is trained when it was
+// mispredicted or when its output magnitude is below theta; theta walks up by
+// ThetaStep every ThetaSpeed such events and back down on correct-but-low-
+// magnitude ones, floored at 0 and unbounded above.
+case object BoomBlbpThetaInit   extends Field[Int](16)
+case object BoomBlbpThetaStep   extends Field[Int](16)
+case object BoomBlbpThetaSpeed  extends Field[Int](1)
 case object BoomBlbpThetaMax    extends Field[Int](65535)
 
 class WithBlbp extends Config((site, here, up) => {
