@@ -105,16 +105,24 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val nbias = 4096
 
   // Direction-history fold windows (capped by BOOM global history) — direction only
-  val histLens = Seq(0, 2, 4, 8, 16, 16, 32, 64).map(_ min globalHistoryLength)
+  // Per-table windows into the global history, as [lo, hi) bit positions, bit 0
+  // being the most recent direction. They overlap on purpose and do not all
+  // start at 0: each table sees a different slice of the long history, so the
+  // eight tables are decorrelated rather than nested. t0 keeps none by design —
+  // it is PC-only, or PC ^ local history when that feature is enabled.
+  val histRanges = Seq((0, 0), (0, 13), (1, 33), (23, 49), (44, 85), (77, 149), (159, 270), (252, 630))
+  require(histRanges.length == Tbl, s"histRanges must have Tbl ($Tbl) entries")
+  require(histRanges.map(_._2).max <= globalHistoryLength,
+    s"largest history window (${histRanges.map(_._2).max}) exceeds globalHistoryLength ($globalHistoryLength)")
 
   // idbits history depth: config-driven, DECOUPLED from globalHistoryLength
-  val maxHist = blbpIdhLen                       // was histLens.max; now the config knob (default 42)
+  val maxHist = blbpIdhLen                       // config knob (default 42)
   require(histIdBits == blbpIdhShift,
     s"histIdBits ($histIdBits) must equal blbpIdhShift ($blbpIdhShift) — set both via WithBlbpIdbits")
   require(histIdBits <= F, s"histIdBits ($histIdBits) cannot exceed fingerprint width F ($F)")
 
   // idbits fold windows: scale the base pattern to maxHist, NOT capped by globalHistoryLength.
-  // At maxHist==42 (default) this is exactly the old shared histLens => behavior unchanged.
+  // At maxHist==42 (default) idhLens keeps its base pattern unchanged.
   private val idhLensBase = Seq(0, 2, 4, 8, 12, 18, 28, 42)
   val idhLens = idhLensBase.map(l => math.min(l * maxHist / idhLensBase.max, maxHist))
   require(idhLens.max <= maxHist && idhLens.length == Tbl,
@@ -191,11 +199,13 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     Seq.tabulate(Tbl)(t => (s"blbp_weight$t", E, F * 5)) ++
     (if (useBias) Seq(("blbp_bias", nbias, F * 5)) else Nil)
 
-  // Index helpers
-  def foldHist(hist: UInt, len: Int): UInt = {
-    if (len == 0) 0.U(log2Ceil(E).W)
+  // Index helpers. foldHist XOR-folds the history bits [lo, hi) into
+  // log2Ceil(E)-wide chunks; an empty range contributes nothing.
+  def foldHist(hist: UInt, lo: Int, hi: Int): UInt = {
+    if (hi <= lo) 0.U(log2Ceil(E).W)
     else {
-      val h = hist(len - 1, 0)
+      val len = hi - lo
+      val h = hist(hi - 1, lo)
       val chunkW = log2Ceil(E)
       val nChunks = (len + chunkW - 1) / chunkW
       val chunks = (0 until nChunks).map { i =>
@@ -205,11 +215,13 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     }
   }
   def tblIdx(pc: UInt, ghist: UInt, t: Int): UInt =
-    (fetchIdx(pc) ^ foldHist(ghist, histLens(t)))(log2Ceil(E) - 1, 0)
+    (fetchIdx(pc) ^ foldHist(ghist, histRanges(t)._1, histRanges(t)._2))(log2Ceil(E) - 1, 0)
 
-  // Hybrid: directions from `ghist`, indirect idbits from `idh`, XOR-mixed
+  // Hybrid: directions from the ghist window of table t, indirect idbits from
+  // `idh` (its own nested windows), XOR-mixed
   def tblIdxMix(pc: UInt, ghist: UInt, idh: UInt, t: Int): UInt =
-    (fetchIdx(pc) ^ foldHist(ghist, histLens(t)) ^ foldHist(idh, idhLens(t)))(log2Ceil(E) - 1, 0)
+    (fetchIdx(pc) ^ foldHist(ghist, histRanges(t)._1, histRanges(t)._2) ^
+      foldHist(idh, 0, idhLens(t)))(log2Ceil(E) - 1, 0)
 
   // Target fingerprint extraction. Bit-selection (default) or XOR-folded hash.
   def extractFp(target: UInt): UInt = {
