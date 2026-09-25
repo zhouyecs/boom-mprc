@@ -9,7 +9,6 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
 
   def itc_nSets = p(BoomBlbpITCSets)
   def itc_nWays = p(BoomBlbpITCWays)
-  def override_thresh = p(BoomBlbpOverrideThresh)
   val useRRIP = p(BoomBlbpUseRRIP)
   val usePLRU = p(BoomBlbpUsePLRU)
   val useDotProduct = p(BoomBlbpUseDotProduct)
@@ -365,7 +364,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val tr_updated_bias = if (useBias) Wire(Vec(F, SInt(4.W))) else VecInit(Seq.fill(F)(0.S(4.W)))
 
   if (IN_SIMULATION && useAdaptive) {
-    when (tr_fire) {
+    when (tr_b_fire) {
       val w0 = 0  // sample bit 0
       val sum_w0 = {
         val wsum = (0 until Tbl).map { t => xfer(tr_carried_wt(t)(w0)) }.reduce(_ +& _)
@@ -375,13 +374,14 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
       val pred_bit0   = (sum_w0 >= 0.S).asUInt
       val target_bit0 = tr_actual_fp(w0)
       printf(p"[adapt] sum0=${sum_w0} theta0=${theta(w0)} tc0=${tc(w0)} " +
-        p"underConf=${sum_w0.abs < theta(w0)} we=${tr_we(w0)} correct=${pred_bit0 === target_bit0}\n")
+        p"underConf=${sum_w0.abs < theta(w0)} we=${tr_we(w0)} train=${trainable(w0)} " +
+        p"correct=${pred_bit0 === target_bit0}\n")
     }
   }
 
-  // 在 tr_fire 附近，不依赖 useAdaptive 的打印
+  // 在 tr_b_fire 附近，不依赖 useAdaptive 的打印
   if (IN_SIMULATION) {
-    when (tr_fire) {
+    when (tr_b_fire) {
       val w0 = 0
       val sum_w0 = {
         val wsum = (0 until Tbl).map { t => xfer(tr_carried_wt(t)(w0)) }.reduce(_ +& _)
@@ -411,6 +411,10 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   // training to zero forever. So only suppress bits when there is a real
   // discriminative set to suppress against; otherwise train all of them.
   val anyDiscrim = if (useSelectiveBit) (0 until F).map(w => discriminative(w)).reduce(_ || _) else true.B
+  // The bits the trainer is allowed to touch. Everything adaptive is confined to
+  // them: a bit the pool cannot tell apart carries no information about which
+  // target this is, so it must neither move a weight nor move the threshold.
+  def trainable(w: Int): Bool = if (useSelectiveBit) (discriminative(w) || !anyDiscrim) else true.B
 
   for (w <- 0 until F) {
     val sum_w = {
@@ -422,23 +426,35 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     val target_bit = tr_actual_fp(w)
     val correct = (pred_bit === target_bit)
     val absSum  = Mux(sum_w < 0.S, -sum_w, sum_w)              // |sum_w|
-    val underConf    = if (useAdaptive) (absSum < theta(w)) else false.B
-    // val trainBit = if (useSelectiveBit) discriminative(w) else true.B
-    val trainBit = if (useSelectiveBit) (discriminative(w) || !anyDiscrim) else true.B
-    tr_we(w) := ((pred_bit =/= target_bit) || underConf) && trainBit
+    val trainBit  = trainable(w)
+    // The threshold walk is applied before the weight decision is taken, so the
+    // event that brings theta down is gated against the lowered value rather than
+    // the one sitting in the register. Only the downward step can change the
+    // gate: a mispredicted bit trains whatever theta says.
+    val underConf = if (useAdaptive) (absSum < theta(w)) else false.B
+    val stepDown  = if (useAdaptive) underConf && (tc(w) <= -(thetaSpeed - 1).S) else false.B
+    val thetaLow  = if (useAdaptive) Mux(theta(w) > thetaStep.S, theta(w) - thetaStep.S, 0.S) else 0.S
+    val underGate = if (useAdaptive) (absSum < Mux(stepDown, thetaLow, theta(w))) else false.B
+    tr_we(w) := ((pred_bit =/= target_bit) || underGate) && trainBit
 
     if (useAdaptive) {
-      when (tr_fire) {
+      // The walk is over this event's numbers, not the previous event's:
+      // `correct`/`underConf` are built from the carried snapshots, which hold the
+      // event being processed, so the update belongs in the weight-write cycle
+      // (tr_b_fire) rather than in the cycle the update request showed up. It is
+      // also confined to the trainable bits, so theta never moves for a bit the
+      // trainer skips. Nothing clamps theta from above; the floor is 0.
+      when (tr_b_fire && trainBit) {
         when (!correct) {
           when (tc(w) >= (thetaSpeed - 1).S) {
             theta(w) := theta(w) + thetaStep.S
             tc(w)    := 0.S
           } .otherwise { tc(w) := tc(w) + 1.S }
         } .elsewhen (underConf) {
-          adapt_train := true.B
-          when (tc(w) <= -(thetaSpeed - 1).S) {
-            theta(w) := Mux(theta(w) > thetaStep.S, theta(w) - thetaStep.S, 0.S)
-            tc(w)    := 0.S
+          when (stepDown) {
+            adapt_train := true.B
+            theta(w)    := thetaLow
+            tc(w)       := 0.S
           } .otherwise { tc(w) := tc(w) - 1.S }
         }
       }
@@ -988,13 +1004,21 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
   val snip_valid   = cand_valid.asUInt.orR && s3_valid
   val snip_target  = s3_pool_tgt(snip_sel)
   val snip_sig     = snip_target(F - 1, 0)
+  // Observer only: it is carried in meta so the commit side can histogram how
+  // close the chosen candidate's fingerprint was to the predicted one. The
+  // override below does NOT gate on it.
   val snip_min_ham = ham(snip_sel)
-  val snip_conf    = snip_valid && (snip_min_ham <= override_thresh.U)
+  val snip_conf    = snip_valid
 
   // Step-2: unconditional override of every column. The frontend only consumes
   // predicted_pc.bits on a column its own decode proves is a JALR (JAL/BR/CFI_X
   // columns take brsigs.target or never redirect), so writing all columns is safe
   // and lets the L3 correct a *wrong* earlier-bank target, not merely fill a hole.
+  // There is no confidence gate: as soon as the ITC holds a valid candidate for
+  // this branch, the L3's target replaces whatever the earlier banks produced, so
+  // a plain fetch packet with a same-index neighbour can be overridden too. The
+  // commit-side corrected/harmed counters (from the carried baseline below) are
+  // what measure the cost of that.
   // Precondition: RAS enabled — a ret column's target is taken from ras_top.
   // NOTE: this also makes frontend f3_btb_mispredicts fire on JAL columns; that
   // path is currently hardwired off (f4_btb_corrections.io.enq.valid := false.B).
@@ -1007,7 +1031,7 @@ class BLBPBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
     (if (useBias) s3_bia.asUInt else 0.U(0.W)),
     snip_valid, snip_min_ham, snip_sig, s3_fingerprint)
 
-  // F3 target override: every column, whenever the L3 is confident.
+  // F3 target override: every column, whenever the ITC has a valid candidate.
   when (snip_conf) {
     for (w <- 0 until bankWidth) {
       io.resp.f3(w).predicted_pc.valid := true.B

@@ -128,7 +128,8 @@ class WithIttage extends Config((site, here, up) => {
 case object BoomBlbpKey            extends Field[Boolean](false)
 case object BoomBlbpITCSets        extends Field[Int](256)
 case object BoomBlbpITCWays        extends Field[Int](8)
-case object BoomBlbpOverrideThresh extends Field[Int](2)
+// The F3 override has no confidence threshold: any valid ITC candidate for the
+// branch takes over the earlier banks' target.
 case object BoomBlbpUseRRIP extends Field[Boolean](false)
 case object BoomBlbpUseDotProduct extends Field[Boolean](false)
 case object BoomBlbpUseTransfer extends Field[Boolean](false)
@@ -159,7 +160,9 @@ case object BoomBlbpLBit         extends Field[Int](3)
 // weight and there is no fixed-point scale left to divide out. A bit is trained
 // when it was mispredicted or when its output magnitude is below theta; theta
 // walks up by ThetaStep every ThetaSpeed such events and back down on correct-
-// but-low-magnitude ones, floored at 0 and unbounded above.
+// but-low-magnitude ones, floored at 0 and unbounded above. Only the bits the
+// trainer is allowed to touch move it at all, and a downward step is applied
+// before that same event's training decision.
 case object BoomBlbpThetaInit   extends Field[Int](1)
 case object BoomBlbpThetaStep   extends Field[Int](1)
 case object BoomBlbpThetaSpeed  extends Field[Int](1)
@@ -171,7 +174,6 @@ class WithBlbp extends Config((site, here, up) => {
 class WithBlbpSmallITC extends Config((site, here, up) => {
   case BoomBlbpITCSets       => 64
   case BoomBlbpITCWays       => 4
-  case BoomBlbpOverrideThresh => 2
 })
 
 // IBTB geometry sweep
